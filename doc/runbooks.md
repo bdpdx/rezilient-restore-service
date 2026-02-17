@@ -258,3 +258,45 @@
    - verify `worm_enabled` policy state is explicit in export payload.
 4. Do not delete rollback-journal linkage until required evidence exports are
    complete and retention criteria are met.
+
+## SLO Burn-Rate Triage (RS-15)
+
+1. Fetch SLO dashboard:
+   - `GET /v1/admin/ops/slo`
+2. Inspect `burn_rate`:
+   - `status` (`within_budget`, `at_risk`, `breached`)
+   - failed checks and observed vs target values.
+3. Prioritize critical failures first:
+   - `execute_success_rate`
+   - `stale_source_count`
+   - `evidence_verification_failed`
+4. Route warning failures to ops queue with bounded mitigation windows:
+   - queue wait p95
+   - execute duration p95
+   - auth pause rate.
+
+## GA Readiness Gate (RS-15)
+
+1. Fetch gate summary:
+   - `GET /v1/admin/ops/ga-readiness`
+2. Validate required checks:
+   - staging mode enabled,
+   - SLO burn-rate status is `within_budget`,
+   - runbooks signed off,
+   - required failure drills passed,
+   - evidence verification failures are zero.
+3. If gate is blocked, use `blocked_reasons` to drive corrective action.
+4. Do not mark GA-ready until all checks pass in the agreed measurement window.
+
+## Staging Mode and Drill Recording (RS-15)
+
+1. Toggle staging mode for GA-targeted validation:
+   - `POST /v1/admin/ops/staging-mode`
+   - payload: `{"enabled": true|false, "actor": "<operator>"}`
+2. Record runbook sign-off:
+   - `POST /v1/admin/ops/runbooks-signoff`
+   - payload: `{"signed_off": true|false, "actor": "<operator>"}`
+3. Record failure drill outcomes:
+   - `POST /v1/admin/ops/failure-drills`
+   - payload:
+     `{"drill_id":"auth_outage|sidecar_lag|pg_saturation|entitlement_disable|crash_resume|evidence_audit_export","status":"pass|fail|pending","actor":"<operator>","notes":"optional"}`

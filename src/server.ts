@@ -224,11 +224,161 @@ export function createRestoreServiceServer(
                     return;
                 }
 
+                if (method === 'GET' && pathname === '/v1/admin/ops/slo') {
+                    sendJson(response, 200, deps.admin.getSloDashboard());
+
+                    return;
+                }
+
+                if (
+                    method === 'GET' &&
+                    pathname === '/v1/admin/ops/ga-readiness'
+                ) {
+                    sendJson(response, 200, deps.admin.getGaReadinessDashboard());
+
+                    return;
+                }
+
+                if (method === 'POST' && pathname === '/v1/admin/ops/staging-mode') {
+                    const body = await readJsonBody(request);
+                    const enabled = body.enabled;
+                    const actor = body.actor;
+
+                    if (typeof enabled !== 'boolean') {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message: 'enabled must be a boolean',
+                        });
+
+                        return;
+                    }
+
+                    if (typeof actor !== 'string' || actor.trim() === '') {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message: 'actor must be a non-empty string',
+                        });
+
+                        return;
+                    }
+
+                    sendJson(
+                        response,
+                        200,
+                        deps.admin.setStagingMode(enabled, actor.trim()),
+                    );
+
+                    return;
+                }
+
+                if (
+                    method === 'POST' &&
+                    pathname === '/v1/admin/ops/runbooks-signoff'
+                ) {
+                    const body = await readJsonBody(request);
+                    const signedOff = body.signed_off;
+                    const actor = body.actor;
+
+                    if (typeof signedOff !== 'boolean') {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message: 'signed_off must be a boolean',
+                        });
+
+                        return;
+                    }
+
+                    if (typeof actor !== 'string' || actor.trim() === '') {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message: 'actor must be a non-empty string',
+                        });
+
+                        return;
+                    }
+
+                    sendJson(
+                        response,
+                        200,
+                        deps.admin.setRunbookSignoff(signedOff, actor.trim()),
+                    );
+
+                    return;
+                }
+
+                if (method === 'POST' && pathname === '/v1/admin/ops/failure-drills') {
+                    const body = await readJsonBody(request);
+                    const drillId = body.drill_id;
+                    const status = body.status;
+                    const actor = body.actor;
+                    const notes = body.notes;
+
+                    if (typeof drillId !== 'string' || drillId.trim() === '') {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message: 'drill_id must be a non-empty string',
+                        });
+
+                        return;
+                    }
+
+                    if (typeof status !== 'string' || status.trim() === '') {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message: 'status must be a non-empty string',
+                        });
+
+                        return;
+                    }
+
+                    if (typeof actor !== 'string' || actor.trim() === '') {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message: 'actor must be a non-empty string',
+                        });
+
+                        return;
+                    }
+
+                    if (notes !== undefined && typeof notes !== 'string') {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message: 'notes must be a string when provided',
+                        });
+
+                        return;
+                    }
+
+                    const result = deps.admin.recordFailureDrillResult(
+                        drillId.trim(),
+                        status.trim(),
+                        actor.trim(),
+                        typeof notes === 'string' ? notes : undefined,
+                    );
+
+                    if (!result.success) {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message: result.message,
+                        });
+
+                        return;
+                    }
+
+                    sendJson(response, 200, {
+                        drill: result.record,
+                    });
+
+                    return;
+                }
+
                 if (method === 'GET' && pathname === '/v1/admin/ops/overview') {
                     sendJson(response, 200, {
                         queue: deps.admin.getQueueDashboard(),
                         freshness: deps.admin.getFreshnessDashboard(),
                         evidence: deps.admin.getEvidenceDashboard(),
+                        slo: deps.admin.getSloDashboard(),
+                        ga_readiness: deps.admin.getGaReadinessDashboard(),
                     });
 
                     return;

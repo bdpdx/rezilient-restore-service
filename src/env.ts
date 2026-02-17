@@ -18,6 +18,8 @@ export interface RestoreServiceEnv {
     evidenceSigningPublicKeyPem?: string;
     evidenceImmutableWormEnabled: boolean;
     evidenceImmutableRetentionClass: string;
+    stagingModeEnabled: boolean;
+    gaRunbooksSignedOff: boolean;
     sourceMappings: SourceMappingInput[];
 }
 
@@ -252,6 +254,16 @@ export function parseRestoreServiceEnv(
         evidenceImmutableRetentionClass: parseOptionalString(
             env.RRS_EVIDENCE_IMMUTABLE_RETENTION_CLASS,
         ) || 'standard-30d',
+        stagingModeEnabled: parseBoolean(
+            env.RRS_STAGING_MODE_ENABLED,
+            'RRS_STAGING_MODE_ENABLED',
+            false,
+        ),
+        gaRunbooksSignedOff: parseBoolean(
+            env.RRS_GA_RUNBOOKS_SIGNED_OFF,
+            'RRS_GA_RUNBOOKS_SIGNED_OFF',
+            false,
+        ),
         sourceMappings: parseSourceMappings(env.RRS_SOURCE_MAPPINGS_JSON),
     };
 }

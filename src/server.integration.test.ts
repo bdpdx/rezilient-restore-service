@@ -118,6 +118,33 @@ async function getAdminJson(
     };
 }
 
+async function postAdminJson(
+    baseUrl: string,
+    path: string,
+    payload: Record<string, unknown>,
+    adminToken?: string,
+): Promise<ResponseData> {
+    const headers: Record<string, string> = {
+        'content-type': 'application/json',
+    };
+
+    if (adminToken) {
+        headers['x-rezilient-admin-token'] = adminToken;
+    }
+
+    const response = await fetch(`${baseUrl}${path}`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+    });
+    const body = await response.json() as Record<string, unknown>;
+
+    return {
+        status: response.status,
+        body,
+    };
+}
+
 function createService(
     signingKey: string,
     options?: {
@@ -174,7 +201,7 @@ function createService(
         },
         now,
     );
-    const admin = new RestoreOpsAdminService(jobs, plans, evidence);
+    const admin = new RestoreOpsAdminService(jobs, plans, evidence, execute);
 
     return createRestoreServiceServer({
         admin,
@@ -1426,6 +1453,8 @@ test('admin ops endpoints require admin token when configured', async () => {
         assert.equal(typeof authorized.body.queue, 'object');
         assert.equal(typeof authorized.body.freshness, 'object');
         assert.equal(typeof authorized.body.evidence, 'object');
+        assert.equal(typeof authorized.body.slo, 'object');
+        assert.equal(typeof authorized.body.ga_readiness, 'object');
     } finally {
         await closeServer(server);
     }
@@ -1519,6 +1548,183 @@ test('admin ops endpoints expose queue, freshness, and evidence summaries', asyn
         >>;
         assert.equal(evidenceRows[0].job_id, firstPlan.jobId);
         assert.equal(typeof secondPlan.jobId, 'string');
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('admin ops RS-15 SLO and GA readiness endpoints enforce staged gate checks', async () => {
+    const signingKey = 'test-signing-key';
+    const adminToken = 'admin-secret';
+    const server = createService(signingKey, {
+        adminToken,
+    });
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+
+    try {
+        const fixture = await createPlanAndJob(
+            baseUrl,
+            token,
+            'admin-plan-rs15-01',
+        );
+        const execute = await postJson(
+            baseUrl,
+            `/v1/jobs/${fixture.jobId}/execution`,
+            token,
+            createExecutePayload(),
+        );
+        assert.equal(execute.status, 200);
+
+        const evidenceExport = await postJson(
+            baseUrl,
+            `/v1/jobs/${fixture.jobId}/evidence/export`,
+            token,
+            {},
+        );
+        assert.equal(evidenceExport.status, 200);
+
+        const initialGa = await getAdminJson(
+            baseUrl,
+            '/v1/admin/ops/ga-readiness',
+            adminToken,
+        );
+        assert.equal(initialGa.status, 200);
+        assert.equal(initialGa.body.ga_ready, false);
+        const initialBlocked = initialGa.body.blocked_reasons as string[];
+        assert.ok(initialBlocked.includes('staging_mode_enabled'));
+        assert.ok(initialBlocked.includes('runbooks_signed_off'));
+        assert.ok(initialBlocked.includes('failure_drills_passed'));
+
+        const stagingEnabled = await postAdminJson(
+            baseUrl,
+            '/v1/admin/ops/staging-mode',
+            {
+                enabled: true,
+                actor: 'ops@example.com',
+            },
+            adminToken,
+        );
+        assert.equal(stagingEnabled.status, 200);
+        const stagingMode = stagingEnabled.body.staging_mode as Record<
+            string,
+            unknown
+        >;
+        assert.equal(stagingMode.enabled, true);
+
+        const runbookSignoff = await postAdminJson(
+            baseUrl,
+            '/v1/admin/ops/runbooks-signoff',
+            {
+                signed_off: true,
+                actor: 'ops@example.com',
+            },
+            adminToken,
+        );
+        assert.equal(runbookSignoff.status, 200);
+        const runbooks = runbookSignoff.body.runbooks as Record<
+            string,
+            unknown
+        >;
+        assert.equal(runbooks.signed_off, true);
+
+        const drills = [
+            'auth_outage',
+            'sidecar_lag',
+            'pg_saturation',
+            'entitlement_disable',
+            'crash_resume',
+            'evidence_audit_export',
+        ];
+
+        for (const drillId of drills) {
+            const drill = await postAdminJson(
+                baseUrl,
+                '/v1/admin/ops/failure-drills',
+                {
+                    drill_id: drillId,
+                    status: 'pass',
+                    actor: 'ops@example.com',
+                    notes: 'simulated drill passed',
+                },
+                adminToken,
+            );
+            assert.equal(drill.status, 200);
+            const drillRecord = drill.body.drill as Record<string, unknown>;
+            assert.equal(drillRecord.drill_id, drillId);
+            assert.equal(drillRecord.status, 'passed');
+        }
+
+        const slo = await getAdminJson(
+            baseUrl,
+            '/v1/admin/ops/slo',
+            adminToken,
+        );
+        assert.equal(slo.status, 200);
+        const burnRate = slo.body.burn_rate as Record<string, unknown>;
+        assert.equal(burnRate.status, 'within_budget');
+        assert.equal(burnRate.severity, 'normal');
+
+        const gaReadiness = await getAdminJson(
+            baseUrl,
+            '/v1/admin/ops/ga-readiness',
+            adminToken,
+        );
+        assert.equal(gaReadiness.status, 200);
+        assert.equal(gaReadiness.body.ga_ready, true);
+        const blockedReasons = gaReadiness.body.blocked_reasons as string[];
+        assert.equal(blockedReasons.length, 0);
+        const failureDrillSummary = gaReadiness.body.failure_drills as Record<
+            string,
+            unknown
+        >;
+        const totals = failureDrillSummary.totals as Record<string, unknown>;
+        assert.equal(totals.passed, 6);
+        assert.equal(totals.pending, 0);
+        assert.equal(totals.failed, 0);
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('admin ops RS-15 SLO dashboard captures multi-job execute samples', async () => {
+    const signingKey = 'test-signing-key';
+    const adminToken = 'admin-secret';
+    const server = createService(signingKey, {
+        adminToken,
+    });
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+
+    try {
+        for (let index = 0; index < 5; index += 1) {
+            const suffix = String(index + 1).padStart(2, '0');
+            const fixture = await createPlanAndJob(
+                baseUrl,
+                token,
+                `admin-plan-rs15-load-${suffix}`,
+            );
+            const execute = await postJson(
+                baseUrl,
+                `/v1/jobs/${fixture.jobId}/execution`,
+                token,
+                createExecutePayload(),
+            );
+            assert.equal(execute.status, 200);
+        }
+
+        const slo = await getAdminJson(
+            baseUrl,
+            '/v1/admin/ops/slo',
+            adminToken,
+        );
+        assert.equal(slo.status, 200);
+        const execution = slo.body.execution as Record<string, unknown>;
+        assert.equal(execution.total, 5);
+        assert.equal(execution.terminal, 5);
+        const queue = slo.body.queue as Record<string, unknown>;
+        assert.equal(typeof queue.queue_wait_p95_ms, 'number');
+        assert.equal(typeof execution.execute_duration_p95_ms, 'number');
     } finally {
         await closeServer(server);
     }

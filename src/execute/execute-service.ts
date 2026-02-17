@@ -787,6 +787,16 @@ export class RestoreExecutionService {
         return this.records.get(jobId) || null;
     }
 
+    listExecutions(): RestoreExecutionRecord[] {
+        return Array.from(this.records.values())
+            .map((record) =>
+                JSON.parse(JSON.stringify(record)) as RestoreExecutionRecord
+            )
+            .sort((left, right) => {
+                return left.started_at.localeCompare(right.started_at);
+            });
+    }
+
     getCheckpoint(jobId: string): ExecutionResumeCheckpoint | null {
         const record = this.records.get(jobId);
 

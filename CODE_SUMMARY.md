@@ -18,7 +18,8 @@ Purpose:
     hashing, signature verification state, immutable-storage metadata, and
     export endpoints,
   - RS-14 admin ops dashboards for queue/lock visibility, freshness/backfill
-    summaries, and evidence verification status.
+    summaries, and evidence verification status,
+  - RS-15 admin SLO/burn-rate and GA-readiness/staging controls.
 
 Entrypoints:
 - `src/index.ts`: restore-service bootstrap and HTTP server startup.
@@ -36,8 +37,8 @@ Entrypoints:
   helpers for RS-12 evidence.
 - `src/evidence/evidence-service.ts`: RS-12 evidence package builder and
   verifier (artifact hashes, report hash, signed manifest metadata).
-- `src/admin/ops-admin-service.ts`: RS-14 admin ops summary service for queue,
-  freshness/backfill heuristic status, and evidence verification listings.
+- `src/admin/ops-admin-service.ts`: RS-14/RS-15 admin ops summary service for
+  queue/freshness/evidence plus SLO burn-rate and GA gate readiness checks.
 - `src/jobs/job-service.ts`: restore job orchestration and queue audit events.
 - `src/locks/lock-manager.ts`: lock acquisition/release and queued-job
   promotion.
@@ -63,5 +64,5 @@ Tests:
 - `src/server.integration.test.ts`: auth scope and source-mapping fail-closed
   tests, RS-08 dry-run coverage, RS-09 execute endpoint checks, RS-10
   resume/checkpoint/journal API checks, RS-11 media dry-run/execute API
-  coverage, RS-12 evidence export/read API coverage, and RS-14 admin ops
+  coverage, RS-12 evidence export/read API coverage, and RS-14/RS-15 admin ops
   endpoint coverage.

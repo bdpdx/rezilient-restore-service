@@ -52,7 +52,16 @@ async function main(): Promise<void> {
         tokenClockSkewSeconds: env.authClockSkewSeconds,
         expectedIssuer: env.authExpectedIssuer,
     });
-    const admin = new RestoreOpsAdminService(jobs, plans, evidence);
+    const admin = new RestoreOpsAdminService(
+        jobs,
+        plans,
+        evidence,
+        execute,
+        {
+            stagingModeEnabled: env.stagingModeEnabled,
+            runbooksSignedOff: env.gaRunbooksSignedOff,
+        },
+    );
     const server = createRestoreServiceServer({
         admin,
         authenticator,
@@ -82,6 +91,8 @@ async function main(): Promise<void> {
         evidence_signer_key_id: env.evidenceSignerKeyId,
         evidence_immutable_worm_enabled: env.evidenceImmutableWormEnabled,
         evidence_immutable_retention_class: env.evidenceImmutableRetentionClass,
+        staging_mode_enabled: env.stagingModeEnabled,
+        ga_runbooks_signed_off: env.gaRunbooksSignedOff,
         mapping_count: sourceRegistry.list().length,
         port: env.port,
     });
