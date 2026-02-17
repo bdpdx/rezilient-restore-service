@@ -1,0 +1,1833 @@
+openapi: 3.0.3
+info:
+  title: Rezilient Restore Service API
+  version: 0.0.1
+  description: >
+    RS-12 restore API with dry-run planning, deterministic plan_hash generation,
+    execute/resume checkpoint orchestration, rollback-journal linkage, signed
+    evidence export endpoints, and RS-07 job lifecycle endpoints.
+servers:
+  - url: https://restore.rezilient.local
+paths:
+  /v1/health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - ok
+                properties:
+                  ok:
+                    type: boolean
+  /v1/plans/dry-run:
+    post:
+      summary: Create deterministic dry-run restore plan
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDryRunPlanRequest'
+      responses:
+        '200':
+          description: Existing immutable plan returned (same plan_id/hash)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DryRunPlanResponse'
+        '201':
+          description: New dry-run plan created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DryRunPlanResponse'
+        '401':
+          description: Unauthorized token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthFailure'
+        '403':
+          description: Source scope mismatch or unknown mapping
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScopeBlockedFailure'
+        '409':
+          description: plan_id already exists with different plan_hash
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScopeBlockedFailure'
+  /v1/plans/{plan_id}:
+    get:
+      summary: Get dry-run plan and executability gate state
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: plan_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Dry-run plan record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DryRunPlanResponse'
+        '404':
+          description: Plan not found
+  /v1/jobs:
+    post:
+      summary: Create restore job
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRestoreJobRequest'
+      responses:
+        '201':
+          description: Restore job created
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - job
+                properties:
+                  job:
+                    $ref: '#/components/schemas/RestoreJobRecord'
+        '401':
+          description: Unauthorized token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthFailure'
+        '403':
+          description: Source scope mismatch or unknown mapping
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScopeBlockedFailure'
+  /v1/jobs/{job_id}:
+    get:
+      summary: Get restore job
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Restore job
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - job
+                properties:
+                  job:
+                    $ref: '#/components/schemas/RestoreJobRecord'
+        '404':
+          description: Job not found
+  /v1/jobs/{job_id}/events:
+    get:
+      summary: List restore job queue/audit events
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Event list
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - events
+                properties:
+                  events:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RestoreJobEvent'
+  /v1/jobs/{job_id}/execution:
+    get:
+      summary: Get execution record for a restore job
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Execution record
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - execution
+                properties:
+                  execution:
+                    $ref: '#/components/schemas/RestoreExecutionRecord'
+        '404':
+          description: Execution not found
+    post:
+      summary: Execute approved restore plan rows for a running job
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecuteRestoreJobRequest'
+      responses:
+        '200':
+          description: Execute completed or existing execution returned
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - execution
+                  - promoted_job_ids
+                properties:
+                  execution:
+                    $ref: '#/components/schemas/RestoreExecutionRecord'
+                  promoted_job_ids:
+                    type: array
+                    items:
+                      type: string
+                  evidence:
+                    $ref: '#/components/schemas/ExecutionEvidenceSummary'
+        '202':
+          description: Execute attempt paused and requires resume
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - execution
+                  - promoted_job_ids
+                properties:
+                  execution:
+                    $ref: '#/components/schemas/RestoreExecutionRecord'
+                  promoted_job_ids:
+                    type: array
+                    items:
+                      type: string
+                  evidence:
+                    $ref: '#/components/schemas/ExecutionEvidenceSummary'
+        '403':
+          description: Missing capability or scope mismatch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecuteFailure'
+        '409':
+          description: Non-executable plan or hard-block conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecuteFailure'
+  /v1/jobs/{job_id}/resume:
+    post:
+      summary: Resume a paused restore execution from the stored checkpoint
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResumeRestoreJobRequest'
+      responses:
+        '200':
+          description: Resume completed or existing terminal execution returned
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - execution
+                  - promoted_job_ids
+                properties:
+                  execution:
+                    $ref: '#/components/schemas/RestoreExecutionRecord'
+                  promoted_job_ids:
+                    type: array
+                    items:
+                      type: string
+                  evidence:
+                    $ref: '#/components/schemas/ExecutionEvidenceSummary'
+        '202':
+          description: Resume attempt paused and additional resume is required
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - execution
+                  - promoted_job_ids
+                properties:
+                  execution:
+                    $ref: '#/components/schemas/RestoreExecutionRecord'
+                  promoted_job_ids:
+                    type: array
+                    items:
+                      type: string
+                  evidence:
+                    $ref: '#/components/schemas/ExecutionEvidenceSummary'
+        '403':
+          description: Missing capability or scope mismatch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecuteFailure'
+        '409':
+          description: Resume blocked by checksum/precondition mismatch
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecuteFailure'
+  /v1/jobs/{job_id}/checkpoint:
+    get:
+      summary: Get latest execution resume checkpoint
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Resume checkpoint
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - checkpoint
+                properties:
+                  checkpoint:
+                    $ref: '#/components/schemas/ExecutionResumeCheckpoint'
+        '404':
+          description: Checkpoint not found
+  /v1/jobs/{job_id}/rollback-journal:
+    get:
+      summary: Get authoritative rollback journal entries and SN mirror linkage
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Rollback journal bundle
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RollbackJournalResponse'
+        '404':
+          description: Rollback journal not found
+  /v1/jobs/{job_id}/evidence:
+    get:
+      summary: Get signed evidence package for a restore job
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Evidence package and verification status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvidenceResponse'
+        '404':
+          description: Evidence package not found
+  /v1/jobs/{job_id}/evidence/export:
+    post:
+      summary: Generate or fetch signed evidence package for a restore job
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Existing evidence package returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvidenceResponse'
+        '201':
+          description: Evidence package created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EvidenceResponse'
+        '409':
+          description: Evidence export blocked by non-terminal execution state
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecuteFailure'
+  /v1/jobs/{job_id}/complete:
+    post:
+      summary: Mark restore job terminal and release locks
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: job_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteRestoreJobRequest'
+      responses:
+        '200':
+          description: Job updated
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - job
+                  - promoted_job_ids
+                properties:
+                  job:
+                    $ref: '#/components/schemas/RestoreJobRecord'
+                  promoted_job_ids:
+                    type: array
+                    items:
+                      type: string
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    RestoreCapability:
+      type: string
+      enum:
+        - restore_execute
+        - restore_delete
+        - restore_override_caps
+        - restore_schema_override
+    RestoreReasonCode:
+      type: string
+      enum:
+        - none
+        - queued_scope_lock
+        - blocked_unknown_source_mapping
+        - blocked_missing_capability
+        - blocked_unresolved_delete_candidates
+        - blocked_unresolved_media_candidates
+        - blocked_reference_conflict
+        - blocked_media_parent_missing
+        - blocked_freshness_stale
+        - blocked_freshness_unknown
+        - blocked_auth_control_plane_outage
+        - blocked_plan_hash_mismatch
+        - blocked_evidence_not_ready
+        - blocked_resume_precondition_mismatch
+        - blocked_resume_checkpoint_missing
+        - paused_token_refresh_grace_exhausted
+        - paused_entitlement_disabled
+        - paused_instance_disabled
+        - failed_media_parent_missing
+        - failed_media_hash_mismatch
+        - failed_media_retry_exhausted
+        - failed_evidence_report_hash_mismatch
+        - failed_evidence_artifact_hash_mismatch
+        - failed_evidence_signature_verification
+        - failed_schema_conflict
+        - failed_permission_conflict
+        - failed_internal_error
+        - denied_token_expired
+        - denied_token_invalid_signature
+        - denied_token_wrong_service_scope
+        - denied_token_malformed
+    ApprovalPlaceholder:
+      type: object
+      required:
+        - approval_required
+        - approval_state
+        - approval_placeholder_mode
+      properties:
+        approval_required:
+          type: boolean
+        approval_state:
+          type: string
+        approval_placeholder_mode:
+          type: string
+          enum:
+            - mvp_not_enforced
+    RestorePlanRecord:
+      type: object
+      required:
+        - contract_version
+        - plan_id
+        - plan_hash
+        - plan_hash_algorithm
+        - plan_hash_input_version
+        - generated_at
+        - pit
+        - scope
+        - execution_options
+        - action_counts
+        - conflicts
+        - approval
+        - metadata_allowlist_version
+      properties:
+        contract_version:
+          type: string
+          enum:
+            - restore.contracts.v1
+        plan_id:
+          type: string
+        plan_hash:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        plan_hash_algorithm:
+          type: string
+          enum:
+            - sha256
+        plan_hash_input_version:
+          type: string
+          enum:
+            - plan-hash-input.v1
+        generated_at:
+          type: string
+          format: date-time
+        pit:
+          type: object
+          additionalProperties: true
+        scope:
+          type: object
+          additionalProperties: true
+        execution_options:
+          type: object
+          additionalProperties: true
+        action_counts:
+          type: object
+          additionalProperties: true
+        conflicts:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        approval:
+          $ref: '#/components/schemas/ApprovalPlaceholder'
+        metadata_allowlist_version:
+          type: string
+          enum:
+            - rrs.metadata.allowlist.v1
+    DryRunGate:
+      type: object
+      required:
+        - executability
+        - reason_code
+        - unresolved_delete_candidates
+        - unresolved_media_candidates
+        - unresolved_hard_block_conflicts
+        - stale_partition_count
+        - unknown_partition_count
+      properties:
+        executability:
+          type: string
+          enum:
+            - executable
+            - preview_only
+            - blocked
+        reason_code:
+          $ref: '#/components/schemas/RestoreReasonCode'
+        unresolved_delete_candidates:
+          type: integer
+          minimum: 0
+        unresolved_media_candidates:
+          type: integer
+          minimum: 0
+        unresolved_hard_block_conflicts:
+          type: integer
+          minimum: 0
+        stale_partition_count:
+          type: integer
+          minimum: 0
+        unknown_partition_count:
+          type: integer
+          minimum: 0
+    CreateDryRunPlanRequest:
+      type: object
+      required:
+        - tenant_id
+        - instance_id
+        - source
+        - plan_id
+        - requested_by
+        - pit
+        - scope
+        - execution_options
+        - rows
+        - watermarks
+      properties:
+        tenant_id:
+          type: string
+        instance_id:
+          type: string
+        source:
+          type: string
+        plan_id:
+          type: string
+        requested_by:
+          type: string
+        pit:
+          type: object
+          additionalProperties: true
+        scope:
+          type: object
+          additionalProperties: true
+        execution_options:
+          type: object
+          additionalProperties: true
+        rows:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            additionalProperties: true
+        conflicts:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        delete_candidates:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        media_candidates:
+          type: array
+          items:
+            $ref: '#/components/schemas/RestoreMediaCandidate'
+        watermarks:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            additionalProperties: true
+        pit_candidates:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        approval:
+          $ref: '#/components/schemas/ApprovalPlaceholder'
+    DryRunPlanResponse:
+      type: object
+      required:
+        - plan
+        - plan_hash_input
+        - gate
+        - delete_candidates
+        - media_candidates
+        - pit_resolutions
+        - watermarks
+      properties:
+        plan:
+          $ref: '#/components/schemas/RestorePlanRecord'
+        plan_hash_input:
+          type: object
+          additionalProperties: true
+        gate:
+          $ref: '#/components/schemas/DryRunGate'
+        delete_candidates:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        media_candidates:
+          type: array
+          items:
+            $ref: '#/components/schemas/RestoreMediaCandidate'
+        pit_resolutions:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        watermarks:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    CreateRestoreJobRequest:
+      type: object
+      required:
+        - tenant_id
+        - instance_id
+        - source
+        - plan_id
+        - plan_hash
+        - lock_scope_tables
+        - required_capabilities
+        - requested_by
+      properties:
+        tenant_id:
+          type: string
+        instance_id:
+          type: string
+        source:
+          type: string
+        plan_id:
+          type: string
+        plan_hash:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        lock_scope_tables:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        required_capabilities:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/RestoreCapability'
+        requested_by:
+          type: string
+        approval:
+          $ref: '#/components/schemas/ApprovalPlaceholder'
+    RestoreJobRecord:
+      type: object
+      required:
+        - contract_version
+        - job_id
+        - tenant_id
+        - instance_id
+        - source
+        - plan_id
+        - plan_hash
+        - status
+        - status_reason_code
+        - lock_scope_tables
+        - required_capabilities
+        - requested_by
+        - requested_at
+        - approval
+        - metadata_allowlist_version
+      properties:
+        contract_version:
+          type: string
+          enum:
+            - restore.contracts.v1
+        job_id:
+          type: string
+        tenant_id:
+          type: string
+        instance_id:
+          type: string
+        source:
+          type: string
+        plan_id:
+          type: string
+        plan_hash:
+          type: string
+        status:
+          type: string
+          enum:
+            - queued
+            - running
+            - paused
+            - completed
+            - failed
+            - cancelled
+        status_reason_code:
+          $ref: '#/components/schemas/RestoreReasonCode'
+        lock_scope_tables:
+          type: array
+          items:
+            type: string
+        required_capabilities:
+          type: array
+          items:
+            $ref: '#/components/schemas/RestoreCapability'
+        requested_by:
+          type: string
+        requested_at:
+          type: string
+          format: date-time
+        approval:
+          $ref: '#/components/schemas/ApprovalPlaceholder'
+        metadata_allowlist_version:
+          type: string
+          enum:
+            - rrs.metadata.allowlist.v1
+        queue_position:
+          type: integer
+          nullable: true
+        wait_reason_code:
+          allOf:
+            - $ref: '#/components/schemas/RestoreReasonCode'
+          nullable: true
+        wait_tables:
+          type: array
+          items:
+            type: string
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        updated_at:
+          type: string
+          format: date-time
+    RestoreJobEvent:
+      type: object
+      required:
+        - event_id
+        - event_type
+        - job_id
+        - reason_code
+        - created_at
+        - details
+      properties:
+        event_id:
+          type: string
+        event_type:
+          type: string
+        job_id:
+          type: string
+        reason_code:
+          $ref: '#/components/schemas/RestoreReasonCode'
+        created_at:
+          type: string
+          format: date-time
+        details:
+          type: object
+          additionalProperties: true
+    CompleteRestoreJobRequest:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          enum:
+            - completed
+            - failed
+            - cancelled
+        reason_code:
+          $ref: '#/components/schemas/RestoreReasonCode'
+    ExecuteRuntimeConflictInput:
+      type: object
+      required:
+        - conflict_id
+        - row_id
+        - class
+        - reason_code
+        - reason
+        - resolution
+      properties:
+        conflict_id:
+          type: string
+        row_id:
+          type: string
+        class:
+          type: string
+          enum:
+            - value_conflict
+            - missing_row_conflict
+            - unexpected_existing_conflict
+            - reference_conflict
+            - schema_conflict
+            - permission_conflict
+            - stale_conflict
+        reason_code:
+          $ref: '#/components/schemas/RestoreReasonCode'
+        reason:
+          type: string
+        resolution:
+          type: string
+          enum:
+            - skip
+            - abort_and_replan
+    ExecuteWorkflowInput:
+      type: object
+      required:
+        - mode
+      properties:
+        mode:
+          type: string
+          enum:
+            - suppressed_default
+            - allowlist
+        allowlist:
+          type: array
+          items:
+            type: string
+    ElevatedConfirmationInput:
+      type: object
+      required:
+        - confirmed
+        - confirmation
+        - reason
+      properties:
+        confirmed:
+          type: boolean
+          enum:
+            - true
+        confirmation:
+          type: string
+        reason:
+          type: string
+    ExecuteRestoreJobRequest:
+      type: object
+      required:
+        - operator_id
+        - operator_capabilities
+      properties:
+        operator_id:
+          type: string
+        operator_capabilities:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/RestoreCapability'
+        chunk_size:
+          type: integer
+          minimum: 1
+          maximum: 1000
+        workflow:
+          $ref: '#/components/schemas/ExecuteWorkflowInput'
+        runtime_conflicts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExecuteRuntimeConflictInput'
+        elevated_confirmation:
+          $ref: '#/components/schemas/ElevatedConfirmationInput'
+    RestoreMediaCandidate:
+      type: object
+      required:
+        - candidate_id
+        - table
+        - record_sys_id
+        - size_bytes
+        - sha256_plain
+      properties:
+        candidate_id:
+          type: string
+        table:
+          type: string
+        record_sys_id:
+          type: string
+        attachment_sys_id:
+          type: string
+        media_id:
+          type: string
+        content_type:
+          type: string
+        size_bytes:
+          type: integer
+          minimum: 0
+        sha256_plain:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        decision:
+          type: string
+          enum:
+            - include
+            - exclude
+        parent_record_exists:
+          type: boolean
+        observed_sha256_plain:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        retryable_failures:
+          type: integer
+          minimum: 0
+        max_retry_attempts:
+          type: integer
+          minimum: 1
+        metadata:
+          type: object
+          additionalProperties: true
+    ExecutionMediaOutcome:
+      type: object
+      required:
+        - candidate_id
+        - table
+        - record_sys_id
+        - decision
+        - outcome
+        - reason_code
+        - chunk_id
+        - attempt_count
+        - size_bytes
+        - expected_sha256_plain
+      properties:
+        candidate_id:
+          type: string
+        table:
+          type: string
+        record_sys_id:
+          type: string
+        attachment_sys_id:
+          type: string
+        media_id:
+          type: string
+        decision:
+          type: string
+          enum:
+            - include
+            - exclude
+        outcome:
+          type: string
+          enum:
+            - applied
+            - skipped
+            - failed
+        reason_code:
+          $ref: '#/components/schemas/RestoreReasonCode'
+        chunk_id:
+          type: string
+        attempt_count:
+          type: integer
+          minimum: 0
+        size_bytes:
+          type: integer
+          minimum: 0
+        expected_sha256_plain:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        observed_sha256_plain:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        message:
+          type: string
+    ResumeRestoreJobRequest:
+      type: object
+      required:
+        - operator_id
+        - operator_capabilities
+      properties:
+        operator_id:
+          type: string
+        operator_capabilities:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/RestoreCapability'
+        runtime_conflicts:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExecuteRuntimeConflictInput'
+        expected_plan_checksum:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        expected_precondition_checksum:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+    ExecutionRowOutcome:
+      type: object
+      required:
+        - row_id
+        - table
+        - record_sys_id
+        - action
+        - outcome
+        - reason_code
+        - chunk_id
+        - used_row_fallback
+      properties:
+        row_id:
+          type: string
+        table:
+          type: string
+        record_sys_id:
+          type: string
+        action:
+          type: string
+          enum:
+            - update
+            - insert
+            - delete
+            - skip
+        outcome:
+          type: string
+          enum:
+            - applied
+            - skipped
+            - failed
+        reason_code:
+          $ref: '#/components/schemas/RestoreReasonCode'
+        chunk_id:
+          type: string
+        used_row_fallback:
+          type: boolean
+        conflict_id:
+          type: string
+        conflict_class:
+          type: string
+        conflict_resolution:
+          type: string
+    ExecutionChunkOutcome:
+      type: object
+      required:
+        - chunk_id
+        - row_count
+        - status
+        - started_at
+        - completed_at
+        - applied_count
+        - skipped_count
+        - failed_count
+        - fallback_trigger_conflict_ids
+      properties:
+        chunk_id:
+          type: string
+        row_count:
+          type: integer
+          minimum: 0
+        status:
+          type: string
+          enum:
+            - applied
+            - row_fallback
+            - failed
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+        applied_count:
+          type: integer
+          minimum: 0
+        skipped_count:
+          type: integer
+          minimum: 0
+        failed_count:
+          type: integer
+          minimum: 0
+        fallback_trigger_conflict_ids:
+          type: array
+          items:
+            type: string
+    RestoreExecutionSummary:
+      type: object
+      required:
+        - planned_rows
+        - applied_rows
+        - skipped_rows
+        - failed_rows
+        - attachments_planned
+        - attachments_applied
+        - attachments_skipped
+        - attachments_failed
+        - chunk_count
+        - fallback_chunk_count
+        - runtime_conflict_count
+      properties:
+        planned_rows:
+          type: integer
+          minimum: 0
+        applied_rows:
+          type: integer
+          minimum: 0
+        skipped_rows:
+          type: integer
+          minimum: 0
+        failed_rows:
+          type: integer
+          minimum: 0
+        attachments_planned:
+          type: integer
+          minimum: 0
+        attachments_applied:
+          type: integer
+          minimum: 0
+        attachments_skipped:
+          type: integer
+          minimum: 0
+        attachments_failed:
+          type: integer
+          minimum: 0
+        chunk_count:
+          type: integer
+          minimum: 0
+        fallback_chunk_count:
+          type: integer
+          minimum: 0
+        runtime_conflict_count:
+          type: integer
+          minimum: 0
+    ExecutionResumeCheckpoint:
+      type: object
+      required:
+        - checkpoint_id
+        - next_chunk_index
+        - total_chunks
+        - last_chunk_id
+        - row_attempt_by_row
+        - updated_at
+      properties:
+        checkpoint_id:
+          type: string
+        next_chunk_index:
+          type: integer
+          minimum: 0
+        total_chunks:
+          type: integer
+          minimum: 0
+        last_chunk_id:
+          type: string
+          nullable: true
+        row_attempt_by_row:
+          type: object
+          additionalProperties:
+            type: integer
+            minimum: 0
+        updated_at:
+          type: string
+          format: date-time
+    RestoreExecutionRecord:
+      type: object
+      required:
+        - contract_version
+        - job_id
+        - plan_id
+        - plan_hash
+        - plan_checksum
+        - precondition_checksum
+        - status
+        - reason_code
+        - started_at
+        - completed_at
+        - executed_by
+        - chunk_size
+        - workflow_mode
+        - workflow_allowlist
+        - elevated_confirmation_used
+        - capabilities_used
+        - resume_attempt_count
+        - checkpoint
+        - summary
+        - chunks
+        - row_outcomes
+        - media_outcomes
+      properties:
+        contract_version:
+          type: string
+          enum:
+            - restore.contracts.v1
+        job_id:
+          type: string
+        plan_id:
+          type: string
+        plan_hash:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        plan_checksum:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        precondition_checksum:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        status:
+          type: string
+          enum:
+            - paused
+            - completed
+            - failed
+        reason_code:
+          $ref: '#/components/schemas/RestoreReasonCode'
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        executed_by:
+          type: string
+        chunk_size:
+          type: integer
+          minimum: 1
+        workflow_mode:
+          type: string
+          enum:
+            - suppressed_default
+            - allowlist
+        workflow_allowlist:
+          type: array
+          items:
+            type: string
+        elevated_confirmation_used:
+          type: boolean
+        capabilities_used:
+          type: array
+          items:
+            $ref: '#/components/schemas/RestoreCapability'
+        resume_attempt_count:
+          type: integer
+          minimum: 0
+        checkpoint:
+          $ref: '#/components/schemas/ExecutionResumeCheckpoint'
+        summary:
+          $ref: '#/components/schemas/RestoreExecutionSummary'
+        chunks:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExecutionChunkOutcome'
+        row_outcomes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExecutionRowOutcome'
+        media_outcomes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ExecutionMediaOutcome'
+    ExecutionEvidenceSummary:
+      type: object
+      required:
+        - evidence_id
+        - signature_verification
+        - reused
+      properties:
+        evidence_id:
+          type: string
+        signature_verification:
+          type: string
+          enum:
+            - verified
+            - verification_failed
+        reused:
+          type: boolean
+    EvidenceResumeMetadata:
+      type: object
+      required:
+        - resume_attempt_count
+        - checkpoint_id
+        - next_chunk_index
+        - total_chunks
+        - last_chunk_id
+        - plan_checksum
+        - precondition_checksum
+      properties:
+        resume_attempt_count:
+          type: integer
+          minimum: 0
+        checkpoint_id:
+          type: string
+        next_chunk_index:
+          type: integer
+          minimum: 0
+        total_chunks:
+          type: integer
+          minimum: 0
+        last_chunk_id:
+          type: string
+          nullable: true
+        plan_checksum:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        precondition_checksum:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+    RestoreEvidenceArtifactHash:
+      type: object
+      required:
+        - artifact_id
+        - sha256
+        - bytes
+      properties:
+        artifact_id:
+          type: string
+        sha256:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        bytes:
+          type: integer
+          minimum: 0
+    RestoreEvidenceSignature:
+      type: object
+      required:
+        - signature_algorithm
+        - signer_key_id
+        - signature
+        - signature_verification
+        - signed_at
+      properties:
+        signature_algorithm:
+          type: string
+          enum:
+            - ed25519
+            - rsa-pss-sha256
+        signer_key_id:
+          type: string
+        signature:
+          type: string
+        signature_verification:
+          type: string
+          enum:
+            - verified
+            - verification_pending
+            - verification_failed
+        signed_at:
+          type: string
+          format: date-time
+    RestoreEvidenceRecord:
+      type: object
+      required:
+        - contract_version
+        - evidence_id
+        - job_id
+        - plan_hash
+        - report_hash
+        - pit_algorithm_version
+        - backup_timestamp
+        - approved_scope
+        - schema_drift_summary
+        - conflict_summary
+        - delete_decision_summary
+        - execution_outcomes
+        - resume_metadata
+        - artifact_hashes
+        - canonicalization_version
+        - manifest_signature
+        - immutable_storage
+        - approval
+      properties:
+        contract_version:
+          type: string
+          enum:
+            - restore.contracts.v1
+        evidence_id:
+          type: string
+        job_id:
+          type: string
+        plan_hash:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        report_hash:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        pit_algorithm_version:
+          type: string
+          enum:
+            - pit.v1.sys_updated_on-sys_mod_count-__time-event_id
+        backup_timestamp:
+          type: string
+          format: date-time
+        approved_scope:
+          type: object
+          additionalProperties: true
+        schema_drift_summary:
+          type: object
+          required:
+            - compatible_columns
+            - incompatible_columns
+            - override_applied
+          properties:
+            compatible_columns:
+              type: integer
+              minimum: 0
+            incompatible_columns:
+              type: integer
+              minimum: 0
+            override_applied:
+              type: boolean
+        conflict_summary:
+          type: object
+          required:
+            - total
+            - unresolved
+          properties:
+            total:
+              type: integer
+              minimum: 0
+            unresolved:
+              type: integer
+              minimum: 0
+        delete_decision_summary:
+          type: object
+          required:
+            - allow_deletion
+            - skip_deletion
+          properties:
+            allow_deletion:
+              type: integer
+              minimum: 0
+            skip_deletion:
+              type: integer
+              minimum: 0
+        execution_outcomes:
+          type: object
+          required:
+            - rows_applied
+            - rows_skipped
+            - rows_failed
+            - attachments_applied
+            - attachments_skipped
+            - attachments_failed
+          properties:
+            rows_applied:
+              type: integer
+              minimum: 0
+            rows_skipped:
+              type: integer
+              minimum: 0
+            rows_failed:
+              type: integer
+              minimum: 0
+            attachments_applied:
+              type: integer
+              minimum: 0
+            attachments_skipped:
+              type: integer
+              minimum: 0
+            attachments_failed:
+              type: integer
+              minimum: 0
+        resume_metadata:
+          $ref: '#/components/schemas/EvidenceResumeMetadata'
+        artifact_hashes:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/RestoreEvidenceArtifactHash'
+        canonicalization_version:
+          type: string
+          enum:
+            - evidence.canonical-json.v1
+        manifest_signature:
+          $ref: '#/components/schemas/RestoreEvidenceSignature'
+        immutable_storage:
+          type: object
+          required:
+            - worm_enabled
+            - retention_class
+          properties:
+            worm_enabled:
+              type: boolean
+            retention_class:
+              type: string
+        approval:
+          $ref: '#/components/schemas/ApprovalPlaceholder'
+    EvidenceVerificationStatus:
+      type: object
+      required:
+        - signature_verification
+        - reason_code
+        - report_hash_matches
+        - artifact_hashes_match
+        - signature_valid
+        - verified_at
+      properties:
+        signature_verification:
+          type: string
+          enum:
+            - verified
+            - verification_failed
+        reason_code:
+          type: string
+          enum:
+            - none
+            - failed_evidence_report_hash_mismatch
+            - failed_evidence_artifact_hash_mismatch
+            - failed_evidence_signature_verification
+        report_hash_matches:
+          type: boolean
+        artifact_hashes_match:
+          type: boolean
+        signature_valid:
+          type: boolean
+        verified_at:
+          type: string
+          format: date-time
+    EvidenceResponse:
+      type: object
+      required:
+        - evidence
+        - verification
+        - manifest_sha256
+        - generated_at
+      properties:
+        evidence:
+          $ref: '#/components/schemas/RestoreEvidenceRecord'
+        verification:
+          $ref: '#/components/schemas/EvidenceVerificationStatus'
+        manifest_sha256:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        generated_at:
+          type: string
+          format: date-time
+        reused:
+          type: boolean
+    RestoreJournalEntry:
+      type: object
+      required:
+        - contract_version
+        - journal_id
+        - job_id
+        - plan_hash
+        - plan_row_id
+        - table
+        - record_sys_id
+        - action
+        - touched_fields
+        - chunk_id
+        - row_attempt
+        - executed_by
+        - executed_at
+        - outcome
+      properties:
+        contract_version:
+          type: string
+          enum:
+            - restore.contracts.v1
+        journal_id:
+          type: string
+        job_id:
+          type: string
+        plan_hash:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        plan_row_id:
+          type: string
+        table:
+          type: string
+        record_sys_id:
+          type: string
+        action:
+          type: string
+          enum:
+            - update
+            - insert
+            - delete
+            - skip
+        touched_fields:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        before_image_enc:
+          type: object
+          additionalProperties: true
+        chunk_id:
+          type: string
+        row_attempt:
+          type: integer
+          minimum: 1
+        executed_by:
+          type: string
+        executed_at:
+          type: string
+          format: date-time
+        outcome:
+          type: string
+          enum:
+            - applied
+            - skipped
+            - failed
+        error_code:
+          $ref: '#/components/schemas/RestoreReasonCode'
+    RestoreJournalMirrorRecord:
+      type: object
+      required:
+        - mirror_id
+        - journal_id
+        - job_id
+        - plan_hash
+        - plan_row_id
+        - table
+        - record_sys_id
+        - action
+        - outcome
+        - reason_code
+        - chunk_id
+        - row_attempt
+        - linked_at
+      properties:
+        mirror_id:
+          type: string
+        journal_id:
+          type: string
+        job_id:
+          type: string
+        plan_hash:
+          type: string
+          pattern: '^[a-fA-F0-9]{64}$'
+        plan_row_id:
+          type: string
+        table:
+          type: string
+        record_sys_id:
+          type: string
+        action:
+          type: string
+          enum:
+            - update
+            - insert
+            - delete
+            - skip
+        outcome:
+          type: string
+          enum:
+            - applied
+            - skipped
+            - failed
+        reason_code:
+          $ref: '#/components/schemas/RestoreReasonCode'
+        chunk_id:
+          type: string
+        row_attempt:
+          type: integer
+          minimum: 1
+        linked_at:
+          type: string
+          format: date-time
+    RollbackJournalResponse:
+      type: object
+      required:
+        - rollback_journal
+        - sn_mirror
+      properties:
+        rollback_journal:
+          type: array
+          items:
+            $ref: '#/components/schemas/RestoreJournalEntry'
+        sn_mirror:
+          type: array
+          items:
+            $ref: '#/components/schemas/RestoreJournalMirrorRecord'
+    AuthFailure:
+      type: object
+      required:
+        - error
+        - reason_code
+      properties:
+        error:
+          type: string
+          enum:
+            - unauthorized
+        reason_code:
+          type: string
+          enum:
+            - denied_token_expired
+            - denied_token_invalid_signature
+            - denied_token_wrong_service_scope
+            - denied_token_malformed
+    ScopeBlockedFailure:
+      type: object
+      required:
+        - error
+        - reason_code
+        - message
+      properties:
+        error:
+          type: string
+          enum:
+            - scope_blocked
+        reason_code:
+          type: string
+          enum:
+            - blocked_unknown_source_mapping
+            - blocked_plan_hash_mismatch
+            - blocked_missing_capability
+            - blocked_unresolved_delete_candidates
+            - blocked_unresolved_media_candidates
+            - blocked_reference_conflict
+            - blocked_media_parent_missing
+            - blocked_freshness_stale
+            - blocked_freshness_unknown
+            - blocked_auth_control_plane_outage
+            - blocked_evidence_not_ready
+            - blocked_resume_precondition_mismatch
+            - blocked_resume_checkpoint_missing
+            - paused_token_refresh_grace_exhausted
+            - paused_entitlement_disabled
+            - paused_instance_disabled
+            - failed_media_parent_missing
+            - failed_media_hash_mismatch
+            - failed_media_retry_exhausted
+            - failed_evidence_report_hash_mismatch
+            - failed_evidence_artifact_hash_mismatch
+            - failed_evidence_signature_verification
+            - failed_schema_conflict
+            - failed_permission_conflict
+            - failed_internal_error
+        message:
+          type: string
+    ExecuteFailure:
+      type: object
+      required:
+        - error
+        - message
+      properties:
+        error:
+          type: string
+        reason_code:
+          $ref: '#/components/schemas/RestoreReasonCode'
+        message:
+          type: string
