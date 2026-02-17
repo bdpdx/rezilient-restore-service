@@ -5,7 +5,9 @@
 - `env.ts`: restore-service environment parsing.
 - `server.ts`: HTTP routes for health, dry-run planning, job create/read, job
   events, execute/resume/checkpoint/rollback-journal, signed evidence export,
-  and job completion (lock release).
+  job completion (lock release), and RS-14 admin ops summary APIs.
+- `admin/ops-admin-service.ts`: RS-14 admin summary builder for queue/locks,
+  freshness/backfill heuristics, and evidence verification listing output.
 - `auth/claims.ts`: token claim parsing/validation for RS-02 claim profile.
 - `auth/jwt.ts`: HS256 JWT sign/verify helpers for scoped token checks.
 - `auth/authenticator.ts`: auth middleware helper enforcing `rrs` scope.
@@ -46,5 +48,5 @@
   tests for report/artifact/signature integrity checks.
 - `server.integration.test.ts`: auth + source-mapping fail-closed integration
   tests through HTTP endpoints, plus RS-08 dry-run, RS-09 execute endpoint
-  coverage, RS-11 media API integration coverage, and RS-12 evidence endpoint
-  integration coverage.
+  coverage, RS-11 media API integration coverage, RS-12 evidence endpoint
+  integration coverage, and RS-14 admin ops endpoint coverage.

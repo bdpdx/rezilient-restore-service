@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { Server } from 'node:http';
 import { test } from 'node:test';
+import { RestoreOpsAdminService } from './admin/ops-admin-service';
 import { RequestAuthenticator } from './auth/authenticator';
 import { RestoreEvidenceService } from './evidence/evidence-service';
 import { RestoreExecutionService } from './execute/execute-service';
@@ -94,6 +95,29 @@ async function getJson(
     };
 }
 
+async function getAdminJson(
+    baseUrl: string,
+    path: string,
+    adminToken?: string,
+): Promise<ResponseData> {
+    const headers: Record<string, string> = {};
+
+    if (adminToken) {
+        headers['x-rezilient-admin-token'] = adminToken;
+    }
+
+    const response = await fetch(`${baseUrl}${path}`, {
+        method: 'GET',
+        headers,
+    });
+    const body = await response.json() as Record<string, unknown>;
+
+    return {
+        status: response.status,
+        body,
+    };
+}
+
 function createService(
     signingKey: string,
     options?: {
@@ -107,6 +131,7 @@ function createService(
             mediaMaxBytes?: number;
             mediaMaxRetryAttempts?: number;
         };
+        adminToken?: string;
     },
 ): Server {
     const sourceRegistry = new SourceRegistry([
@@ -149,13 +174,17 @@ function createService(
         },
         now,
     );
+    const admin = new RestoreOpsAdminService(jobs, plans, evidence);
 
     return createRestoreServiceServer({
+        admin,
         authenticator,
         evidence,
         execute,
         jobs,
         plans,
+    }, {
+        adminToken: options?.adminToken,
     });
 }
 
@@ -1366,6 +1395,130 @@ test('evidence endpoints return signed verified export payload after terminal ex
         >;
 
         assert.equal(exportedEvidence.evidence_id, evidence.evidence_id);
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('admin ops endpoints require admin token when configured', async () => {
+    const signingKey = 'test-signing-key';
+    const server = createService(signingKey, {
+        adminToken: 'admin-secret',
+    });
+    const baseUrl = await listen(server);
+
+    try {
+        const unauthorized = await getAdminJson(
+            baseUrl,
+            '/v1/admin/ops/overview',
+        );
+
+        assert.equal(unauthorized.status, 403);
+        assert.equal(unauthorized.body.reason_code, 'admin_auth_required');
+
+        const authorized = await getAdminJson(
+            baseUrl,
+            '/v1/admin/ops/overview',
+            'admin-secret',
+        );
+
+        assert.equal(authorized.status, 200);
+        assert.equal(typeof authorized.body.queue, 'object');
+        assert.equal(typeof authorized.body.freshness, 'object');
+        assert.equal(typeof authorized.body.evidence, 'object');
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('admin ops endpoints expose queue, freshness, and evidence summaries', async () => {
+    const signingKey = 'test-signing-key';
+    const adminToken = 'admin-secret';
+    const server = createService(signingKey, {
+        adminToken,
+    });
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+
+    try {
+        const firstPlan = await createPlanAndJob(
+            baseUrl,
+            token,
+            'admin-plan-queue-01',
+        );
+        const secondPlan = await createPlanAndJob(
+            baseUrl,
+            token,
+            'admin-plan-queue-02',
+            {
+                dryRunOverrides: {
+                    watermarks: [
+                        createWatermark({
+                            freshness: 'stale',
+                            executability: 'preview_only',
+                            reasonCode: 'blocked_freshness_stale',
+                        }),
+                    ],
+                },
+            },
+        );
+
+        const queue = await getAdminJson(
+            baseUrl,
+            '/v1/admin/ops/queue',
+            adminToken,
+        );
+
+        assert.equal(queue.status, 200);
+        const queueTotals = queue.body.totals as Record<string, unknown>;
+        assert.equal(queueTotals.running_jobs, 1);
+        assert.equal(queueTotals.queued_jobs, 1);
+        const waitReasonCounts = queue.body
+            .wait_reason_counts as Record<string, unknown>;
+        assert.equal(waitReasonCounts.queued_scope_lock, 1);
+
+        const execute = await postJson(
+            baseUrl,
+            `/v1/jobs/${firstPlan.jobId}/execution`,
+            token,
+            createExecutePayload(),
+        );
+        assert.equal(execute.status, 200);
+
+        const evidenceExport = await postJson(
+            baseUrl,
+            `/v1/jobs/${firstPlan.jobId}/evidence/export`,
+            token,
+            {},
+        );
+        assert.equal(evidenceExport.status, 200);
+
+        const freshness = await getAdminJson(
+            baseUrl,
+            '/v1/admin/ops/freshness',
+            adminToken,
+        );
+        assert.equal(freshness.status, 200);
+        const freshnessTotals = freshness.body.totals as Record<string, unknown>;
+        assert.equal(freshnessTotals.source_count, 1);
+        assert.equal(freshnessTotals.stale_source_count, 1);
+
+        const evidence = await getAdminJson(
+            baseUrl,
+            '/v1/admin/ops/evidence',
+            adminToken,
+        );
+        assert.equal(evidence.status, 200);
+        const evidenceTotals = evidence.body.totals as Record<string, unknown>;
+        assert.equal(evidenceTotals.total, 1);
+        assert.equal(evidenceTotals.verified, 1);
+
+        const evidenceRows = evidence.body.evidences as Array<Record<
+            string,
+            unknown
+        >>;
+        assert.equal(evidenceRows[0].job_id, firstPlan.jobId);
+        assert.equal(typeof secondPlan.jobId, 'string');
     } finally {
         await closeServer(server);
     }

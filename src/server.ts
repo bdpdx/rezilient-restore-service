@@ -6,17 +6,23 @@ import {
 } from 'node:http';
 import { URL } from 'node:url';
 import { RequestAuthenticator } from './auth/authenticator';
+import { RestoreOpsAdminService } from './admin/ops-admin-service';
 import { RestoreEvidenceService } from './evidence/evidence-service';
 import { RestoreExecutionService } from './execute/execute-service';
 import { RestoreJobService } from './jobs/job-service';
 import { RestorePlanService } from './plans/plan-service';
 
 export interface RestoreServiceDependencies {
+    admin: RestoreOpsAdminService;
     authenticator: RequestAuthenticator;
     evidence: RestoreEvidenceService;
     execute: RestoreExecutionService;
     jobs: RestoreJobService;
     plans: RestorePlanService;
+}
+
+export interface RestoreServiceServerOptions {
+    adminToken?: string;
 }
 
 async function readJsonBody(
@@ -157,8 +163,24 @@ function asPlanId(pathname: string): string | null {
     return decodeURIComponent(match[1]);
 }
 
+function isAdminPath(pathname: string): boolean {
+    return pathname.startsWith('/v1/admin/');
+}
+
+function isAdminAuthorized(
+    request: IncomingMessage,
+    options?: RestoreServiceServerOptions,
+): boolean {
+    if (!options?.adminToken) {
+        return true;
+    }
+
+    return request.headers['x-rezilient-admin-token'] === options.adminToken;
+}
+
 export function createRestoreServiceServer(
     deps: RestoreServiceDependencies,
+    options?: RestoreServiceServerOptions,
 ): Server {
     return createServer(async (request, response) => {
         try {
@@ -169,6 +191,51 @@ export function createRestoreServiceServer(
             if (method === 'GET' && pathname === '/v1/health') {
                 sendJson(response, 200, {
                     ok: true,
+                });
+
+                return;
+            }
+
+            if (isAdminPath(pathname)) {
+                if (!isAdminAuthorized(request, options)) {
+                    sendJson(response, 403, {
+                        error: 'forbidden',
+                        reason_code: 'admin_auth_required',
+                    });
+
+                    return;
+                }
+
+                if (method === 'GET' && pathname === '/v1/admin/ops/queue') {
+                    sendJson(response, 200, deps.admin.getQueueDashboard());
+
+                    return;
+                }
+
+                if (method === 'GET' && pathname === '/v1/admin/ops/freshness') {
+                    sendJson(response, 200, deps.admin.getFreshnessDashboard());
+
+                    return;
+                }
+
+                if (method === 'GET' && pathname === '/v1/admin/ops/evidence') {
+                    sendJson(response, 200, deps.admin.getEvidenceDashboard());
+
+                    return;
+                }
+
+                if (method === 'GET' && pathname === '/v1/admin/ops/overview') {
+                    sendJson(response, 200, {
+                        queue: deps.admin.getQueueDashboard(),
+                        freshness: deps.admin.getFreshnessDashboard(),
+                        evidence: deps.admin.getEvidenceDashboard(),
+                    });
+
+                    return;
+                }
+
+                sendJson(response, 404, {
+                    error: 'not_found',
                 });
 
                 return;

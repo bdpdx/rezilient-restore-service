@@ -471,6 +471,14 @@ export class RestoreEvidenceService {
         return cloneRecord(existing);
     }
 
+    listEvidence(): EvidenceExportRecord[] {
+        return Array.from(this.byJobId.values())
+            .map((record) => cloneRecord(record))
+            .sort((left, right) => {
+                return left.generated_at.localeCompare(right.generated_at);
+            });
+    }
+
     validateEvidenceRecord(
         record: EvidenceExportRecord,
     ): EvidenceVerificationRecord {

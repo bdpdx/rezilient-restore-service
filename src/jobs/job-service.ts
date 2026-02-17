@@ -347,6 +347,29 @@ export class RestoreJobService {
         return [...(this.events.get(jobId) || [])];
     }
 
+    listJobs(): RestoreJobRecord[] {
+        return Array.from(this.jobs.values())
+            .map((job) => ({
+                ...job,
+                lock_scope_tables: [...job.lock_scope_tables],
+                required_capabilities: [...job.required_capabilities],
+                wait_tables: [...job.wait_tables],
+                approval: {
+                    ...job.approval,
+                },
+            }))
+            .sort((left, right) => {
+                return left.requested_at.localeCompare(right.requested_at);
+            });
+    }
+
+    getLockSnapshot(): {
+        running: Array<{ jobId: string; tables: string[] }>;
+        queued: Array<{ jobId: string; tables: string[] }>;
+    } {
+        return this.lockManager.snapshot();
+    }
+
     listPlans(): RestorePlanMetadataRecord[] {
         return Array.from(this.plans.values());
     }

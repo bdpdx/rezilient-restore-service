@@ -310,6 +310,18 @@ export class RestorePlanService {
         return this.plans.get(planId) || null;
     }
 
+    listPlans(): RestoreDryRunPlanRecord[] {
+        return Array.from(this.plans.values())
+            .map((record) =>
+                JSON.parse(JSON.stringify(record)) as RestoreDryRunPlanRecord
+            )
+            .sort((left, right) => {
+                return left.plan.generated_at.localeCompare(
+                    right.plan.generated_at,
+                );
+            });
+    }
+
     private validateScopeRequest(
         request: CreateDryRunPlanRequest,
         claims: AuthTokenClaims,

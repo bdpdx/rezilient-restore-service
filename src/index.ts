@@ -1,6 +1,7 @@
 import { createRestoreServiceServer } from './server';
 import { parseRestoreServiceEnv } from './env';
 import { RequestAuthenticator } from './auth/authenticator';
+import { RestoreOpsAdminService } from './admin/ops-admin-service';
 import { RestoreEvidenceService } from './evidence/evidence-service';
 import { RestoreExecutionService } from './execute/execute-service';
 import { RestoreLockManager } from './locks/lock-manager';
@@ -51,12 +52,16 @@ async function main(): Promise<void> {
         tokenClockSkewSeconds: env.authClockSkewSeconds,
         expectedIssuer: env.authExpectedIssuer,
     });
+    const admin = new RestoreOpsAdminService(jobs, plans, evidence);
     const server = createRestoreServiceServer({
+        admin,
         authenticator,
         evidence,
         execute,
         jobs,
         plans,
+    }, {
+        adminToken: process.env.RRS_ADMIN_TOKEN,
     });
 
     await new Promise<void>((resolve) => {
