@@ -5,6 +5,10 @@ import { RestoreJobService } from '../jobs/job-service';
 import { RestoreLockManager } from '../locks/lock-manager';
 import { RestorePlanService } from '../plans/plan-service';
 import { SourceRegistry } from '../registry/source-registry';
+import {
+    TEST_EVIDENCE_SIGNING_PRIVATE_KEY_PEM,
+    TEST_EVIDENCE_SIGNING_PUBLIC_KEY_PEM,
+} from '../test-helpers';
 import { RestoreEvidenceService } from './evidence-service';
 
 const FIXED_NOW = new Date('2026-02-17T01:02:03.000Z');
@@ -94,6 +98,8 @@ function createFixture() {
         {
             signer: {
                 signer_key_id: 'rrs-test-signer',
+                private_key_pem: TEST_EVIDENCE_SIGNING_PRIVATE_KEY_PEM,
+                public_key_pem: TEST_EVIDENCE_SIGNING_PUBLIC_KEY_PEM,
             },
             immutable_storage: {
                 worm_enabled: true,

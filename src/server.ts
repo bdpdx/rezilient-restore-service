@@ -23,15 +23,33 @@ export interface RestoreServiceDependencies {
 
 export interface RestoreServiceServerOptions {
     adminToken?: string;
+    maxJsonBodyBytes?: number;
+}
+
+const DEFAULT_MAX_JSON_BODY_BYTES = 1_048_576;
+
+class RequestBodyTooLargeError extends Error {
+    constructor(public readonly maxBytes: number) {
+        super(`request body exceeded max of ${maxBytes} bytes`);
+    }
 }
 
 async function readJsonBody(
     request: IncomingMessage,
+    maxJsonBodyBytes: number,
 ): Promise<Record<string, unknown>> {
     const chunks: Buffer[] = [];
+    let totalBytes = 0;
 
     for await (const chunk of request) {
-        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        totalBytes += buffer.length;
+
+        if (totalBytes > maxJsonBodyBytes) {
+            throw new RequestBodyTooLargeError(maxJsonBodyBytes);
+        }
+
+        chunks.push(buffer);
     }
 
     if (chunks.length === 0) {
@@ -172,7 +190,7 @@ function isAdminAuthorized(
     options?: RestoreServiceServerOptions,
 ): boolean {
     if (!options?.adminToken) {
-        return true;
+        return false;
     }
 
     return request.headers['x-rezilient-admin-token'] === options.adminToken;
@@ -182,6 +200,9 @@ export function createRestoreServiceServer(
     deps: RestoreServiceDependencies,
     options?: RestoreServiceServerOptions,
 ): Server {
+    const maxJsonBodyBytes = options?.maxJsonBodyBytes ||
+        DEFAULT_MAX_JSON_BODY_BYTES;
+
     return createServer(async (request, response) => {
         try {
             const method = request.method || 'GET';
@@ -240,7 +261,7 @@ export function createRestoreServiceServer(
                 }
 
                 if (method === 'POST' && pathname === '/v1/admin/ops/staging-mode') {
-                    const body = await readJsonBody(request);
+                    const body = await readJsonBody(request, maxJsonBodyBytes);
                     const enabled = body.enabled;
                     const actor = body.actor;
 
@@ -275,7 +296,7 @@ export function createRestoreServiceServer(
                     method === 'POST' &&
                     pathname === '/v1/admin/ops/runbooks-signoff'
                 ) {
-                    const body = await readJsonBody(request);
+                    const body = await readJsonBody(request, maxJsonBodyBytes);
                     const signedOff = body.signed_off;
                     const actor = body.actor;
 
@@ -307,7 +328,7 @@ export function createRestoreServiceServer(
                 }
 
                 if (method === 'POST' && pathname === '/v1/admin/ops/failure-drills') {
-                    const body = await readJsonBody(request);
+                    const body = await readJsonBody(request, maxJsonBodyBytes);
                     const drillId = body.drill_id;
                     const status = body.status;
                     const actor = body.actor;
@@ -405,7 +426,7 @@ export function createRestoreServiceServer(
             }
 
             if (method === 'POST' && pathname === '/v1/jobs') {
-                const body = await readJsonBody(request);
+                const body = await readJsonBody(request, maxJsonBodyBytes);
                 const result = deps.jobs.createJob(
                     body,
                     authResult.auth.claims,
@@ -429,7 +450,7 @@ export function createRestoreServiceServer(
             }
 
             if (method === 'POST' && pathname === '/v1/plans/dry-run') {
-                const body = await readJsonBody(request);
+                const body = await readJsonBody(request, maxJsonBodyBytes);
                 const result = deps.plans.createDryRunPlan(
                     body,
                     authResult.auth.claims,
@@ -636,7 +657,7 @@ export function createRestoreServiceServer(
                 const resumeJobId = asJobResumePath(pathname);
 
                 if (resumeJobId) {
-                    const body = await readJsonBody(request);
+                    const body = await readJsonBody(request, maxJsonBodyBytes);
                     const result = deps.execute.resumeJob(
                         resumeJobId,
                         body,
@@ -688,7 +709,7 @@ export function createRestoreServiceServer(
                 const executeJobId = asJobExecutionPath(pathname);
 
                 if (executeJobId) {
-                    const body = await readJsonBody(request);
+                    const body = await readJsonBody(request, maxJsonBodyBytes);
                     const result = deps.execute.executeJob(
                         executeJobId,
                         body,
@@ -740,7 +761,7 @@ export function createRestoreServiceServer(
                 const jobId = asJobCompletePath(pathname);
 
                 if (jobId) {
-                    const body = await readJsonBody(request);
+                    const body = await readJsonBody(request, maxJsonBodyBytes);
                     const result = deps.jobs.completeJob(jobId, body);
 
                     if (!result.success) {
@@ -765,6 +786,16 @@ export function createRestoreServiceServer(
                 error: 'not_found',
             });
         } catch (error: unknown) {
+            if (error instanceof RequestBodyTooLargeError) {
+                sendJson(response, 413, {
+                    error: 'payload_too_large',
+                    reason_code: 'request_body_too_large',
+                    message: error.message,
+                });
+
+                return;
+            }
+
             const message = error instanceof Error
                 ? error.message
                 : 'unknown_error';

@@ -11,7 +11,11 @@ import { RestoreLockManager } from './locks/lock-manager';
 import { RestorePlanService } from './plans/plan-service';
 import { SourceRegistry } from './registry/source-registry';
 import { createRestoreServiceServer } from './server';
-import { buildScopedToken } from './test-helpers';
+import {
+    buildScopedToken,
+    TEST_EVIDENCE_SIGNING_PRIVATE_KEY_PEM,
+    TEST_EVIDENCE_SIGNING_PUBLIC_KEY_PEM,
+} from './test-helpers';
 
 interface ResponseData {
     status: number;
@@ -159,6 +163,7 @@ function createService(
             mediaMaxRetryAttempts?: number;
         };
         adminToken?: string;
+        bodyMaxBytes?: number;
     },
 ): Server {
     const sourceRegistry = new SourceRegistry([
@@ -193,6 +198,8 @@ function createService(
         {
             signer: {
                 signer_key_id: 'rrs-test-signer',
+                private_key_pem: TEST_EVIDENCE_SIGNING_PRIVATE_KEY_PEM,
+                public_key_pem: TEST_EVIDENCE_SIGNING_PUBLIC_KEY_PEM,
             },
             immutable_storage: {
                 worm_enabled: true,
@@ -212,6 +219,7 @@ function createService(
         plans,
     }, {
         adminToken: options?.adminToken,
+        maxJsonBodyBytes: options?.bodyMaxBytes,
     });
 }
 
@@ -1443,6 +1451,15 @@ test('admin ops endpoints require admin token when configured', async () => {
         assert.equal(unauthorized.status, 403);
         assert.equal(unauthorized.body.reason_code, 'admin_auth_required');
 
+        const wrongToken = await getAdminJson(
+            baseUrl,
+            '/v1/admin/ops/overview',
+            'wrong-admin-token',
+        );
+
+        assert.equal(wrongToken.status, 403);
+        assert.equal(wrongToken.body.reason_code, 'admin_auth_required');
+
         const authorized = await getAdminJson(
             baseUrl,
             '/v1/admin/ops/overview',
@@ -1455,6 +1472,37 @@ test('admin ops endpoints require admin token when configured', async () => {
         assert.equal(typeof authorized.body.evidence, 'object');
         assert.equal(typeof authorized.body.slo, 'object');
         assert.equal(typeof authorized.body.ga_readiness, 'object');
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('oversized JSON request returns 413 request_body_too_large', async () => {
+    const signingKey = 'test-signing-key';
+    const server = createService(signingKey, {
+        adminToken: 'admin-secret',
+        bodyMaxBytes: 256,
+    });
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+    const oversized = {
+        payload: 'x'.repeat(1024),
+    };
+
+    try {
+        const response = await postJson(
+            baseUrl,
+            '/v1/jobs',
+            token,
+            oversized,
+        );
+
+        assert.equal(response.status, 413);
+        assert.equal(response.body.error, 'payload_too_large');
+        assert.equal(
+            response.body.reason_code,
+            'request_body_too_large',
+        );
     } finally {
         await closeServer(server);
     }

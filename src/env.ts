@@ -2,9 +2,11 @@ import { SourceMappingInput } from './registry/source-registry';
 
 export interface RestoreServiceEnv {
     port: number;
+    adminToken: string;
     authSigningKey: string;
     authClockSkewSeconds: number;
     authExpectedIssuer?: string;
+    maxJsonBodyBytes: number;
     executeDefaultChunkSize: number;
     executeMaxRows: number;
     executeElevatedSkipRatioPercent: number;
@@ -14,8 +16,8 @@ export interface RestoreServiceEnv {
     executeMediaMaxBytes: number;
     executeMediaMaxRetryAttempts: number;
     evidenceSignerKeyId: string;
-    evidenceSigningPrivateKeyPem?: string;
-    evidenceSigningPublicKeyPem?: string;
+    evidenceSigningPrivateKeyPem: string;
+    evidenceSigningPublicKeyPem: string;
     evidenceImmutableWormEnabled: boolean;
     evidenceImmutableRetentionClass: string;
     stagingModeEnabled: boolean;
@@ -179,24 +181,47 @@ function parseOptionalString(raw: string | undefined): string | undefined {
     return trimmed ? trimmed : undefined;
 }
 
+function parseRequiredString(
+    raw: string | undefined,
+    fieldName: string,
+): string {
+    const parsed = parseOptionalString(raw);
+
+    if (!parsed) {
+        throw new Error(`${fieldName} is required`);
+    }
+
+    return parsed;
+}
+
 export function parseRestoreServiceEnv(
     env: NodeJS.ProcessEnv,
 ): RestoreServiceEnv {
-    const authSigningKey = env.RRS_AUTH_SIGNING_KEY ||
-        env.AUTH_SIGNING_KEY ||
-        'rez_restore_dev_signing_key';
-
-    const authExpectedIssuer = env.RRS_AUTH_EXPECTED_ISSUER;
+    const authExpectedIssuer = parseOptionalString(
+        env.RRS_AUTH_EXPECTED_ISSUER,
+    );
 
     return {
         port: parsePositiveInteger(env.PORT, 'PORT', 3100),
-        authSigningKey,
+        adminToken: parseRequiredString(
+            env.RRS_ADMIN_TOKEN,
+            'RRS_ADMIN_TOKEN',
+        ),
+        authSigningKey: parseRequiredString(
+            env.RRS_AUTH_SIGNING_KEY,
+            'RRS_AUTH_SIGNING_KEY',
+        ),
         authClockSkewSeconds: parsePositiveInteger(
             env.RRS_AUTH_TOKEN_CLOCK_SKEW_SECONDS,
             'RRS_AUTH_TOKEN_CLOCK_SKEW_SECONDS',
             30,
         ),
         authExpectedIssuer,
+        maxJsonBodyBytes: parseStrictPositiveInteger(
+            env.RRS_MAX_JSON_BODY_BYTES,
+            'RRS_MAX_JSON_BODY_BYTES',
+            1048576,
+        ),
         executeDefaultChunkSize: parseStrictPositiveInteger(
             env.RRS_EXECUTE_DEFAULT_CHUNK_SIZE,
             'RRS_EXECUTE_DEFAULT_CHUNK_SIZE',
@@ -240,11 +265,13 @@ export function parseRestoreServiceEnv(
         evidenceSignerKeyId: parseOptionalString(
             env.RRS_EVIDENCE_SIGNER_KEY_ID,
         ) || 'rrs-dev-ed25519-v1',
-        evidenceSigningPrivateKeyPem: parseOptionalString(
+        evidenceSigningPrivateKeyPem: parseRequiredString(
             env.RRS_EVIDENCE_SIGNING_PRIVATE_KEY_PEM,
+            'RRS_EVIDENCE_SIGNING_PRIVATE_KEY_PEM',
         ),
-        evidenceSigningPublicKeyPem: parseOptionalString(
+        evidenceSigningPublicKeyPem: parseRequiredString(
             env.RRS_EVIDENCE_SIGNING_PUBLIC_KEY_PEM,
+            'RRS_EVIDENCE_SIGNING_PUBLIC_KEY_PEM',
         ),
         evidenceImmutableWormEnabled: parseBoolean(
             env.RRS_EVIDENCE_IMMUTABLE_WORM_ENABLED,

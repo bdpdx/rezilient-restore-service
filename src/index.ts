@@ -70,7 +70,8 @@ async function main(): Promise<void> {
         jobs,
         plans,
     }, {
-        adminToken: process.env.RRS_ADMIN_TOKEN,
+        adminToken: env.adminToken,
+        maxJsonBodyBytes: env.maxJsonBodyBytes,
     });
 
     await new Promise<void>((resolve) => {
@@ -93,6 +94,7 @@ async function main(): Promise<void> {
         evidence_immutable_retention_class: env.evidenceImmutableRetentionClass,
         staging_mode_enabled: env.stagingModeEnabled,
         ga_runbooks_signed_off: env.gaRunbooksSignedOff,
+        max_json_body_bytes: env.maxJsonBodyBytes,
         mapping_count: sourceRegistry.list().length,
         port: env.port,
     });
