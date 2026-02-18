@@ -5,7 +5,9 @@ import { RestoreOpsAdminService } from './admin/ops-admin-service';
 import { RestoreEvidenceService } from './evidence/evidence-service';
 import { RestoreExecutionService } from './execute/execute-service';
 import { RestoreLockManager } from './locks/lock-manager';
+import { SqliteRestoreJobStateStore } from './jobs/job-state-store';
 import { RestoreJobService } from './jobs/job-service';
+import { SqliteRestorePlanStateStore } from './plans/plan-state-store';
 import { RestorePlanService } from './plans/plan-service';
 import { SourceRegistry } from './registry/source-registry';
 
@@ -14,9 +16,24 @@ export * from './constants';
 async function main(): Promise<void> {
     const env = parseRestoreServiceEnv(process.env);
     const sourceRegistry = new SourceRegistry(env.sourceMappings);
+    const planStateStore = new SqliteRestorePlanStateStore(
+        env.coreStateDbPath,
+    );
+    const jobStateStore = new SqliteRestoreJobStateStore(
+        env.coreStateDbPath,
+    );
     const lockManager = new RestoreLockManager();
-    const jobs = new RestoreJobService(lockManager, sourceRegistry);
-    const plans = new RestorePlanService(sourceRegistry);
+    const jobs = new RestoreJobService(
+        lockManager,
+        sourceRegistry,
+        undefined,
+        jobStateStore,
+    );
+    const plans = new RestorePlanService(
+        sourceRegistry,
+        undefined,
+        planStateStore,
+    );
     const execute = new RestoreExecutionService(
         jobs,
         plans,
@@ -95,6 +112,7 @@ async function main(): Promise<void> {
         staging_mode_enabled: env.stagingModeEnabled,
         ga_runbooks_signed_off: env.gaRunbooksSignedOff,
         max_json_body_bytes: env.maxJsonBodyBytes,
+        core_state_db_path: env.coreStateDbPath,
         mapping_count: sourceRegistry.list().length,
         port: env.port,
     });

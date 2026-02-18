@@ -12,6 +12,7 @@ function buildEnv(
     return {
         RRS_ADMIN_TOKEN: 'admin-token-0123456789abcdef',
         RRS_AUTH_SIGNING_KEY: '0123456789abcdef0123456789abcdef',
+        RRS_CORE_STATE_DB_PATH: '/tmp/rez-restore-service.test.sqlite',
         RRS_EVIDENCE_SIGNER_KEY_ID: 'rrs-test-ed25519-v1',
         RRS_EVIDENCE_SIGNING_PRIVATE_KEY_PEM:
             TEST_EVIDENCE_SIGNING_PRIVATE_KEY_PEM,
@@ -60,4 +61,12 @@ test('startup config fails when RRS_EVIDENCE_SIGNING_PUBLIC_KEY_PEM is missing',
             RRS_EVIDENCE_SIGNING_PUBLIC_KEY_PEM: undefined,
         }));
     }, /RRS_EVIDENCE_SIGNING_PUBLIC_KEY_PEM is required/);
+});
+
+test('startup config fails when RRS_CORE_STATE_DB_PATH is missing', () => {
+    assert.throws(() => {
+        parseRestoreServiceEnv(buildEnv({
+            RRS_CORE_STATE_DB_PATH: undefined,
+        }));
+    }, /RRS_CORE_STATE_DB_PATH is required/);
 });

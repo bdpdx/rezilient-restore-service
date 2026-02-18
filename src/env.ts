@@ -7,6 +7,7 @@ export interface RestoreServiceEnv {
     authClockSkewSeconds: number;
     authExpectedIssuer?: string;
     maxJsonBodyBytes: number;
+    coreStateDbPath: string;
     executeDefaultChunkSize: number;
     executeMaxRows: number;
     executeElevatedSkipRatioPercent: number;
@@ -221,6 +222,10 @@ export function parseRestoreServiceEnv(
             env.RRS_MAX_JSON_BODY_BYTES,
             'RRS_MAX_JSON_BODY_BYTES',
             1048576,
+        ),
+        coreStateDbPath: parseRequiredString(
+            env.RRS_CORE_STATE_DB_PATH,
+            'RRS_CORE_STATE_DB_PATH',
         ),
         executeDefaultChunkSize: parseStrictPositiveInteger(
             env.RRS_EXECUTE_DEFAULT_CHUNK_SIZE,

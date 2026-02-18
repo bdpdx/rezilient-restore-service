@@ -26,13 +26,20 @@ export interface ReleaseResult {
     promoted: LockPromotion[];
 }
 
-interface QueueEntry {
+export interface RestoreLockQueueEntry {
     jobId: string;
     tenantId: string;
     instanceId: string;
     tables: string[];
     reasonCode: RestoreReasonCode;
 }
+
+export interface RestoreLockManagerState {
+    running_jobs: RestoreLockQueueEntry[];
+    queued_jobs: RestoreLockQueueEntry[];
+}
+
+type QueueEntry = RestoreLockQueueEntry;
 
 function normalizeTables(tables: string[]): string[] {
     const normalized = new Set<string>();
@@ -60,12 +67,93 @@ function lockKey(
     return `${tenantId}|${instanceId}|${table}`;
 }
 
+function normalizeQueueEntry(entry: RestoreLockQueueEntry): QueueEntry {
+    const tables = normalizeTables(entry.tables);
+
+    if (tables.length === 0) {
+        throw new Error('lock state entry must include at least one table');
+    }
+
+    return {
+        jobId: entry.jobId,
+        tenantId: entry.tenantId,
+        instanceId: entry.instanceId,
+        tables,
+        reasonCode: entry.reasonCode,
+    };
+}
+
 export class RestoreLockManager {
     private readonly activeLocks = new Map<string, string>();
 
     private readonly runningJobs = new Map<string, QueueEntry>();
 
     private readonly queue: QueueEntry[] = [];
+
+    constructor(initialState?: RestoreLockManagerState) {
+        if (!initialState) {
+            return;
+        }
+
+        this.loadState(initialState);
+    }
+
+    loadState(state: RestoreLockManagerState): void {
+        this.activeLocks.clear();
+        this.runningJobs.clear();
+        this.queue.length = 0;
+
+        for (const running of state.running_jobs) {
+            const normalized = normalizeQueueEntry(running);
+
+            if (this.runningJobs.has(normalized.jobId)) {
+                throw new Error(
+                    `duplicate running lock state for job ${normalized.jobId}`,
+                );
+            }
+
+            this.runningJobs.set(normalized.jobId, normalized);
+
+            for (const table of normalized.tables) {
+                const key = lockKey(
+                    normalized.tenantId,
+                    normalized.instanceId,
+                    table,
+                );
+
+                if (this.activeLocks.has(key)) {
+                    throw new Error(
+                        `duplicate running lock for ${key} in persisted state`,
+                    );
+                }
+
+                this.activeLocks.set(key, normalized.jobId);
+            }
+        }
+
+        for (const queued of state.queued_jobs) {
+            this.queue.push(normalizeQueueEntry(queued));
+        }
+    }
+
+    exportState(): RestoreLockManagerState {
+        return {
+            running_jobs: Array.from(this.runningJobs.values()).map((entry) => ({
+                jobId: entry.jobId,
+                tenantId: entry.tenantId,
+                instanceId: entry.instanceId,
+                tables: [...entry.tables],
+                reasonCode: entry.reasonCode,
+            })),
+            queued_jobs: this.queue.map((entry) => ({
+                jobId: entry.jobId,
+                tenantId: entry.tenantId,
+                instanceId: entry.instanceId,
+                tables: [...entry.tables],
+                reasonCode: entry.reasonCode,
+            })),
+        };
+    }
 
     acquire(request: LockRequest): LockDecision {
         const tables = normalizeTables(request.tables);

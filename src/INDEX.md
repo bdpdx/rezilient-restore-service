@@ -31,14 +31,20 @@
 - `plans/models.ts`: RS-08 dry-run request/response and gate model contracts.
 - `plans/plan-service.ts`: RS-08 deterministic dry-run plan generation and
   freshness/deletion/conflict executability gating.
+- `plans/plan-state-store.ts`: durable SQLite + in-memory state store adapters
+  for dry-run plans.
 - `locks/lock-manager.ts`: `(tenant, instance, table)` lock acquisition,
-  queueing, release, and queued-job promotion.
+  queueing, release, queued-job promotion, and lock-state import/export.
 - `jobs/models.ts`: request schemas and runtime record types for plans/jobs.
 - `jobs/job-service.ts`: restore job orchestration with plan metadata,
-  lock-state transitions, and queue audit events.
+  lock-state transitions, queue audit events, and durable state-store writes.
+- `jobs/job-state-store.ts`: durable SQLite + in-memory state store adapters
+  for plan/job/event and lock-queue snapshots.
 - `test-helpers.ts`: scoped-token fixtures used by integration tests.
 - `db-schema.test.ts`: migration contract tests for RS-06/RS-07/RS-10 schema/
   role expectations.
+- `core-state.durability.test.ts`: stage-10 restart-survival and queue-fairness
+  coverage for persisted plans/jobs/events/locks.
 - `locks/lock-manager.test.ts`: unit tests for lock overlap and promotion.
 - `jobs/job-service.test.ts`: concurrency tests for non-overlapping job runs and
   queued overlap promotion.

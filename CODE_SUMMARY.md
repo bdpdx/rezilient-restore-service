@@ -7,6 +7,8 @@ Purpose:
   - dry-run planning with deterministic `plan_hash`,
   - freshness/deletion/conflict executability gating,
   - scoped lock queueing by `(tenant, instance, table)`,
+  - durable SQLite-backed persistence for dry-run plans, job metadata,
+    job-audit events, and lock queue ownership across restart,
   - RS-09 execute orchestration with capability/conflict enforcement,
     chunk-first apply, and row-level fallback recording,
   - RS-10 checksum-gated resume checkpoints and authoritative rollback-journal
@@ -28,6 +30,8 @@ Entrypoints:
 - `src/plans/models.ts`: RS-08 dry-run request/response/gate schemas.
 - `src/plans/plan-service.ts`: RS-08 dry-run orchestration, deterministic hash
   generation, and freshness/deletion/conflict gate evaluation.
+- `src/plans/plan-state-store.ts`: durable/in-memory state stores for
+  persisted dry-run plan records.
 - `src/execute/models.ts`: RS-09 execute request and result schemas.
 - `src/execute/execute-service.ts`: RS-09 execute engine plus RS-10 resume flow
   enforcing plan immutability, capability checks, conflict matrix rules, chunk
@@ -40,8 +44,10 @@ Entrypoints:
 - `src/admin/ops-admin-service.ts`: RS-14/RS-15 admin ops summary service for
   queue/freshness/evidence plus SLO burn-rate and GA gate readiness checks.
 - `src/jobs/job-service.ts`: restore job orchestration and queue audit events.
+- `src/jobs/job-state-store.ts`: durable/in-memory state stores for plan/job/
+  event metadata and persisted lock queue snapshots.
 - `src/locks/lock-manager.ts`: lock acquisition/release and queued-job
-  promotion.
+  promotion, plus import/export helpers for persisted lock-state recovery.
 - `db/migrations/0001_restore_index_plane.sql`: RS-06 restore index tables.
 - `db/migrations/0002_restore_index_roles.sql`: RS-06 index role grants.
 - `db/migrations/0003_restore_job_plane.sql`: RS-07 job/plan/lock queue schema.
@@ -56,6 +62,8 @@ Tests:
   approval placeholders, and role grants.
 - `src/locks/lock-manager.test.ts`: lock overlap arbitration tests.
 - `src/jobs/job-service.test.ts`: parallel non-overlap and queued overlap tests.
+- `src/core-state.durability.test.ts`: restart-survival and queue-fairness
+  tests for durable plan/job/event/lock state.
 - `src/execute/execute-service.test.ts`: RS-09 conflict matrix and chunk
   fallback coverage, plus RS-10 checkpoint/resume and journal linkage tests,
   plus RS-11 media cap/parent/hash/retry behavior tests.

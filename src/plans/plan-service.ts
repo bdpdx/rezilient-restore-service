@@ -22,6 +22,10 @@ import {
     RestoreDryRunPlanRecord,
     RestorePitResolutionRecord,
 } from './models';
+import {
+    InMemoryRestorePlanStateStore,
+    RestorePlanStateStore,
+} from './plan-state-store';
 
 function buildActionCounts(
     request: CreateDryRunPlanRequest,
@@ -212,11 +216,11 @@ function buildPitResolutions(
 }
 
 export class RestorePlanService {
-    private readonly plans = new Map<string, RestoreDryRunPlanRecord>();
-
     constructor(
         private readonly sourceRegistry: SourceRegistry,
         private readonly now: () => Date = () => new Date(),
+        private readonly stateStore: RestorePlanStateStore =
+            new InMemoryRestorePlanStateStore(),
     ) {}
 
     createDryRunPlan(
@@ -250,71 +254,79 @@ export class RestorePlanService {
         const actionCounts = buildActionCounts(request);
         const planHashInput = buildPlanHashInput(request, actionCounts);
         const planHashData = computeRestorePlanHash(planHashInput);
-        const existing = this.plans.get(request.plan_id);
+        return this.stateStore.mutate((state) => {
+            const existing = state.plans_by_id[request.plan_id];
 
-        if (existing && existing.plan.plan_hash !== planHashData.plan_hash) {
-            return {
-                success: false,
-                statusCode: 409,
-                error: 'plan_hash_mismatch',
-                reasonCode: 'blocked_plan_hash_mismatch',
-                message: 'plan_id already exists with a different plan_hash',
+            if (existing && existing.plan.plan_hash !== planHashData.plan_hash) {
+                return {
+                    success: false,
+                    statusCode: 409,
+                    error: 'plan_hash_mismatch',
+                    reasonCode: 'blocked_plan_hash_mismatch',
+                    message: 'plan_id already exists with a different plan_hash',
+                };
+            }
+
+            if (existing) {
+                return {
+                    success: true,
+                    statusCode: 200,
+                    record: existing,
+                };
+            }
+
+            const nowIso = normalizeIsoWithMillis(this.now());
+            const gate = evaluateGate(request);
+            const plan = RestorePlan.parse({
+                contract_version: RESTORE_CONTRACT_VERSION,
+                plan_id: request.plan_id,
+                plan_hash: planHashData.plan_hash,
+                plan_hash_algorithm: PLAN_HASH_ALGORITHM,
+                plan_hash_input_version: PLAN_HASH_INPUT_VERSION,
+                generated_at: nowIso,
+                pit: request.pit,
+                scope: request.scope,
+                execution_options: request.execution_options,
+                action_counts: actionCounts,
+                conflicts: request.conflicts,
+                approval: buildApprovalPlaceholder(request.approval),
+                metadata_allowlist_version: RESTORE_METADATA_ALLOWLIST_VERSION,
+            });
+            const record: RestoreDryRunPlanRecord = {
+                tenant_id: request.tenant_id,
+                instance_id: request.instance_id,
+                source: request.source,
+                plan,
+                plan_hash_input: planHashInput,
+                gate,
+                delete_candidates: [...request.delete_candidates],
+                media_candidates: [...request.media_candidates],
+                pit_resolutions: buildPitResolutions(request),
+                watermarks: [...request.watermarks],
             };
-        }
 
-        if (existing) {
+            state.plans_by_id[request.plan_id] = record;
+
             return {
                 success: true,
-                statusCode: 200,
-                record: existing,
+                statusCode: 201,
+                record,
             };
-        }
-
-        const nowIso = normalizeIsoWithMillis(this.now());
-        const gate = evaluateGate(request);
-        const plan = RestorePlan.parse({
-            contract_version: RESTORE_CONTRACT_VERSION,
-            plan_id: request.plan_id,
-            plan_hash: planHashData.plan_hash,
-            plan_hash_algorithm: PLAN_HASH_ALGORITHM,
-            plan_hash_input_version: PLAN_HASH_INPUT_VERSION,
-            generated_at: nowIso,
-            pit: request.pit,
-            scope: request.scope,
-            execution_options: request.execution_options,
-            action_counts: actionCounts,
-            conflicts: request.conflicts,
-            approval: buildApprovalPlaceholder(request.approval),
-            metadata_allowlist_version: RESTORE_METADATA_ALLOWLIST_VERSION,
         });
-        const record: RestoreDryRunPlanRecord = {
-            tenant_id: request.tenant_id,
-            instance_id: request.instance_id,
-            source: request.source,
-            plan,
-            plan_hash_input: planHashInput,
-            gate,
-            delete_candidates: [...request.delete_candidates],
-            media_candidates: [...request.media_candidates],
-            pit_resolutions: buildPitResolutions(request),
-            watermarks: [...request.watermarks],
-        };
-
-        this.plans.set(request.plan_id, record);
-
-        return {
-            success: true,
-            statusCode: 201,
-            record,
-        };
     }
 
     getPlan(planId: string): RestoreDryRunPlanRecord | null {
-        return this.plans.get(planId) || null;
+        const record = this.stateStore.read().plans_by_id[planId];
+
+        if (!record) {
+            return null;
+        }
+
+        return JSON.parse(JSON.stringify(record)) as RestoreDryRunPlanRecord;
     }
 
     listPlans(): RestoreDryRunPlanRecord[] {
-        return Array.from(this.plans.values())
+        return Object.values(this.stateStore.read().plans_by_id)
             .map((record) =>
                 JSON.parse(JSON.stringify(record)) as RestoreDryRunPlanRecord
             )
