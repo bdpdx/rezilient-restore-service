@@ -139,6 +139,9 @@ export interface RestoreDryRunGate {
 }
 
 export interface RestoreDryRunPlanRecord {
+    tenant_id: string;
+    instance_id: string;
+    source: string;
     plan: RestorePlan;
     plan_hash_input: RestorePlanHashInput;
     gate: RestoreDryRunGate;

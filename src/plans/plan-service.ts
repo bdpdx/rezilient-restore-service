@@ -288,6 +288,9 @@ export class RestorePlanService {
             metadata_allowlist_version: RESTORE_METADATA_ALLOWLIST_VERSION,
         });
         const record: RestoreDryRunPlanRecord = {
+            tenant_id: request.tenant_id,
+            instance_id: request.instance_id,
+            source: request.source,
             plan,
             plan_hash_input: planHashInput,
             gate,

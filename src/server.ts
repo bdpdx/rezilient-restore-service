@@ -5,11 +5,14 @@ import {
     ServerResponse,
 } from 'node:http';
 import { URL } from 'node:url';
+import { AuthTokenClaims } from './auth/claims';
 import { RequestAuthenticator } from './auth/authenticator';
 import { RestoreOpsAdminService } from './admin/ops-admin-service';
 import { RestoreEvidenceService } from './evidence/evidence-service';
 import { RestoreExecutionService } from './execute/execute-service';
+import { RestoreJobRecord } from './jobs/models';
 import { RestoreJobService } from './jobs/job-service';
+import { RestoreDryRunPlanRecord } from './plans/models';
 import { RestorePlanService } from './plans/plan-service';
 
 export interface RestoreServiceDependencies {
@@ -194,6 +197,48 @@ function isAdminAuthorized(
     }
 
     return request.headers['x-rezilient-admin-token'] === options.adminToken;
+}
+
+interface ScopedOwnershipRecord {
+    tenant_id: string;
+    instance_id: string;
+    source: string;
+}
+
+const SCOPED_NOT_FOUND_RESPONSE = {
+    error: 'not_found',
+    reason_code: 'blocked_unknown_source_mapping',
+    message: 'resource not found within token scope',
+} as const;
+
+function isScopeMatch(
+    record: ScopedOwnershipRecord,
+    claims: AuthTokenClaims,
+): boolean {
+    return (
+        record.tenant_id === claims.tenant_id &&
+        record.instance_id === claims.instance_id &&
+        record.source === claims.source
+    );
+}
+
+function getScopedRecord<T extends ScopedOwnershipRecord>(
+    record: T | null,
+    claims: AuthTokenClaims,
+): T | null {
+    if (!record) {
+        return null;
+    }
+
+    if (!isScopeMatch(record, claims)) {
+        return null;
+    }
+
+    return record;
+}
+
+function sendScopedNotFound(response: ServerResponse): void {
+    sendJson(response, 404, SCOPED_NOT_FOUND_RESPONSE);
 }
 
 export function createRestoreServiceServer(
@@ -425,11 +470,21 @@ export function createRestoreServiceServer(
                 return;
             }
 
+            const claims = authResult.auth.claims;
+            const getScopedJob = (jobId: string): RestoreJobRecord | null => {
+                return getScopedRecord(deps.jobs.getJob(jobId), claims);
+            };
+            const getScopedPlan = (
+                planId: string,
+            ): RestoreDryRunPlanRecord | null => {
+                return getScopedRecord(deps.plans.getPlan(planId), claims);
+            };
+
             if (method === 'POST' && pathname === '/v1/jobs') {
                 const body = await readJsonBody(request, maxJsonBodyBytes);
                 const result = deps.jobs.createJob(
                     body,
-                    authResult.auth.claims,
+                    claims,
                 );
 
                 if (!result.success) {
@@ -453,7 +508,7 @@ export function createRestoreServiceServer(
                 const body = await readJsonBody(request, maxJsonBodyBytes);
                 const result = deps.plans.createDryRunPlan(
                     body,
-                    authResult.auth.claims,
+                    claims,
                 );
 
                 if (!result.success) {
@@ -483,12 +538,10 @@ export function createRestoreServiceServer(
                 const planId = asPlanId(pathname);
 
                 if (planId) {
-                    const planRecord = deps.plans.getPlan(planId);
+                    const planRecord = getScopedPlan(planId);
 
                     if (!planRecord) {
-                        sendJson(response, 404, {
-                            error: 'not_found',
-                        });
+                        sendScopedNotFound(response);
 
                         return;
                     }
@@ -509,12 +562,10 @@ export function createRestoreServiceServer(
                 const jobId = asJobId(pathname);
 
                 if (jobId) {
-                    const job = deps.jobs.getJob(jobId);
+                    const job = getScopedJob(jobId);
 
                     if (!job) {
-                        sendJson(response, 404, {
-                            error: 'not_found',
-                        });
+                        sendScopedNotFound(response);
 
                         return;
                     }
@@ -529,8 +580,16 @@ export function createRestoreServiceServer(
                 const eventsJobId = asJobEventsPath(pathname);
 
                 if (eventsJobId) {
+                    const job = getScopedJob(eventsJobId);
+
+                    if (!job) {
+                        sendScopedNotFound(response);
+
+                        return;
+                    }
+
                     sendJson(response, 200, {
-                        events: deps.jobs.listJobEvents(eventsJobId),
+                        events: deps.jobs.listJobEvents(job.job_id),
                     });
 
                     return;
@@ -539,7 +598,15 @@ export function createRestoreServiceServer(
                 const executionJobId = asJobExecutionPath(pathname);
 
                 if (executionJobId) {
-                    const execution = deps.execute.getExecution(executionJobId);
+                    const job = getScopedJob(executionJobId);
+
+                    if (!job) {
+                        sendScopedNotFound(response);
+
+                        return;
+                    }
+
+                    const execution = deps.execute.getExecution(job.job_id);
 
                     if (!execution) {
                         sendJson(response, 404, {
@@ -559,8 +626,16 @@ export function createRestoreServiceServer(
                 const checkpointJobId = asJobCheckpointPath(pathname);
 
                 if (checkpointJobId) {
+                    const job = getScopedJob(checkpointJobId);
+
+                    if (!job) {
+                        sendScopedNotFound(response);
+
+                        return;
+                    }
+
                     const checkpoint = deps.execute.getCheckpoint(
-                        checkpointJobId,
+                        job.job_id,
                     );
 
                     if (!checkpoint) {
@@ -581,8 +656,16 @@ export function createRestoreServiceServer(
                 const rollbackJournalJobId = asJobRollbackJournalPath(pathname);
 
                 if (rollbackJournalJobId) {
+                    const job = getScopedJob(rollbackJournalJobId);
+
+                    if (!job) {
+                        sendScopedNotFound(response);
+
+                        return;
+                    }
+
                     const journal = deps.execute.getRollbackJournal(
-                        rollbackJournalJobId,
+                        job.job_id,
                     );
 
                     if (!journal) {
@@ -604,7 +687,15 @@ export function createRestoreServiceServer(
                 const evidenceJobId = asJobEvidencePath(pathname);
 
                 if (evidenceJobId) {
-                    const evidence = deps.evidence.getEvidence(evidenceJobId);
+                    const job = getScopedJob(evidenceJobId);
+
+                    if (!job) {
+                        sendScopedNotFound(response);
+
+                        return;
+                    }
+
+                    const evidence = deps.evidence.getEvidence(job.job_id);
 
                     if (!evidence) {
                         sendJson(response, 404, {
@@ -629,8 +720,16 @@ export function createRestoreServiceServer(
                 const evidenceExportJobId = asJobEvidenceExportPath(pathname);
 
                 if (evidenceExportJobId) {
+                    const job = getScopedJob(evidenceExportJobId);
+
+                    if (!job) {
+                        sendScopedNotFound(response);
+
+                        return;
+                    }
+
                     const result = deps.evidence.exportEvidence(
-                        evidenceExportJobId,
+                        job.job_id,
                     );
 
                     if (!result.success) {
@@ -657,11 +756,19 @@ export function createRestoreServiceServer(
                 const resumeJobId = asJobResumePath(pathname);
 
                 if (resumeJobId) {
+                    const job = getScopedJob(resumeJobId);
+
+                    if (!job) {
+                        sendScopedNotFound(response);
+
+                        return;
+                    }
+
                     const body = await readJsonBody(request, maxJsonBodyBytes);
                     const result = deps.execute.resumeJob(
-                        resumeJobId,
+                        job.job_id,
                         body,
-                        authResult.auth.claims,
+                        claims,
                     );
 
                     if (!result.success) {
@@ -713,7 +820,7 @@ export function createRestoreServiceServer(
                     const result = deps.execute.executeJob(
                         executeJobId,
                         body,
-                        authResult.auth.claims,
+                        claims,
                     );
 
                     if (!result.success) {
@@ -761,8 +868,16 @@ export function createRestoreServiceServer(
                 const jobId = asJobCompletePath(pathname);
 
                 if (jobId) {
+                    const job = getScopedJob(jobId);
+
+                    if (!job) {
+                        sendScopedNotFound(response);
+
+                        return;
+                    }
+
                     const body = await readJsonBody(request, maxJsonBodyBytes);
-                    const result = deps.jobs.completeJob(jobId, body);
+                    const result = deps.jobs.completeJob(job.job_id, body);
 
                     if (!result.success) {
                         sendJson(response, result.statusCode, {

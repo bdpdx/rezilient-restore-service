@@ -223,7 +223,15 @@ function createService(
     });
 }
 
-function createToken(signingKey: string, scope: 'reg' | 'rrs' = 'rrs'): string {
+function createToken(
+    signingKey: string,
+    scope: 'reg' | 'rrs' = 'rrs',
+    overrides?: Partial<{
+        tenantId: string;
+        instanceId: string;
+        source: string;
+    }>,
+): string {
     const issuedAt = Math.floor(now().getTime() / 1000);
 
     return buildScopedToken({
@@ -231,7 +239,19 @@ function createToken(signingKey: string, scope: 'reg' | 'rrs' = 'rrs'): string {
         issuedAt,
         signingKey,
         scope,
+        tenantId: overrides?.tenantId,
+        instanceId: overrides?.instanceId,
+        source: overrides?.source,
     });
+}
+
+function assertScopedNotFound(response: ResponseData): void {
+    assert.equal(response.status, 404);
+    assert.equal(response.body.error, 'not_found');
+    assert.equal(
+        response.body.reason_code,
+        'blocked_unknown_source_mapping',
+    );
 }
 
 function createJobPayload(source: string): Record<string, unknown> {
@@ -578,6 +598,296 @@ test('wrong service scope token is rejected by auth middleware', async () => {
         assert.equal(
             response.body.reason_code,
             'denied_token_wrong_service_scope',
+        );
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('object-level authorization gates scoped reads and object actions', async () => {
+    const signingKey = 'test-signing-key';
+    const server = createService(signingKey, {
+        executeConfig: {
+            maxChunksPerAttempt: 1,
+            elevatedSkipRatioPercent: 100,
+        },
+    });
+    const baseUrl = await listen(server);
+    const inScopeToken = createToken(signingKey);
+    const crossTenantToken = createToken(signingKey, 'rrs', {
+        tenantId: 'tenant-other',
+    });
+    const crossInstanceToken = createToken(signingKey, 'rrs', {
+        instanceId: 'sn-prod-99',
+    });
+
+    try {
+        const readyPlanId = 'plan-authz-ready';
+        const readyFixture = await createPlanAndJob(
+            baseUrl,
+            inScopeToken,
+            readyPlanId,
+        );
+        const readyExecute = await postJson(
+            baseUrl,
+            `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}/execution`,
+            inScopeToken,
+            createExecutePayload({
+                capabilities: ['restore_execute'],
+                chunkSize: 1,
+            }),
+        );
+
+        assert.equal(readyExecute.status, 202);
+        const readyExecution = readyExecute.body.execution as Record<
+            string,
+            unknown
+        >;
+        const readyResume = await postJson(
+            baseUrl,
+            `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}/resume`,
+            inScopeToken,
+            {
+                operator_id: 'operator@example.com',
+                operator_capabilities: ['restore_execute'],
+                expected_plan_checksum: readyExecution.plan_checksum,
+                expected_precondition_checksum:
+                    readyExecution.precondition_checksum,
+            },
+        );
+
+        assert.equal(readyResume.status, 200);
+
+        const pausedPlanId = 'plan-authz-paused';
+        const pausedFixture = await createPlanAndJob(
+            baseUrl,
+            inScopeToken,
+            pausedPlanId,
+        );
+        const pausedExecute = await postJson(
+            baseUrl,
+            `/v1/jobs/${encodeURIComponent(pausedFixture.jobId)}/execution`,
+            inScopeToken,
+            createExecutePayload({
+                capabilities: ['restore_execute'],
+                chunkSize: 1,
+            }),
+        );
+
+        assert.equal(pausedExecute.status, 202);
+        const pausedExecution = pausedExecute.body.execution as Record<
+            string,
+            unknown
+        >;
+
+        const completeFixture = await createPlanAndJob(
+            baseUrl,
+            inScopeToken,
+            'plan-authz-complete',
+        );
+
+        const resumePayload = {
+            operator_id: 'operator@example.com',
+            operator_capabilities: ['restore_execute'],
+            expected_plan_checksum: pausedExecution.plan_checksum,
+            expected_precondition_checksum:
+                pausedExecution.precondition_checksum,
+        };
+        const completePayload = {
+            status: 'completed',
+            reason_code: 'none',
+        };
+        const protectedRequests: Array<{
+            method: 'GET' | 'POST';
+            path: string;
+            payload?: Record<string, unknown>;
+        }> = [
+            {
+                method: 'GET',
+                path: `/v1/plans/${encodeURIComponent(readyPlanId)}`,
+            },
+            {
+                method: 'GET',
+                path: `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}`,
+            },
+            {
+                method: 'GET',
+                path:
+                    `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
+                    '/events',
+            },
+            {
+                method: 'GET',
+                path:
+                    `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
+                    '/execution',
+            },
+            {
+                method: 'GET',
+                path:
+                    `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
+                    '/checkpoint',
+            },
+            {
+                method: 'GET',
+                path:
+                    `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
+                    '/rollback-journal',
+            },
+            {
+                method: 'GET',
+                path:
+                    `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
+                    '/evidence',
+            },
+            {
+                method: 'POST',
+                path:
+                    `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
+                    '/evidence/export',
+                payload: {},
+            },
+            {
+                method: 'POST',
+                path:
+                    `/v1/jobs/${encodeURIComponent(pausedFixture.jobId)}` +
+                    '/resume',
+                payload: resumePayload,
+            },
+            {
+                method: 'POST',
+                path:
+                    `/v1/jobs/${encodeURIComponent(completeFixture.jobId)}` +
+                    '/complete',
+                payload: completePayload,
+            },
+        ];
+
+        for (const token of [crossTenantToken, crossInstanceToken]) {
+            for (const request of protectedRequests) {
+                const response = request.method === 'GET'
+                    ? await getJson(baseUrl, request.path, token)
+                    : await postJson(
+                        baseUrl,
+                        request.path,
+                        token,
+                        request.payload || {},
+                    );
+
+                assertScopedNotFound(response);
+            }
+        }
+
+        assert.equal(
+            (
+                await getJson(
+                    baseUrl,
+                    `/v1/plans/${encodeURIComponent(readyPlanId)}`,
+                    inScopeToken,
+                )
+            ).status,
+            200,
+        );
+        assert.equal(
+            (
+                await getJson(
+                    baseUrl,
+                    `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}`,
+                    inScopeToken,
+                )
+            ).status,
+            200,
+        );
+        assert.equal(
+            (
+                await getJson(
+                    baseUrl,
+                    `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
+                    '/events',
+                    inScopeToken,
+                )
+            ).status,
+            200,
+        );
+        assert.equal(
+            (
+                await getJson(
+                    baseUrl,
+                    `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
+                    '/execution',
+                    inScopeToken,
+                )
+            ).status,
+            200,
+        );
+        assert.equal(
+            (
+                await getJson(
+                    baseUrl,
+                    `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
+                    '/checkpoint',
+                    inScopeToken,
+                )
+            ).status,
+            200,
+        );
+        assert.equal(
+            (
+                await getJson(
+                    baseUrl,
+                    `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
+                    '/rollback-journal',
+                    inScopeToken,
+                )
+            ).status,
+            200,
+        );
+        assert.equal(
+            (
+                await getJson(
+                    baseUrl,
+                    `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
+                    '/evidence',
+                    inScopeToken,
+                )
+            ).status,
+            200,
+        );
+        assert.equal(
+            (
+                await postJson(
+                    baseUrl,
+                    `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
+                    '/evidence/export',
+                    inScopeToken,
+                    {},
+                )
+            ).status,
+            200,
+        );
+        assert.equal(
+            (
+                await postJson(
+                    baseUrl,
+                    `/v1/jobs/${encodeURIComponent(pausedFixture.jobId)}` +
+                    '/resume',
+                    inScopeToken,
+                    resumePayload,
+                )
+            ).status,
+            200,
+        );
+        assert.equal(
+            (
+                await postJson(
+                    baseUrl,
+                    `/v1/jobs/${encodeURIComponent(completeFixture.jobId)}` +
+                    '/complete',
+                    inScopeToken,
+                    completePayload,
+                )
+            ).status,
+            200,
         );
     } finally {
         await closeServer(server);
