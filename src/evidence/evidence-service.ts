@@ -16,6 +16,11 @@ import { RestoreJobService } from '../jobs/job-service';
 import { RestoreDryRunPlanRecord } from '../plans/models';
 import { RestorePlanService } from '../plans/plan-service';
 import {
+    InMemoryRestoreEvidenceStateStore,
+    RestoreEvidenceState,
+    RestoreEvidenceStateStore,
+} from './evidence-state-store';
+import {
     EvidenceArtifactMaterial,
     EvidenceArtifactRecord,
     EvidenceExportRecord,
@@ -218,8 +223,20 @@ export class RestoreEvidenceService {
         private readonly execute: RestoreExecutionService,
         private readonly config: EvidenceServiceConfig,
         private readonly now: () => Date = () => new Date(),
+        private readonly stateStore: RestoreEvidenceStateStore =
+            new InMemoryRestoreEvidenceStateStore(),
     ) {
         this.signer = createEvidenceSigner(config.signer);
+
+        const state = this.stateStore.read();
+
+        for (const [jobId, record] of Object.entries(state.by_job_id)) {
+            this.byJobId.set(jobId, record);
+        }
+
+        for (const [evidenceId, record] of Object.entries(state.by_evidence_id)) {
+            this.byEvidenceId.set(evidenceId, record);
+        }
     }
 
     exportEvidence(jobId: string): ExportEvidenceResult {
@@ -429,8 +446,7 @@ export class RestoreEvidenceService {
         record.verification = verification;
         record.evidence.manifest_signature.signature_verification =
             verification.signature_verification;
-        this.byJobId.set(jobId, record);
-        this.byEvidenceId.set(record.evidence.evidence_id, record);
+        this.setEvidenceRecord(jobId, record);
 
         return {
             success: true,
@@ -455,8 +471,7 @@ export class RestoreEvidenceService {
         updated.verification = this.validateEvidenceRecord(updated);
         updated.evidence.manifest_signature.signature_verification =
             updated.verification.signature_verification;
-        this.byJobId.set(jobId, cloneRecord(updated));
-        this.byEvidenceId.set(updated.evidence.evidence_id, cloneRecord(updated));
+        this.setEvidenceRecord(jobId, updated);
 
         return updated;
     }
@@ -477,6 +492,45 @@ export class RestoreEvidenceService {
             .sort((left, right) => {
                 return left.generated_at.localeCompare(right.generated_at);
             });
+    }
+
+    private setEvidenceRecord(
+        jobId: string,
+        record: EvidenceExportRecord,
+    ): void {
+        this.byJobId.set(jobId, cloneRecord(record));
+        this.byEvidenceId.set(record.evidence.evidence_id, cloneRecord(record));
+        this.persistState();
+    }
+
+    private persistState(): void {
+        const snapshot = this.snapshotState();
+
+        this.stateStore.mutate((state) => {
+            state.by_job_id = snapshot.by_job_id;
+            state.by_evidence_id = snapshot.by_evidence_id;
+        });
+    }
+
+    private snapshotState(): RestoreEvidenceState {
+        const byJobId: Record<string, EvidenceExportRecord> = {};
+
+        for (const [jobId, record] of this.byJobId.entries()) {
+            byJobId[jobId] = record;
+        }
+
+        const byEvidenceId: Record<string, EvidenceExportRecord> = {};
+
+        for (const [evidenceId, record] of this.byEvidenceId.entries()) {
+            byEvidenceId[evidenceId] = record;
+        }
+
+        return JSON.parse(
+            JSON.stringify({
+                by_job_id: byJobId,
+                by_evidence_id: byEvidenceId,
+            }),
+        ) as RestoreEvidenceState;
     }
 
     validateEvidenceRecord(

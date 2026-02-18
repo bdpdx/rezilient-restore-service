@@ -8,7 +8,8 @@ Purpose:
   - freshness/deletion/conflict executability gating,
   - scoped lock queueing by `(tenant, instance, table)`,
   - durable SQLite-backed persistence for dry-run plans, job metadata,
-    job-audit events, and lock queue ownership across restart,
+    job-audit events, lock queue ownership, execution checkpoints/journals,
+    and evidence export/verification records across restart,
   - RS-09 execute orchestration with capability/conflict enforcement,
     chunk-first apply, and row-level fallback recording,
   - RS-10 checksum-gated resume checkpoints and authoritative rollback-journal
@@ -37,10 +38,14 @@ Entrypoints:
   enforcing plan immutability, capability checks, conflict matrix rules, chunk
   fallback, checkpoint persistence, rollback journal/mirror records, and RS-11
   media candidate execution outcomes.
+- `src/execute/execute-state-store.ts`: durable/in-memory state stores for
+  execution records, checkpoints, and rollback journal linkage.
 - `src/evidence/signature.ts`: canonical payload signing and verification
   helpers for RS-12 evidence.
 - `src/evidence/evidence-service.ts`: RS-12 evidence package builder and
   verifier (artifact hashes, report hash, signed manifest metadata).
+- `src/evidence/evidence-state-store.ts`: durable/in-memory state stores for
+  evidence export records and signature-verification metadata.
 - `src/admin/ops-admin-service.ts`: RS-14/RS-15 admin ops summary service for
   queue/freshness/evidence plus SLO burn-rate and GA gate readiness checks.
 - `src/jobs/job-service.ts`: restore job orchestration and queue audit events.
@@ -64,6 +69,8 @@ Tests:
 - `src/jobs/job-service.test.ts`: parallel non-overlap and queued overlap tests.
 - `src/core-state.durability.test.ts`: restart-survival and queue-fairness
   tests for durable plan/job/event/lock state.
+- `src/execution-evidence.durability.test.ts`: restart-survival tests for
+  paused execution resume and evidence export/read verification state.
 - `src/execute/execute-service.test.ts`: RS-09 conflict matrix and chunk
   fallback coverage, plus RS-10 checkpoint/resume and journal linkage tests,
   plus RS-11 media cap/parent/hash/retry behavior tests.

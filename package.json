@@ -9,7 +9,7 @@
         "build": "tsc -p tsconfig.json",
         "start": "node dist/index.js",
         "start:dev": "ts-node src/index.ts",
-        "test": "npm run build && node --test dist/db-schema.test.js dist/core-state.durability.test.js dist/locks/lock-manager.test.js dist/jobs/job-service.test.js dist/execute/execute-service.test.js dist/evidence/signature.test.js dist/evidence/evidence-service.test.js dist/server.integration.test.js dist/startup.security.test.js"
+        "test": "npm run build && node --test dist/db-schema.test.js dist/core-state.durability.test.js dist/execution-evidence.durability.test.js dist/locks/lock-manager.test.js dist/jobs/job-service.test.js dist/execute/execute-service.test.js dist/evidence/signature.test.js dist/evidence/evidence-service.test.js dist/server.integration.test.js dist/startup.security.test.js"
     },
     "dependencies": {
         "@rezilient/types": "file:../rezilient-types"

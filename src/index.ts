@@ -3,7 +3,9 @@ import { parseRestoreServiceEnv } from './env';
 import { RequestAuthenticator } from './auth/authenticator';
 import { RestoreOpsAdminService } from './admin/ops-admin-service';
 import { RestoreEvidenceService } from './evidence/evidence-service';
+import { SqliteRestoreEvidenceStateStore } from './evidence/evidence-state-store';
 import { RestoreExecutionService } from './execute/execute-service';
+import { SqliteRestoreExecutionStateStore } from './execute/execute-state-store';
 import { RestoreLockManager } from './locks/lock-manager';
 import { SqliteRestoreJobStateStore } from './jobs/job-state-store';
 import { RestoreJobService } from './jobs/job-service';
@@ -20,6 +22,12 @@ async function main(): Promise<void> {
         env.coreStateDbPath,
     );
     const jobStateStore = new SqliteRestoreJobStateStore(
+        env.coreStateDbPath,
+    );
+    const executeStateStore = new SqliteRestoreExecutionStateStore(
+        env.coreStateDbPath,
+    );
+    const evidenceStateStore = new SqliteRestoreEvidenceStateStore(
         env.coreStateDbPath,
     );
     const lockManager = new RestoreLockManager();
@@ -47,6 +55,8 @@ async function main(): Promise<void> {
             mediaMaxBytes: env.executeMediaMaxBytes,
             mediaMaxRetryAttempts: env.executeMediaMaxRetryAttempts,
         },
+        undefined,
+        executeStateStore,
     );
     const evidence = new RestoreEvidenceService(
         jobs,
@@ -63,6 +73,8 @@ async function main(): Promise<void> {
                 retention_class: env.evidenceImmutableRetentionClass,
             },
         },
+        undefined,
+        evidenceStateStore,
     );
     const authenticator = new RequestAuthenticator({
         signingKey: env.authSigningKey,

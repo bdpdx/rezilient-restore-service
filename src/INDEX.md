@@ -19,6 +19,8 @@
   handling with checksum-gated checkpoints, conflict/capability enforcement,
   chunk/row fallback result recording, rollback-journal mirror linkage, and
   RS-11 attachment/media selection + cap/hash/retry enforcement.
+- `execute/execute-state-store.ts`: durable SQLite + in-memory state store
+  adapters for execution records/checkpoints and rollback journal linkage.
 - `evidence/models.ts`: RS-12 evidence export model and verification result
   contracts.
 - `evidence/signature.ts`: RS-12 canonical payload signing/verification helpers
@@ -26,6 +28,8 @@
 - `evidence/evidence-service.ts`: RS-12 signed evidence package generation,
   deterministic artifact/report hashing, immutable-storage metadata capture,
   and tamper-verification logic.
+- `evidence/evidence-state-store.ts`: durable SQLite + in-memory state store
+  adapters for evidence export and signature-verification state.
 - `registry/source-registry.ts`: tenant/instance/source mapping registry and
   fail-closed scope validation.
 - `plans/models.ts`: RS-08 dry-run request/response and gate model contracts.
@@ -45,6 +49,8 @@
   role expectations.
 - `core-state.durability.test.ts`: stage-10 restart-survival and queue-fairness
   coverage for persisted plans/jobs/events/locks.
+- `execution-evidence.durability.test.ts`: stage-11 restart-survival coverage
+  for paused execution resume and evidence export/read consistency.
 - `locks/lock-manager.test.ts`: unit tests for lock overlap and promotion.
 - `jobs/job-service.test.ts`: concurrency tests for non-overlapping job runs and
   queued overlap promotion.

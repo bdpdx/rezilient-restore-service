@@ -14,6 +14,11 @@ import { RestoreJobService } from '../jobs/job-service';
 import { RestoreDryRunPlanRecord } from '../plans/models';
 import { RestorePlanService } from '../plans/plan-service';
 import {
+    InMemoryRestoreExecutionStateStore,
+    RestoreExecutionState,
+    RestoreExecutionStateStore,
+} from './execute-state-store';
+import {
     ExecuteChunkOutcome,
     ExecuteRestoreJobRequest,
     ExecuteRestoreJobRequestSchema,
@@ -419,11 +424,31 @@ export class RestoreExecutionService {
         private readonly plans: RestorePlanService,
         config?: Partial<ExecuteServiceConfig>,
         private readonly now: () => Date = () => new Date(),
+        private readonly stateStore: RestoreExecutionStateStore =
+            new InMemoryRestoreExecutionStateStore(),
     ) {
         this.config = {
             ...DEFAULT_EXECUTE_CONFIG,
             ...(config || {}),
         };
+
+        const state = this.stateStore.read();
+
+        for (const [jobId, record] of Object.entries(state.records_by_job_id)) {
+            this.records.set(jobId, record);
+        }
+
+        for (
+            const [jobId, entries] of Object.entries(
+                state.rollback_journal_by_job_id,
+            )
+        ) {
+            this.rollbackJournal.set(jobId, entries);
+        }
+
+        for (const [jobId, entries] of Object.entries(state.sn_mirror_by_job_id)) {
+            this.snMirrors.set(jobId, entries);
+        }
     }
 
     executeJob(
@@ -593,8 +618,6 @@ export class RestoreExecutionService {
             row_outcomes: [],
             media_outcomes: [],
         };
-
-        this.records.set(jobId, record);
 
         return this.processAttempt(
             job,
@@ -826,6 +849,53 @@ export class RestoreExecutionService {
         };
     }
 
+    private setExecutionRecord(
+        jobId: string,
+        record: RestoreExecutionRecord,
+    ): void {
+        this.records.set(jobId, record);
+        this.persistState();
+    }
+
+    private persistState(): void {
+        const snapshot = this.snapshotState();
+
+        this.stateStore.mutate((state) => {
+            state.records_by_job_id = snapshot.records_by_job_id;
+            state.rollback_journal_by_job_id =
+                snapshot.rollback_journal_by_job_id;
+            state.sn_mirror_by_job_id = snapshot.sn_mirror_by_job_id;
+        });
+    }
+
+    private snapshotState(): RestoreExecutionState {
+        const recordsByJobId: Record<string, RestoreExecutionRecord> = {};
+
+        for (const [jobId, record] of this.records.entries()) {
+            recordsByJobId[jobId] = record;
+        }
+
+        const rollbackJournalByJobId: Record<string, RestoreJournalEntry[]> = {};
+
+        for (const [jobId, entries] of this.rollbackJournal.entries()) {
+            rollbackJournalByJobId[jobId] = entries;
+        }
+
+        const snMirrorByJobId: Record<string, RestoreJournalMirrorRecord[]> = {};
+
+        for (const [jobId, entries] of this.snMirrors.entries()) {
+            snMirrorByJobId[jobId] = entries;
+        }
+
+        return JSON.parse(
+            JSON.stringify({
+                records_by_job_id: recordsByJobId,
+                rollback_journal_by_job_id: rollbackJournalByJobId,
+                sn_mirror_by_job_id: snMirrorByJobId,
+            }),
+        ) as RestoreExecutionState;
+    }
+
     private processAttempt(
         job: RestoreJobRecord,
         plan: RestoreDryRunPlanRecord,
@@ -868,7 +938,7 @@ export class RestoreExecutionService {
                 record.media_outcomes,
             );
 
-            this.records.set(job.job_id, record);
+            this.setExecutionRecord(job.job_id, record);
 
             return {
                 success: true,
@@ -1017,7 +1087,7 @@ export class RestoreExecutionService {
             record.reason_code = 'paused_token_refresh_grace_exhausted';
             record.completed_at = null;
 
-            this.records.set(job.job_id, record);
+            this.setExecutionRecord(job.job_id, record);
 
             return {
                 success: true,
@@ -1064,7 +1134,7 @@ export class RestoreExecutionService {
         record.reason_code = terminalReason;
         record.completed_at = normalizeIsoWithMillis(this.now());
 
-        this.records.set(job.job_id, record);
+        this.setExecutionRecord(job.job_id, record);
 
         return {
             success: true,
