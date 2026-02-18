@@ -54,7 +54,7 @@ function createRow(
                 __time: '2026-02-16T11:59:59.000Z',
                 topic: 'rez.cdc',
                 partition: 1,
-                offset: 100,
+                offset: '100',
             },
         },
         values: action === 'skip'
@@ -163,7 +163,7 @@ function createDryRunPayload(
                 topic: 'rez.cdc',
                 partition: 1,
                 generation_id: 'gen-01',
-                indexed_through_offset: 100,
+                indexed_through_offset: '100',
                 indexed_through_time: '2026-02-16T12:00:00.000Z',
                 coverage_start: '2026-02-16T00:00:00.000Z',
                 coverage_end: '2026-02-16T12:00:00.000Z',

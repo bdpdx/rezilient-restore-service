@@ -291,7 +291,7 @@ function createDryRunRow(rowId: string, recordSysId: string): Record<string, unk
                 __time: '2026-02-16T11:59:59.000Z',
                 topic: 'rez.cdc',
                 partition: 1,
-                offset: 100,
+                offset: '100',
             },
         },
         values: {
@@ -362,7 +362,7 @@ function createWatermark(input?: {
         topic: 'rez.cdc',
         partition: 1,
         generation_id: 'gen-01',
-        indexed_through_offset: 100,
+        indexed_through_offset: '100',
         indexed_through_time: '2026-02-16T12:00:00.000Z',
         coverage_start: '2026-02-16T00:00:00.000Z',
         coverage_end: '2026-02-16T12:00:00.000Z',
@@ -918,6 +918,88 @@ test('dry-run returns executable gate for fresh watermark state', async () => {
     }
 });
 
+test('dry-run accepts large decimal-string offsets and returns string values', async () => {
+    const signingKey = 'test-signing-key';
+    const server = createService(signingKey);
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+    const largeOffset = '900719925474099312345678901234567890';
+    const row = createDryRunRow('row-large-offset', 'rec-large-offset');
+    const metadata = row.metadata as Record<string, unknown>;
+    const metadataFields = metadata.metadata as Record<string, unknown>;
+
+    metadataFields.offset = largeOffset;
+
+    try {
+        const response = await postJson(
+            baseUrl,
+            '/v1/plans/dry-run',
+            token,
+            createDryRunPayload('plan-large-offset', {
+                rows: [row],
+                watermarks: [
+                    {
+                        ...createWatermark(),
+                        indexed_through_offset: `000${largeOffset}`,
+                    },
+                ],
+            }),
+        );
+
+        assert.equal(response.status, 201);
+
+        const watermarks = response.body.watermarks as Record<string, unknown>[];
+        const planHashInput = response.body.plan_hash_input as Record<
+            string,
+            unknown
+        >;
+        const rows = planHashInput.rows as Record<string, unknown>[];
+        const firstRow = rows[0];
+        const parsedRowMetadata = firstRow.metadata as Record<string, unknown>;
+        const parsedMetadataFields = parsedRowMetadata.metadata as Record<
+            string,
+            unknown
+        >;
+
+        assert.equal(watermarks[0].indexed_through_offset, largeOffset);
+        assert.equal(parsedMetadataFields.offset, largeOffset);
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('dry-run rejects invalid watermark offset strings', async () => {
+    const signingKey = 'test-signing-key';
+    const server = createService(signingKey);
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+
+    try {
+        const response = await postJson(
+            baseUrl,
+            '/v1/plans/dry-run',
+            token,
+            createDryRunPayload('plan-invalid-offset', {
+                watermarks: [
+                    {
+                        ...createWatermark(),
+                        indexed_through_offset: '-1',
+                    },
+                ],
+            }),
+        );
+
+        assert.equal(response.status, 400);
+        assert.equal(response.body.error, 'invalid_request');
+        assert.equal(
+            response.body.message,
+            'watermarks[0]: must be non-negative integer offset as decimal string',
+        );
+    } finally {
+        await closeServer(server);
+    }
+});
+
 test('dry-run freshness matrix enforces stale preview-only and unknown blocked', async () => {
     const signingKey = 'test-signing-key';
     const server = createService(signingKey);
@@ -1222,7 +1304,7 @@ test('execute endpoint blocks missing capability for delete actions', async () =
                 __time: '2026-02-16T11:59:59.000Z',
                 topic: 'rez.cdc',
                 partition: 1,
-                offset: 100,
+                offset: '100',
             },
         };
 

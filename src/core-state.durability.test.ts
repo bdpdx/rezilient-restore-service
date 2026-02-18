@@ -94,7 +94,7 @@ function createDryRunRequest(planId: string): Record<string, unknown> {
                         __time: '2026-02-18T15:29:59.000Z',
                         topic: 'rez.cdc',
                         partition: 1,
-                        offset: 42,
+                        offset: '42',
                     },
                 },
                 values: {
@@ -120,7 +120,7 @@ function createDryRunRequest(planId: string): Record<string, unknown> {
                 topic: 'rez.cdc',
                 partition: 1,
                 generation_id: 'gen-01',
-                indexed_through_offset: 100,
+                indexed_through_offset: '100',
                 indexed_through_time: '2026-02-18T15:29:59.000Z',
                 coverage_start: '2026-02-18T00:00:00.000Z',
                 coverage_end: '2026-02-18T15:29:59.000Z',
