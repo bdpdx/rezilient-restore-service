@@ -4,8 +4,9 @@
 - `constants.ts`: RS-06/RS-07 schema profile IDs and auth profile constants.
 - `env.ts`: restore-service environment parsing.
 - `server.ts`: HTTP routes for health, dry-run planning, job create/read, job
-  events, execute/resume/checkpoint/rollback-journal, signed evidence export,
-  job completion (lock release), and RS-14/RS-15 admin ops APIs.
+  events (`/events` and `/events/cross-service`), execute/resume/checkpoint/
+  rollback-journal, signed evidence export, job completion (lock release), and
+  RS-14/RS-15 admin ops APIs.
 - `admin/ops-admin-service.ts`: RS-14/RS-15 admin summary builder for
   queue/locks, freshness/backfill heuristics, evidence verification listing,
   SLO burn-rate checks, and GA-readiness evaluation state.
@@ -41,9 +42,10 @@
   queueing, release, queued-job promotion, and lock-state import/export.
 - `jobs/models.ts`: request schemas and runtime record types for plans/jobs.
 - `jobs/job-service.ts`: restore job orchestration with plan metadata,
-  lock-state transitions, queue audit events, and durable state-store writes.
+  lock-state transitions, legacy queue audit events, normalized cross-service
+  audit emission, and durable state-store writes.
 - `jobs/job-state-store.ts`: durable SQLite + in-memory state store adapters
-  for plan/job/event and lock-queue snapshots.
+  for plan/job/event/cross-service-audit and lock-queue snapshots.
 - `test-helpers.ts`: scoped-token fixtures used by integration tests.
 - `db-schema.test.ts`: migration contract tests for RS-06/RS-07/RS-10 schema/
   role expectations.

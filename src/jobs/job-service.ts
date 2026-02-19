@@ -1,5 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import {
+    compareCrossServiceAuditEventsForReplay,
+    CrossServiceAuditEvent,
+    fromLegacyRestoreJobAuditEvent,
+} from '@rezilient/types';
+import {
     RESTORE_CONTRACT_VERSION,
     RESTORE_METADATA_ALLOWLIST_VERSION,
 } from '../constants';
@@ -368,6 +373,18 @@ export class RestoreJobService {
         return cloneValue(events);
     }
 
+    listCrossServiceJobEvents(jobId: string): CrossServiceAuditEvent[] {
+        const events =
+            this.stateStore.read().cross_service_events_by_job_id[jobId] || [];
+        const ordered = cloneValue(events);
+
+        ordered.sort((left, right) =>
+            compareCrossServiceAuditEventsForReplay(left, right)
+        );
+
+        return ordered;
+    }
+
     listJobs(): RestoreJobRecord[] {
         return Object.values(this.stateStore.read().jobs_by_id)
             .map((job) => cloneValue(job))
@@ -516,10 +533,31 @@ export class RestoreJobService {
 
         if (events) {
             events.push(event);
+        } else {
+            state.events_by_job_id[event.job_id] = [event];
+        }
+
+        const job = state.jobs_by_id[event.job_id];
+
+        if (!job) {
             return;
         }
 
-        state.events_by_job_id[event.job_id] = [event];
+        const normalizedEvent = fromLegacyRestoreJobAuditEvent(event, {
+            instance_id: job.instance_id,
+            plan_hash: job.plan_hash,
+            plan_id: job.plan_id,
+            source: job.source,
+            tenant_id: job.tenant_id,
+        });
+        const crossServiceEvents =
+            state.cross_service_events_by_job_id[event.job_id];
+
+        if (crossServiceEvents) {
+            crossServiceEvents.push(normalizedEvent);
+        } else {
+            state.cross_service_events_by_job_id[event.job_id] = [normalizedEvent];
+        }
     }
 
     private validateScopeRequest(

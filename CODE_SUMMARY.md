@@ -8,8 +8,9 @@ Purpose:
   - freshness/deletion/conflict executability gating,
   - scoped lock queueing by `(tenant, instance, table)`,
   - durable SQLite-backed persistence for dry-run plans, job metadata,
-    job-audit events, lock queue ownership, execution checkpoints/journals,
-    and evidence export/verification records across restart,
+    job-audit events, normalized cross-service audit events, lock queue
+    ownership, execution checkpoints/journals, and evidence export/verification
+    records across restart,
   - RS-09 execute orchestration with capability/conflict enforcement,
     chunk-first apply, and row-level fallback recording,
   - RS-10 checksum-gated resume checkpoints and authoritative rollback-journal
@@ -27,7 +28,8 @@ Purpose:
 Entrypoints:
 - `src/index.ts`: restore-service bootstrap and HTTP server startup.
 - `src/server.ts`: HTTP API handlers for health, dry-run plans, jobs, and
-  queue-state transitions, including evidence export/read APIs.
+  queue-state transitions, including evidence export/read APIs and
+  cross-service job audit read path.
 - `src/plans/models.ts`: RS-08 dry-run request/response/gate schemas.
 - `src/plans/plan-service.ts`: RS-08 dry-run orchestration, deterministic hash
   generation, and freshness/deletion/conflict gate evaluation.
@@ -48,7 +50,8 @@ Entrypoints:
   evidence export records and signature-verification metadata.
 - `src/admin/ops-admin-service.ts`: RS-14/RS-15 admin ops summary service for
   queue/freshness/evidence plus SLO burn-rate and GA gate readiness checks.
-- `src/jobs/job-service.ts`: restore job orchestration and queue audit events.
+- `src/jobs/job-service.ts`: restore job orchestration, legacy queue audit
+  events, and normalized cross-service audit event emission.
 - `src/jobs/job-state-store.ts`: durable/in-memory state stores for plan/job/
   event metadata and persisted lock queue snapshots.
 - `src/locks/lock-manager.ts`: lock acquisition/release and queued-job

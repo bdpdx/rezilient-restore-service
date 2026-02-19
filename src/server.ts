@@ -104,6 +104,18 @@ function asJobEventsPath(pathname: string): string | null {
     return decodeURIComponent(match[1]);
 }
 
+function asJobCrossServiceEventsPath(pathname: string): string | null {
+    const match = pathname.match(
+        /^\/v1\/jobs\/([^/]+)\/events\/cross-service$/,
+    );
+
+    if (!match) {
+        return null;
+    }
+
+    return decodeURIComponent(match[1]);
+}
+
 function asJobCompletePath(pathname: string): string | null {
     const match = pathname.match(/^\/v1\/jobs\/([^/]+)\/complete$/);
 
@@ -590,6 +602,25 @@ export function createRestoreServiceServer(
 
                     sendJson(response, 200, {
                         events: deps.jobs.listJobEvents(job.job_id),
+                    });
+
+                    return;
+                }
+
+                const crossServiceEventsJobId =
+                    asJobCrossServiceEventsPath(pathname);
+
+                if (crossServiceEventsJobId) {
+                    const job = getScopedJob(crossServiceEventsJobId);
+
+                    if (!job) {
+                        sendScopedNotFound(response);
+
+                        return;
+                    }
+
+                    sendJson(response, 200, {
+                        events: deps.jobs.listCrossServiceJobEvents(job.job_id),
                     });
 
                     return;

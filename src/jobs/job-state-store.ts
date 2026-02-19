@@ -1,4 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
+import { CrossServiceAuditEvent } from '@rezilient/types';
 import { RestoreLockManagerState } from '../locks/lock-manager';
 import {
     RestoreJobAuditEvent,
@@ -15,6 +16,7 @@ export interface RestoreJobState {
     plans_by_id: Record<string, RestorePlanMetadataRecord>;
     jobs_by_id: Record<string, RestoreJobRecord>;
     events_by_job_id: Record<string, RestoreJobAuditEvent[]>;
+    cross_service_events_by_job_id: Record<string, CrossServiceAuditEvent[]>;
     lock_state: RestoreLockManagerState;
 }
 
@@ -23,6 +25,7 @@ export function createEmptyRestoreJobState(): RestoreJobState {
         plans_by_id: {},
         jobs_by_id: {},
         events_by_job_id: {},
+        cross_service_events_by_job_id: {},
         lock_state: {
             running_jobs: [],
             queued_jobs: [],
@@ -124,6 +127,17 @@ function parseState(stateJson: string): RestoreJobState {
         throw new Error('invalid persisted job state events_by_job_id payload');
     }
 
+    const crossServiceEventsByJobId = state.cross_service_events_by_job_id;
+
+    if (
+        crossServiceEventsByJobId !== undefined &&
+        typeof crossServiceEventsByJobId !== 'object'
+    ) {
+        throw new Error(
+            'invalid persisted job state cross_service_events_by_job_id payload',
+        );
+    }
+
     const lockState = state.lock_state;
 
     if (!lockState || typeof lockState !== 'object') {
@@ -143,6 +157,9 @@ function parseState(stateJson: string): RestoreJobState {
         jobs_by_id: state.jobs_by_id as Record<string, RestoreJobRecord>,
         events_by_job_id:
             state.events_by_job_id as Record<string, RestoreJobAuditEvent[]>,
+        cross_service_events_by_job_id:
+            (crossServiceEventsByJobId ||
+                {}) as Record<string, CrossServiceAuditEvent[]>,
         lock_state: {
             running_jobs: lockState.running_jobs,
             queued_jobs: lockState.queued_jobs,

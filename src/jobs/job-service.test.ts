@@ -172,3 +172,75 @@ test('running job can pause and resume without releasing scope lock', () => {
 
     assert.deepEqual(completion.promoted_job_ids, [queued.job.job_id]);
 });
+
+test('job lifecycle events emit normalized cross-service audit events', () => {
+    const service = new RestoreJobService(
+        new RestoreLockManager(),
+        new SourceRegistry([
+            {
+                tenantId: 'tenant-acme',
+                instanceId: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+            },
+        ]),
+        now,
+    );
+
+    const running = service.createJob(baseRequest('plan-1', 'incident'), claims());
+    const queued = service.createJob(baseRequest('plan-2', 'incident'), claims());
+
+    assert.equal(running.success, true);
+    assert.equal(queued.success, true);
+
+    if (!running.success || !queued.success) {
+        return;
+    }
+
+    const completion = service.completeJob(running.job.job_id, {
+        status: 'completed',
+    });
+
+    assert.equal(completion.success, true);
+
+    const runningCrossService = service.listCrossServiceJobEvents(
+        running.job.job_id,
+    );
+    const queuedCrossService = service.listCrossServiceJobEvents(
+        queued.job.job_id,
+    );
+
+    assert.ok(runningCrossService.length >= 2);
+    assert.equal(runningCrossService[0].contract_version, 'audit.contracts.v1');
+    assert.equal(runningCrossService[0].schema_version, 'audit.event.v1');
+    assert.equal(runningCrossService[0].service, 'rrs');
+    assert.equal(runningCrossService[0].tenant_id, 'tenant-acme');
+    assert.equal(runningCrossService[0].instance_id, 'sn-dev-01');
+    assert.equal(
+        runningCrossService[0].source,
+        'sn://acme-dev.service-now.com',
+    );
+    assert.equal(runningCrossService[0].plan_id, 'plan-1');
+    assert.equal(runningCrossService[0].job_id, running.job.job_id);
+
+    const hasPlanCreated = runningCrossService.some((event) =>
+        event.lifecycle === 'plan' &&
+        event.action === 'job_created' &&
+        event.outcome === 'accepted'
+    );
+    const hasCompleted = runningCrossService.some((event) =>
+        event.lifecycle === 'execute' &&
+        event.action === 'completed' &&
+        event.outcome === 'completed'
+    );
+
+    assert.equal(hasPlanCreated, true);
+    assert.equal(hasCompleted, true);
+
+    const hasQueued = queuedCrossService.some((event) =>
+        event.lifecycle === 'execute' &&
+        event.action === 'queued_for_lock' &&
+        event.outcome === 'queued'
+    );
+
+    assert.equal(hasQueued, true);
+});

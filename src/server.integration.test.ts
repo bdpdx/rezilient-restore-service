@@ -720,6 +720,12 @@ test('object-level authorization gates scoped reads and object actions', async (
                 method: 'GET',
                 path:
                     `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
+                    '/events/cross-service',
+            },
+            {
+                method: 'GET',
+                path:
+                    `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
                     '/execution',
             },
             {
@@ -804,6 +810,17 @@ test('object-level authorization gates scoped reads and object actions', async (
                     baseUrl,
                     `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
                     '/events',
+                    inScopeToken,
+                )
+            ).status,
+            200,
+        );
+        assert.equal(
+            (
+                await getJson(
+                    baseUrl,
+                    `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
+                    '/events/cross-service',
                     inScopeToken,
                 )
             ).status,
