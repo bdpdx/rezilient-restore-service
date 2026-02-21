@@ -20,7 +20,7 @@
   handling with checksum-gated checkpoints, conflict/capability enforcement,
   chunk/row fallback result recording, rollback-journal mirror linkage, and
   RS-11 attachment/media selection + cap/hash/retry enforcement.
-- `execute/execute-state-store.ts`: durable SQLite + in-memory state store
+- `execute/execute-state-store.ts`: durable Postgres + in-memory state store
   adapters for execution records/checkpoints and rollback journal linkage.
 - `evidence/models.ts`: RS-12 evidence export model and verification result
   contracts.
@@ -29,14 +29,14 @@
 - `evidence/evidence-service.ts`: RS-12 signed evidence package generation,
   deterministic artifact/report hashing, immutable-storage metadata capture,
   and tamper-verification logic.
-- `evidence/evidence-state-store.ts`: durable SQLite + in-memory state store
+- `evidence/evidence-state-store.ts`: durable Postgres + in-memory state store
   adapters for evidence export and signature-verification state.
 - `registry/source-registry.ts`: tenant/instance/source mapping registry and
   fail-closed scope validation.
 - `plans/models.ts`: RS-08 dry-run request/response and gate model contracts.
 - `plans/plan-service.ts`: RS-08 deterministic dry-run plan generation and
   freshness/deletion/conflict executability gating.
-- `plans/plan-state-store.ts`: durable SQLite + in-memory state store adapters
+- `plans/plan-state-store.ts`: durable Postgres + in-memory state store adapters
   for dry-run plans.
 - `locks/lock-manager.ts`: `(tenant, instance, table)` lock acquisition,
   queueing, release, queued-job promotion, and lock-state import/export.
@@ -44,11 +44,13 @@
 - `jobs/job-service.ts`: restore job orchestration with plan metadata,
   lock-state transitions, legacy queue audit events, normalized cross-service
   audit emission, and durable state-store writes.
-- `jobs/job-state-store.ts`: durable SQLite + in-memory state store adapters
+- `jobs/job-state-store.ts`: durable Postgres + in-memory state store adapters
   for plan/job/event/cross-service-audit and lock-queue snapshots.
+- `state/postgres-snapshot-store.ts`: shared Postgres JSON snapshot persistence
+  primitive used by plan/job/execute/evidence state-store adapters.
 - `test-helpers.ts`: scoped-token fixtures used by integration tests.
 - `db-schema.test.ts`: migration contract tests for RS-06/RS-07/RS-10 schema/
-  role expectations.
+  role expectations including runtime snapshot persistence tables/grants.
 - `core-state.durability.test.ts`: stage-10 restart-survival and queue-fairness
   coverage for persisted plans/jobs/events/locks.
 - `execution-evidence.durability.test.ts`: stage-11 restart-survival coverage

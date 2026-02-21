@@ -38,7 +38,7 @@ function baseRequest(planId: string, table: string) {
     };
 }
 
-test('parallel non-overlapping jobs run immediately', () => {
+test('parallel non-overlapping jobs run immediately', async () => {
     const service = new RestoreJobService(
         new RestoreLockManager(),
         new SourceRegistry([
@@ -51,8 +51,8 @@ test('parallel non-overlapping jobs run immediately', () => {
         now,
     );
 
-    const first = service.createJob(baseRequest('plan-1', 'incident'), claims());
-    const second = service.createJob(baseRequest('plan-2', 'cmdb_ci'), claims());
+    const first = await service.createJob(baseRequest('plan-1', 'incident'), claims());
+    const second = await service.createJob(baseRequest('plan-2', 'cmdb_ci'), claims());
 
     assert.equal(first.success, true);
     assert.equal(second.success, true);
@@ -67,7 +67,7 @@ test('parallel non-overlapping jobs run immediately', () => {
     assert.equal(second.job.status_reason_code, 'none');
 });
 
-test('queued job is promoted after overlapping running job completes', () => {
+test('queued job is promoted after overlapping running job completes', async () => {
     const service = new RestoreJobService(
         new RestoreLockManager(),
         new SourceRegistry([
@@ -80,8 +80,8 @@ test('queued job is promoted after overlapping running job completes', () => {
         now,
     );
 
-    const running = service.createJob(baseRequest('plan-1', 'incident'), claims());
-    const queued = service.createJob(baseRequest('plan-2', 'incident'), claims());
+    const running = await service.createJob(baseRequest('plan-1', 'incident'), claims());
+    const queued = await service.createJob(baseRequest('plan-2', 'incident'), claims());
 
     assert.equal(running.success, true);
     assert.equal(queued.success, true);
@@ -93,7 +93,7 @@ test('queued job is promoted after overlapping running job completes', () => {
     assert.equal(queued.job.status, 'queued');
     assert.equal(queued.job.status_reason_code, 'queued_scope_lock');
 
-    const completion = service.completeJob(running.job.job_id, {
+    const completion = await service.completeJob(running.job.job_id, {
         status: 'completed',
     });
 
@@ -105,7 +105,7 @@ test('queued job is promoted after overlapping running job completes', () => {
 
     assert.deepEqual(completion.promoted_job_ids, [queued.job.job_id]);
 
-    const promoted = service.getJob(queued.job.job_id);
+    const promoted = await service.getJob(queued.job.job_id);
 
     assert.notEqual(promoted, null);
     assert.equal(promoted?.status, 'running');
@@ -113,7 +113,7 @@ test('queued job is promoted after overlapping running job completes', () => {
     assert.equal(promoted?.queue_position, null);
 });
 
-test('running job can pause and resume without releasing scope lock', () => {
+test('running job can pause and resume without releasing scope lock', async () => {
     const service = new RestoreJobService(
         new RestoreLockManager(),
         new SourceRegistry([
@@ -126,8 +126,8 @@ test('running job can pause and resume without releasing scope lock', () => {
         now,
     );
 
-    const running = service.createJob(baseRequest('plan-1', 'incident'), claims());
-    const queued = service.createJob(baseRequest('plan-2', 'incident'), claims());
+    const running = await service.createJob(baseRequest('plan-1', 'incident'), claims());
+    const queued = await service.createJob(baseRequest('plan-2', 'incident'), claims());
 
     assert.equal(running.success, true);
     assert.equal(queued.success, true);
@@ -136,7 +136,7 @@ test('running job can pause and resume without releasing scope lock', () => {
         return;
     }
 
-    const pause = service.pauseJob(
+    const pause = await service.pauseJob(
         running.job.job_id,
         'paused_token_refresh_grace_exhausted',
     );
@@ -150,7 +150,7 @@ test('running job can pause and resume without releasing scope lock', () => {
     assert.equal(pause.job.status, 'paused');
     assert.equal(queued.job.status, 'queued');
 
-    const resumed = service.resumePausedJob(running.job.job_id);
+    const resumed = await service.resumePausedJob(running.job.job_id);
 
     assert.equal(resumed.success, true);
 
@@ -160,7 +160,7 @@ test('running job can pause and resume without releasing scope lock', () => {
 
     assert.equal(resumed.job.status, 'running');
 
-    const completion = service.completeJob(running.job.job_id, {
+    const completion = await service.completeJob(running.job.job_id, {
         status: 'completed',
     });
 
@@ -173,7 +173,7 @@ test('running job can pause and resume without releasing scope lock', () => {
     assert.deepEqual(completion.promoted_job_ids, [queued.job.job_id]);
 });
 
-test('job lifecycle events emit normalized cross-service audit events', () => {
+test('job lifecycle events emit normalized cross-service audit events', async () => {
     const service = new RestoreJobService(
         new RestoreLockManager(),
         new SourceRegistry([
@@ -186,8 +186,8 @@ test('job lifecycle events emit normalized cross-service audit events', () => {
         now,
     );
 
-    const running = service.createJob(baseRequest('plan-1', 'incident'), claims());
-    const queued = service.createJob(baseRequest('plan-2', 'incident'), claims());
+    const running = await service.createJob(baseRequest('plan-1', 'incident'), claims());
+    const queued = await service.createJob(baseRequest('plan-2', 'incident'), claims());
 
     assert.equal(running.success, true);
     assert.equal(queued.success, true);
@@ -196,16 +196,16 @@ test('job lifecycle events emit normalized cross-service audit events', () => {
         return;
     }
 
-    const completion = service.completeJob(running.job.job_id, {
+    const completion = await service.completeJob(running.job.job_id, {
         status: 'completed',
     });
 
     assert.equal(completion.success, true);
 
-    const runningCrossService = service.listCrossServiceJobEvents(
+    const runningCrossService = await service.listCrossServiceJobEvents(
         running.job.job_id,
     );
-    const queuedCrossService = service.listCrossServiceJobEvents(
+    const queuedCrossService = await service.listCrossServiceJobEvents(
         queued.job.job_id,
     );
 

@@ -285,25 +285,25 @@ export function createRestoreServiceServer(
                 }
 
                 if (method === 'GET' && pathname === '/v1/admin/ops/queue') {
-                    sendJson(response, 200, deps.admin.getQueueDashboard());
+                    sendJson(response, 200, await deps.admin.getQueueDashboard());
 
                     return;
                 }
 
                 if (method === 'GET' && pathname === '/v1/admin/ops/freshness') {
-                    sendJson(response, 200, deps.admin.getFreshnessDashboard());
+                    sendJson(response, 200, await deps.admin.getFreshnessDashboard());
 
                     return;
                 }
 
                 if (method === 'GET' && pathname === '/v1/admin/ops/evidence') {
-                    sendJson(response, 200, deps.admin.getEvidenceDashboard());
+                    sendJson(response, 200, await deps.admin.getEvidenceDashboard());
 
                     return;
                 }
 
                 if (method === 'GET' && pathname === '/v1/admin/ops/slo') {
-                    sendJson(response, 200, deps.admin.getSloDashboard());
+                    sendJson(response, 200, await deps.admin.getSloDashboard());
 
                     return;
                 }
@@ -312,7 +312,7 @@ export function createRestoreServiceServer(
                     method === 'GET' &&
                     pathname === '/v1/admin/ops/ga-readiness'
                 ) {
-                    sendJson(response, 200, deps.admin.getGaReadinessDashboard());
+                    sendJson(response, 200, await deps.admin.getGaReadinessDashboard());
 
                     return;
                 }
@@ -451,12 +451,26 @@ export function createRestoreServiceServer(
                 }
 
                 if (method === 'GET' && pathname === '/v1/admin/ops/overview') {
+                    const [
+                        queue,
+                        freshness,
+                        evidence,
+                        slo,
+                        gaReadiness,
+                    ] = await Promise.all([
+                        deps.admin.getQueueDashboard(),
+                        deps.admin.getFreshnessDashboard(),
+                        deps.admin.getEvidenceDashboard(),
+                        deps.admin.getSloDashboard(),
+                        deps.admin.getGaReadinessDashboard(),
+                    ]);
+
                     sendJson(response, 200, {
-                        queue: deps.admin.getQueueDashboard(),
-                        freshness: deps.admin.getFreshnessDashboard(),
-                        evidence: deps.admin.getEvidenceDashboard(),
-                        slo: deps.admin.getSloDashboard(),
-                        ga_readiness: deps.admin.getGaReadinessDashboard(),
+                        queue,
+                        freshness,
+                        evidence,
+                        slo,
+                        ga_readiness: gaReadiness,
                     });
 
                     return;
@@ -483,18 +497,20 @@ export function createRestoreServiceServer(
             }
 
             const claims = authResult.auth.claims;
-            const getScopedJob = (jobId: string): RestoreJobRecord | null => {
-                return getScopedRecord(deps.jobs.getJob(jobId), claims);
+            const getScopedJob = async (
+                jobId: string,
+            ): Promise<RestoreJobRecord | null> => {
+                return getScopedRecord(await deps.jobs.getJob(jobId), claims);
             };
-            const getScopedPlan = (
+            const getScopedPlan = async (
                 planId: string,
-            ): RestoreDryRunPlanRecord | null => {
-                return getScopedRecord(deps.plans.getPlan(planId), claims);
+            ): Promise<RestoreDryRunPlanRecord | null> => {
+                return getScopedRecord(await deps.plans.getPlan(planId), claims);
             };
 
             if (method === 'POST' && pathname === '/v1/jobs') {
                 const body = await readJsonBody(request, maxJsonBodyBytes);
-                const result = deps.jobs.createJob(
+                const result = await deps.jobs.createJob(
                     body,
                     claims,
                 );
@@ -518,7 +534,7 @@ export function createRestoreServiceServer(
 
             if (method === 'POST' && pathname === '/v1/plans/dry-run') {
                 const body = await readJsonBody(request, maxJsonBodyBytes);
-                const result = deps.plans.createDryRunPlan(
+                const result = await deps.plans.createDryRunPlan(
                     body,
                     claims,
                 );
@@ -550,7 +566,7 @@ export function createRestoreServiceServer(
                 const planId = asPlanId(pathname);
 
                 if (planId) {
-                    const planRecord = getScopedPlan(planId);
+                    const planRecord = await getScopedPlan(planId);
 
                     if (!planRecord) {
                         sendScopedNotFound(response);
@@ -574,7 +590,7 @@ export function createRestoreServiceServer(
                 const jobId = asJobId(pathname);
 
                 if (jobId) {
-                    const job = getScopedJob(jobId);
+                    const job = await getScopedJob(jobId);
 
                     if (!job) {
                         sendScopedNotFound(response);
@@ -592,7 +608,7 @@ export function createRestoreServiceServer(
                 const eventsJobId = asJobEventsPath(pathname);
 
                 if (eventsJobId) {
-                    const job = getScopedJob(eventsJobId);
+                    const job = await getScopedJob(eventsJobId);
 
                     if (!job) {
                         sendScopedNotFound(response);
@@ -601,7 +617,7 @@ export function createRestoreServiceServer(
                     }
 
                     sendJson(response, 200, {
-                        events: deps.jobs.listJobEvents(job.job_id),
+                        events: await deps.jobs.listJobEvents(job.job_id),
                     });
 
                     return;
@@ -611,7 +627,7 @@ export function createRestoreServiceServer(
                     asJobCrossServiceEventsPath(pathname);
 
                 if (crossServiceEventsJobId) {
-                    const job = getScopedJob(crossServiceEventsJobId);
+                    const job = await getScopedJob(crossServiceEventsJobId);
 
                     if (!job) {
                         sendScopedNotFound(response);
@@ -620,7 +636,9 @@ export function createRestoreServiceServer(
                     }
 
                     sendJson(response, 200, {
-                        events: deps.jobs.listCrossServiceJobEvents(job.job_id),
+                        events: await deps.jobs.listCrossServiceJobEvents(
+                            job.job_id,
+                        ),
                     });
 
                     return;
@@ -629,7 +647,7 @@ export function createRestoreServiceServer(
                 const executionJobId = asJobExecutionPath(pathname);
 
                 if (executionJobId) {
-                    const job = getScopedJob(executionJobId);
+                    const job = await getScopedJob(executionJobId);
 
                     if (!job) {
                         sendScopedNotFound(response);
@@ -637,7 +655,7 @@ export function createRestoreServiceServer(
                         return;
                     }
 
-                    const execution = deps.execute.getExecution(job.job_id);
+                    const execution = await deps.execute.getExecution(job.job_id);
 
                     if (!execution) {
                         sendJson(response, 404, {
@@ -657,7 +675,7 @@ export function createRestoreServiceServer(
                 const checkpointJobId = asJobCheckpointPath(pathname);
 
                 if (checkpointJobId) {
-                    const job = getScopedJob(checkpointJobId);
+                    const job = await getScopedJob(checkpointJobId);
 
                     if (!job) {
                         sendScopedNotFound(response);
@@ -665,7 +683,7 @@ export function createRestoreServiceServer(
                         return;
                     }
 
-                    const checkpoint = deps.execute.getCheckpoint(
+                    const checkpoint = await deps.execute.getCheckpoint(
                         job.job_id,
                     );
 
@@ -687,7 +705,7 @@ export function createRestoreServiceServer(
                 const rollbackJournalJobId = asJobRollbackJournalPath(pathname);
 
                 if (rollbackJournalJobId) {
-                    const job = getScopedJob(rollbackJournalJobId);
+                    const job = await getScopedJob(rollbackJournalJobId);
 
                     if (!job) {
                         sendScopedNotFound(response);
@@ -695,7 +713,7 @@ export function createRestoreServiceServer(
                         return;
                     }
 
-                    const journal = deps.execute.getRollbackJournal(
+                    const journal = await deps.execute.getRollbackJournal(
                         job.job_id,
                     );
 
@@ -718,7 +736,7 @@ export function createRestoreServiceServer(
                 const evidenceJobId = asJobEvidencePath(pathname);
 
                 if (evidenceJobId) {
-                    const job = getScopedJob(evidenceJobId);
+                    const job = await getScopedJob(evidenceJobId);
 
                     if (!job) {
                         sendScopedNotFound(response);
@@ -726,7 +744,7 @@ export function createRestoreServiceServer(
                         return;
                     }
 
-                    const evidence = deps.evidence.getEvidence(job.job_id);
+                    const evidence = await deps.evidence.getEvidence(job.job_id);
 
                     if (!evidence) {
                         sendJson(response, 404, {
@@ -751,7 +769,7 @@ export function createRestoreServiceServer(
                 const evidenceExportJobId = asJobEvidenceExportPath(pathname);
 
                 if (evidenceExportJobId) {
-                    const job = getScopedJob(evidenceExportJobId);
+                    const job = await getScopedJob(evidenceExportJobId);
 
                     if (!job) {
                         sendScopedNotFound(response);
@@ -759,7 +777,7 @@ export function createRestoreServiceServer(
                         return;
                     }
 
-                    const result = deps.evidence.exportEvidence(
+                    const result = await deps.evidence.exportEvidence(
                         job.job_id,
                     );
 
@@ -787,7 +805,7 @@ export function createRestoreServiceServer(
                 const resumeJobId = asJobResumePath(pathname);
 
                 if (resumeJobId) {
-                    const job = getScopedJob(resumeJobId);
+                    const job = await getScopedJob(resumeJobId);
 
                     if (!job) {
                         sendScopedNotFound(response);
@@ -796,7 +814,7 @@ export function createRestoreServiceServer(
                     }
 
                     const body = await readJsonBody(request, maxJsonBodyBytes);
-                    const result = deps.execute.resumeJob(
+                    const result = await deps.execute.resumeJob(
                         job.job_id,
                         body,
                         claims,
@@ -821,7 +839,7 @@ export function createRestoreServiceServer(
                         result.record.status === 'completed' ||
                         result.record.status === 'failed'
                     ) {
-                        const evidenceResult = deps.evidence.ensureEvidence(
+                        const evidenceResult = await deps.evidence.ensureEvidence(
                             result.record.job_id,
                         );
 
@@ -848,7 +866,7 @@ export function createRestoreServiceServer(
 
                 if (executeJobId) {
                     const body = await readJsonBody(request, maxJsonBodyBytes);
-                    const result = deps.execute.executeJob(
+                    const result = await deps.execute.executeJob(
                         executeJobId,
                         body,
                         claims,
@@ -873,7 +891,7 @@ export function createRestoreServiceServer(
                         result.record.status === 'completed' ||
                         result.record.status === 'failed'
                     ) {
-                        const evidenceResult = deps.evidence.ensureEvidence(
+                        const evidenceResult = await deps.evidence.ensureEvidence(
                             result.record.job_id,
                         );
 
@@ -899,7 +917,7 @@ export function createRestoreServiceServer(
                 const jobId = asJobCompletePath(pathname);
 
                 if (jobId) {
-                    const job = getScopedJob(jobId);
+                    const job = await getScopedJob(jobId);
 
                     if (!job) {
                         sendScopedNotFound(response);
@@ -908,7 +926,7 @@ export function createRestoreServiceServer(
                     }
 
                     const body = await readJsonBody(request, maxJsonBodyBytes);
-                    const result = deps.jobs.completeJob(job.job_id, body);
+                    const result = await deps.jobs.completeJob(job.job_id, body);
 
                     if (!result.success) {
                         sendJson(response, result.statusCode, {

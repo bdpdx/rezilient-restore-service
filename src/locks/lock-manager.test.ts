@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { RestoreLockManager } from './lock-manager';
 
-test('overlapping table scopes are queued with explicit reason code', () => {
+test('overlapping table scopes are queued with explicit reason code', async () => {
     const locks = new RestoreLockManager();
     const first = locks.acquire({
         jobId: 'job-1',
@@ -27,7 +27,7 @@ test('overlapping table scopes are queued with explicit reason code', () => {
     assert.equal(second.queuePosition, 1);
 });
 
-test('release promotes queued overlapping job once scope lock frees', () => {
+test('release promotes queued overlapping job once scope lock frees', async () => {
     const locks = new RestoreLockManager();
 
     locks.acquire({
@@ -59,7 +59,7 @@ test('release promotes queued overlapping job once scope lock frees', () => {
     assert.equal(snapshot.queued.length, 0);
 });
 
-test('non-overlapping scopes can run in parallel', () => {
+test('non-overlapping scopes can run in parallel', async () => {
     const locks = new RestoreLockManager();
 
     const first = locks.acquire({

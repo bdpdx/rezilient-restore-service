@@ -71,7 +71,10 @@ function createRow(rowId: string) {
     };
 }
 
-function createFixture() {
+async function createFixture(): Promise<{
+    evidence: RestoreEvidenceService;
+    jobId: string;
+}> {
     const sourceRegistry = new SourceRegistry([
         {
             tenantId: 'tenant-acme',
@@ -108,7 +111,7 @@ function createFixture() {
         },
         now,
     );
-    const dryRun = plans.createDryRunPlan(
+    const dryRun = await plans.createDryRunPlan(
         {
             tenant_id: 'tenant-acme',
             instance_id: 'sn-dev-01',
@@ -176,7 +179,7 @@ function createFixture() {
         throw new Error('failed to create dry-run fixture');
     }
 
-    const job = jobs.createJob(
+    const job = await jobs.createJob(
         {
             tenant_id: 'tenant-acme',
             instance_id: 'sn-dev-01',
@@ -195,7 +198,7 @@ function createFixture() {
         throw new Error('failed to create job fixture');
     }
 
-    const executed = execute.executeJob(
+    const executed = await execute.executeJob(
         job.job.job_id,
         {
             operator_id: 'operator@example.com',
@@ -217,9 +220,9 @@ function createFixture() {
     };
 }
 
-test('evidence export is deterministic and includes signed verification status', () => {
-    const fixture = createFixture();
-    const first = fixture.evidence.exportEvidence(fixture.jobId);
+test('evidence export is deterministic and includes signed verification status', async () => {
+    const fixture = await createFixture();
+    const first = await fixture.evidence.exportEvidence(fixture.jobId);
 
     assert.equal(first.success, true);
     if (!first.success) {
@@ -237,7 +240,7 @@ test('evidence export is deterministic and includes signed verification status',
     assert.ok(first.record.evidence.artifact_hashes.length >= 3);
     assert.ok(first.record.evidence.resume_metadata.checkpoint_id);
 
-    const second = fixture.evidence.exportEvidence(fixture.jobId);
+    const second = await fixture.evidence.exportEvidence(fixture.jobId);
 
     assert.equal(second.success, true);
     if (!second.success) {
@@ -256,9 +259,9 @@ test('evidence export is deterministic and includes signed verification status',
     );
 });
 
-test('evidence verification detects report-hash tampering', () => {
-    const fixture = createFixture();
-    const exported = fixture.evidence.exportEvidence(fixture.jobId);
+test('evidence verification detects report-hash tampering', async () => {
+    const fixture = await createFixture();
+    const exported = await fixture.evidence.exportEvidence(fixture.jobId);
 
     assert.equal(exported.success, true);
     if (!exported.success) {
@@ -280,9 +283,9 @@ test('evidence verification detects report-hash tampering', () => {
     assert.equal(verification.signature_verification, 'verification_failed');
 });
 
-test('evidence verification detects artifact hash tampering', () => {
-    const fixture = createFixture();
-    const exported = fixture.evidence.exportEvidence(fixture.jobId);
+test('evidence verification detects artifact hash tampering', async () => {
+    const fixture = await createFixture();
+    const exported = await fixture.evidence.exportEvidence(fixture.jobId);
 
     assert.equal(exported.success, true);
     if (!exported.success) {
@@ -305,9 +308,9 @@ test('evidence verification detects artifact hash tampering', () => {
     assert.equal(verification.signature_verification, 'verification_failed');
 });
 
-test('evidence verification detects signature tampering', () => {
-    const fixture = createFixture();
-    const exported = fixture.evidence.exportEvidence(fixture.jobId);
+test('evidence verification detects signature tampering', async () => {
+    const fixture = await createFixture();
+    const exported = await fixture.evidence.exportEvidence(fixture.jobId);
 
     assert.equal(exported.success, true);
     if (!exported.success) {

@@ -223,10 +223,10 @@ export class RestorePlanService {
             new InMemoryRestorePlanStateStore(),
     ) {}
 
-    createDryRunPlan(
+    async createDryRunPlan(
         requestBody: unknown,
         claims: AuthTokenClaims,
-    ): CreateDryRunPlanResult {
+    ): Promise<CreateDryRunPlanResult> {
         const parsed = parseCreateDryRunPlanRequest(requestBody);
 
         if (!parsed.success) {
@@ -315,8 +315,9 @@ export class RestorePlanService {
         });
     }
 
-    getPlan(planId: string): RestoreDryRunPlanRecord | null {
-        const record = this.stateStore.read().plans_by_id[planId];
+    async getPlan(planId: string): Promise<RestoreDryRunPlanRecord | null> {
+        const state = await this.stateStore.read();
+        const record = state.plans_by_id[planId];
 
         if (!record) {
             return null;
@@ -325,8 +326,10 @@ export class RestorePlanService {
         return JSON.parse(JSON.stringify(record)) as RestoreDryRunPlanRecord;
     }
 
-    listPlans(): RestoreDryRunPlanRecord[] {
-        return Object.values(this.stateStore.read().plans_by_id)
+    async listPlans(): Promise<RestoreDryRunPlanRecord[]> {
+        const state = await this.stateStore.read();
+
+        return Object.values(state.plans_by_id)
             .map((record) =>
                 JSON.parse(JSON.stringify(record)) as RestoreDryRunPlanRecord
             )

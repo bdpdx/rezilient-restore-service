@@ -7,7 +7,7 @@ Purpose:
   - dry-run planning with deterministic `plan_hash`,
   - freshness/deletion/conflict executability gating,
   - scoped lock queueing by `(tenant, instance, table)`,
-  - durable SQLite-backed persistence for dry-run plans, job metadata,
+  - durable Postgres-backed persistence for dry-run plans, job metadata,
     job-audit events, normalized cross-service audit events, lock queue
     ownership, execution checkpoints/journals, and evidence export/verification
     records across restart,
@@ -64,6 +64,10 @@ Entrypoints:
   rollback-journal schema.
 - `db/migrations/0006_restore_resume_journal_roles.sql`: RS-10 role grants for
   checkpoint and rollback-journal tables.
+- `db/migrations/0007_restore_runtime_state_plane.sql`: RS-10 durable runtime
+  snapshot state table for service-owned plan/job/execute/evidence state.
+- `db/migrations/0008_restore_runtime_state_roles.sql`: RS-10 grants for
+  runtime snapshot table access by restore-service roles.
 
 Tests:
 - `src/db-schema.test.ts`: migration contract checks for RS-06 + RS-07 schema,

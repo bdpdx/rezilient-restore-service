@@ -369,8 +369,8 @@ export class RestoreOpsAdminService {
         };
     }
 
-    getQueueDashboard(): Record<string, unknown> {
-        const jobs = this.jobs.listJobs();
+    async getQueueDashboard(): Promise<Record<string, unknown>> {
+        const jobs = await this.jobs.listJobs();
         const runningJobs = jobs.filter((job) => job.status === 'running');
         const queuedJobs = jobs.filter((job) => job.status === 'queued');
         const pausedJobs = jobs.filter((job) => job.status === 'paused');
@@ -389,16 +389,16 @@ export class RestoreOpsAdminService {
                 paused_jobs: pausedJobs.length,
             },
             wait_reason_counts: waitReasonCounts,
-            lock_snapshot: this.jobs.getLockSnapshot(),
+            lock_snapshot: await this.jobs.getLockSnapshot(),
             running_jobs: runningJobs,
             queued_jobs: queuedJobs,
             paused_jobs: pausedJobs,
         };
     }
 
-    getFreshnessDashboard(): Record<string, unknown> {
+    async getFreshnessDashboard(): Promise<Record<string, unknown>> {
         const accumulators = new Map<string, FreshnessAccumulator>();
-        const plans = this.plans.listPlans();
+        const plans = await this.plans.listPlans();
 
         for (const plan of plans) {
             for (const watermark of plan.watermarks) {
@@ -485,8 +485,8 @@ export class RestoreOpsAdminService {
         };
     }
 
-    getEvidenceDashboard(): Record<string, unknown> {
-        const evidences = this.evidence.listEvidence()
+    async getEvidenceDashboard(): Promise<Record<string, unknown>> {
+        const evidences = (await this.evidence.listEvidence())
             .map((record) => ({
                 job_id: record.evidence.job_id,
                 evidence_id: record.evidence.evidence_id,
@@ -518,12 +518,12 @@ export class RestoreOpsAdminService {
         };
     }
 
-    getSloDashboard(): Record<string, unknown> {
-        const plans = this.plans.listPlans();
-        const jobs = this.jobs.listJobs();
-        const executions = this.execute.listExecutions();
-        const freshness = this.getFreshnessDashboard();
-        const evidence = this.getEvidenceDashboard();
+    async getSloDashboard(): Promise<Record<string, unknown>> {
+        const plans = await this.plans.listPlans();
+        const jobs = await this.jobs.listJobs();
+        const executions = await this.execute.listExecutions();
+        const freshness = await this.getFreshnessDashboard();
+        const evidence = await this.getEvidenceDashboard();
         const timestamps: string[] = [];
         const queueWaitDurations: number[] = [];
         const executeDurations: number[] = [];
@@ -749,12 +749,12 @@ export class RestoreOpsAdminService {
         };
     }
 
-    getGaReadinessDashboard(): Record<string, unknown> {
+    async getGaReadinessDashboard(): Promise<Record<string, unknown>> {
         const nowIso = normalizeIsoWithMillis(this.now());
-        const slo = this.getSloDashboard();
+        const slo = await this.getSloDashboard();
         const burnRate = slo.burn_rate as Record<string, unknown>;
         const burnRateStatus = String(burnRate.status || 'breached');
-        const evidence = this.getEvidenceDashboard();
+        const evidence = await this.getEvidenceDashboard();
         const evidenceTotals = evidence.totals as Record<string, unknown>;
         const evidenceVerificationFailed = Number(
             evidenceTotals.verification_failed || 0,

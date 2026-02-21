@@ -177,7 +177,7 @@ function createDryRunPayload(
     };
 }
 
-function buildFixture(options?: {
+async function buildFixture(options?: {
     executeConfig?: {
         defaultChunkSize?: number;
         maxRows?: number;
@@ -215,7 +215,7 @@ function buildFixture(options?: {
         createRow('row-01'),
         createRow('row-02'),
     ];
-    const plan = plans.createDryRunPlan(
+    const plan = await plans.createDryRunPlan(
         createDryRunPayload(
             'plan-1',
             planRows,
@@ -230,7 +230,7 @@ function buildFixture(options?: {
         throw new Error('failed to create dry-run plan fixture');
     }
 
-    const job = jobs.createJob(
+    const job = await jobs.createJob(
         {
             tenant_id: 'tenant-acme',
             instance_id: 'sn-dev-01',
@@ -257,15 +257,15 @@ function buildFixture(options?: {
     };
 }
 
-test('unresolved media candidates block execution until decisions are set', () => {
+test('unresolved media candidates block execution until decisions are set', async () => {
     const unresolved = createMediaCandidate('media-unresolved');
 
     delete unresolved.decision;
 
-    const fixture = buildFixture({
+    const fixture = await buildFixture({
         mediaCandidates: [unresolved],
     });
-    const result = fixture.execute.executeJob(
+    const result = await fixture.execute.executeJob(
         fixture.jobId,
         {
             operator_id: 'operator@example.com',
@@ -284,7 +284,7 @@ test('unresolved media candidates block execution until decisions are set', () =
     assert.equal(result.reasonCode, 'blocked_unresolved_media_candidates');
 });
 
-test('media hard-cap enforcement requires override capability and confirmation', () => {
+test('media hard-cap enforcement requires override capability and confirmation', async () => {
     const mediaCandidates = [
         createMediaCandidate('media-01', {
             size_bytes: 64,
@@ -293,14 +293,14 @@ test('media hard-cap enforcement requires override capability and confirmation',
             size_bytes: 64,
         }),
     ];
-    const fixtureWithoutOverride = buildFixture({
+    const fixtureWithoutOverride = await buildFixture({
         mediaCandidates,
         executeConfig: {
             mediaMaxItems: 1,
             mediaMaxBytes: 80,
         },
     });
-    const blocked = fixtureWithoutOverride.execute.executeJob(
+    const blocked = await fixtureWithoutOverride.execute.executeJob(
         fixtureWithoutOverride.jobId,
         {
             operator_id: 'operator@example.com',
@@ -319,14 +319,14 @@ test('media hard-cap enforcement requires override capability and confirmation',
     assert.equal(blocked.reasonCode, 'blocked_missing_capability');
     assert.match(blocked.message, /elevated confirmation/i);
 
-    const fixtureWithOverride = buildFixture({
+    const fixtureWithOverride = await buildFixture({
         mediaCandidates,
         executeConfig: {
             mediaMaxItems: 1,
             mediaMaxBytes: 80,
         },
     });
-    const allowed = fixtureWithOverride.execute.executeJob(
+    const allowed = await fixtureWithOverride.execute.executeJob(
         fixtureWithOverride.jobId,
         {
             operator_id: 'operator@example.com',
@@ -346,7 +346,7 @@ test('media hard-cap enforcement requires override capability and confirmation',
     assert.equal(allowed.success, true);
 });
 
-test('media outcomes record parent checks, hash verification, and retry results', () => {
+test('media outcomes record parent checks, hash verification, and retry results', async () => {
     const mediaCandidates = [
         createMediaCandidate('media-parent-missing', {
             parent_record_exists: false,
@@ -367,10 +367,10 @@ test('media outcomes record parent checks, hash verification, and retry results'
             decision: 'exclude',
         }),
     ];
-    const fixture = buildFixture({
+    const fixture = await buildFixture({
         mediaCandidates,
     });
-    const result = fixture.execute.executeJob(
+    const result = await fixture.execute.executeJob(
         fixture.jobId,
         {
             operator_id: 'operator@example.com',
@@ -418,7 +418,7 @@ test('media outcomes record parent checks, hash verification, and retry results'
     assert.equal(byId.get('media-excluded')?.outcome, 'skipped');
 });
 
-test('conflict matrix allows skip for non-reference conflict classes', () => {
+test('conflict matrix allows skip for non-reference conflict classes', async () => {
     const classes = [
         'value_conflict',
         'missing_row_conflict',
@@ -429,7 +429,7 @@ test('conflict matrix allows skip for non-reference conflict classes', () => {
     ] as const;
 
     for (const conflictClass of classes) {
-        const fixture = buildFixture({
+        const fixture = await buildFixture({
             executeConfig: {
                 elevatedSkipRatioPercent: 100,
             },
@@ -439,7 +439,7 @@ test('conflict matrix allows skip for non-reference conflict classes', () => {
             : conflictClass === 'permission_conflict'
             ? 'failed_permission_conflict'
             : 'failed_internal_error';
-        const result = fixture.execute.executeJob(
+        const result = await fixture.execute.executeJob(
             fixture.jobId,
             {
                 operator_id: 'operator@example.com',
@@ -475,9 +475,9 @@ test('conflict matrix allows skip for non-reference conflict classes', () => {
     }
 });
 
-test('reference conflicts hard-block execution', () => {
-    const fixture = buildFixture();
-    const result = fixture.execute.executeJob(
+test('reference conflicts hard-block execution', async () => {
+    const fixture = await buildFixture();
+    const result = await fixture.execute.executeJob(
         fixture.jobId,
         {
             operator_id: 'operator@example.com',
@@ -506,14 +506,14 @@ test('reference conflicts hard-block execution', () => {
     assert.equal(result.reasonCode, 'blocked_reference_conflict');
 });
 
-test('missing delete capability blocks destructive actions', () => {
-    const fixture = buildFixture({
+test('missing delete capability blocks destructive actions', async () => {
+    const fixture = await buildFixture({
         rows: [
             createRow('row-01', 'delete'),
             createRow('row-02', 'update'),
         ],
     });
-    const result = fixture.execute.executeJob(
+    const result = await fixture.execute.executeJob(
         fixture.jobId,
         {
             operator_id: 'operator@example.com',
@@ -533,13 +533,13 @@ test('missing delete capability blocks destructive actions', () => {
     assert.match(result.message, /restore_delete/);
 });
 
-test('override capability and elevated confirmation are enforced', () => {
-    const fixture = buildFixture({
+test('override capability and elevated confirmation are enforced', async () => {
+    const fixture = await buildFixture({
         executeConfig: {
             elevatedSkipRatioPercent: 20,
         },
     });
-    const withoutOverride = fixture.execute.executeJob(
+    const withoutOverride = await fixture.execute.executeJob(
         fixture.jobId,
         {
             operator_id: 'operator@example.com',
@@ -568,12 +568,12 @@ test('override capability and elevated confirmation are enforced', () => {
     assert.equal(withoutOverride.reasonCode, 'blocked_missing_capability');
     assert.match(withoutOverride.message, /elevated confirmation/i);
 
-    const fixtureWithOverride = buildFixture({
+    const fixtureWithOverride = await buildFixture({
         executeConfig: {
             elevatedSkipRatioPercent: 20,
         },
     });
-    const withOverride = fixtureWithOverride.execute.executeJob(
+    const withOverride = await fixtureWithOverride.execute.executeJob(
         fixtureWithOverride.jobId,
         {
             operator_id: 'operator@example.com',
@@ -603,8 +603,8 @@ test('override capability and elevated confirmation are enforced', () => {
     assert.equal(withOverride.success, true);
 });
 
-test('chunk failure falls back to row isolation and records outcomes', () => {
-    const fixture = buildFixture({
+test('chunk failure falls back to row isolation and records outcomes', async () => {
+    const fixture = await buildFixture({
         rows: [
             createRow('row-01'),
             createRow('row-02'),
@@ -614,7 +614,7 @@ test('chunk failure falls back to row isolation and records outcomes', () => {
             elevatedSkipRatioPercent: 100,
         },
     });
-    const result = fixture.execute.executeJob(
+    const result = await fixture.execute.executeJob(
         fixture.jobId,
         {
             operator_id: 'operator@example.com',
@@ -648,8 +648,8 @@ test('chunk failure falls back to row isolation and records outcomes', () => {
     assert.equal(result.record.summary.fallback_chunk_count, 1);
 });
 
-test('resume continues from checkpoint when execution pauses by chunk budget', () => {
-    const fixture = buildFixture({
+test('resume continues from checkpoint when execution pauses by chunk budget', async () => {
+    const fixture = await buildFixture({
         rows: [
             createRow('row-01'),
             createRow('row-02'),
@@ -660,7 +660,7 @@ test('resume continues from checkpoint when execution pauses by chunk budget', (
             elevatedSkipRatioPercent: 100,
         },
     });
-    const first = fixture.execute.executeJob(
+    const first = await fixture.execute.executeJob(
         fixture.jobId,
         {
             operator_id: 'operator@example.com',
@@ -681,7 +681,7 @@ test('resume continues from checkpoint when execution pauses by chunk budget', (
     assert.equal(first.record.checkpoint.next_chunk_index, 1);
     assert.equal(first.record.summary.applied_rows, 1);
 
-    const resumed = fixture.execute.resumeJob(
+    const resumed = await fixture.execute.resumeJob(
         fixture.jobId,
         {
             operator_id: 'operator@example.com',
@@ -702,7 +702,7 @@ test('resume continues from checkpoint when execution pauses by chunk budget', (
     assert.equal(resumed.record.status, 'paused');
     assert.equal(resumed.record.checkpoint.next_chunk_index, 2);
 
-    const resumedAgain = fixture.execute.resumeJob(
+    const resumedAgain = await fixture.execute.resumeJob(
         fixture.jobId,
         {
             operator_id: 'operator@example.com',
@@ -725,15 +725,15 @@ test('resume continues from checkpoint when execution pauses by chunk budget', (
     assert.equal(resumedAgain.record.checkpoint.next_chunk_index, 3);
 });
 
-test('duplicate resume attempts are idempotent after completion', () => {
-    const fixture = buildFixture({
+test('duplicate resume attempts are idempotent after completion', async () => {
+    const fixture = await buildFixture({
         executeConfig: {
             maxChunksPerAttempt: 1,
             elevatedSkipRatioPercent: 100,
         },
     });
 
-    const first = fixture.execute.executeJob(
+    const first = await fixture.execute.executeJob(
         fixture.jobId,
         {
             operator_id: 'operator@example.com',
@@ -749,7 +749,7 @@ test('duplicate resume attempts are idempotent after completion', () => {
         return;
     }
 
-    const second = fixture.execute.resumeJob(
+    const second = await fixture.execute.resumeJob(
         fixture.jobId,
         {
             operator_id: 'operator@example.com',
@@ -766,7 +766,7 @@ test('duplicate resume attempts are idempotent after completion', () => {
         return;
     }
 
-    const third = fixture.execute.resumeJob(
+    const third = await fixture.execute.resumeJob(
         fixture.jobId,
         {
             operator_id: 'operator@example.com',
@@ -789,13 +789,13 @@ test('duplicate resume attempts are idempotent after completion', () => {
     assert.equal(third.record.resume_attempt_count, 2);
 });
 
-test('rollback journal includes authoritative entries and SN mirror linkage', () => {
-    const fixture = buildFixture({
+test('rollback journal includes authoritative entries and SN mirror linkage', async () => {
+    const fixture = await buildFixture({
         executeConfig: {
             elevatedSkipRatioPercent: 100,
         },
     });
-    const result = fixture.execute.executeJob(
+    const result = await fixture.execute.executeJob(
         fixture.jobId,
         {
             operator_id: 'operator@example.com',
@@ -811,7 +811,7 @@ test('rollback journal includes authoritative entries and SN mirror linkage', ()
         return;
     }
 
-    const bundle = fixture.execute.getRollbackJournal(fixture.jobId);
+    const bundle = await fixture.execute.getRollbackJournal(fixture.jobId);
 
     assert.notEqual(bundle, null);
     assert.equal(bundle?.journal_entries.length, 2);

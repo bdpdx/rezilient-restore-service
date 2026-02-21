@@ -1,5 +1,6 @@
-import { DatabaseSync } from 'node:sqlite';
+import { type Pool, type PoolConfig } from 'pg';
 import type { RestoreJournalEntry } from '@rezilient/types';
+import { PostgresSnapshotStore } from '../state/postgres-snapshot-store';
 import {
     RestoreExecutionRecord,
     RestoreJournalMirrorRecord,
@@ -33,8 +34,10 @@ export function cloneRestoreExecutionState(
 }
 
 export interface RestoreExecutionStateStore {
-    read(): RestoreExecutionState;
-    mutate<T>(mutator: (state: RestoreExecutionState) => T): T;
+    read(): Promise<RestoreExecutionState>;
+    mutate<T>(
+        mutator: (state: RestoreExecutionState) => T | Promise<T>,
+    ): Promise<T>;
 }
 
 export class InMemoryRestoreExecutionStateStore
@@ -46,56 +49,19 @@ export class InMemoryRestoreExecutionStateStore
         this.state = cloneRestoreExecutionState(source);
     }
 
-    read(): RestoreExecutionState {
+    async read(): Promise<RestoreExecutionState> {
         return cloneRestoreExecutionState(this.state);
     }
 
-    mutate<T>(mutator: (state: RestoreExecutionState) => T): T {
+    async mutate<T>(
+        mutator: (state: RestoreExecutionState) => T | Promise<T>,
+    ): Promise<T> {
         const workingState = cloneRestoreExecutionState(this.state);
-        const result = mutator(workingState);
+        const result = await mutator(workingState);
         this.state = workingState;
 
         return result;
     }
-}
-
-const CREATE_TABLE_SQL = `
-CREATE TABLE IF NOT EXISTS rrs_execution_state_snapshots (
-    snapshot_id INTEGER PRIMARY KEY CHECK (snapshot_id = 1),
-    version INTEGER NOT NULL,
-    state_json TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-)
-`;
-
-const SELECT_SNAPSHOT_SQL = `
-SELECT version, state_json
-FROM rrs_execution_state_snapshots
-WHERE snapshot_id = 1
-`;
-
-const INSERT_SNAPSHOT_SQL = `
-INSERT INTO rrs_execution_state_snapshots (
-    snapshot_id,
-    version,
-    state_json,
-    updated_at
-) VALUES (
-    1,
-    ?,
-    ?,
-    ?
-)
-`;
-
-const UPDATE_SNAPSHOT_SQL = `
-UPDATE rrs_execution_state_snapshots
-SET version = ?, state_json = ?, updated_at = ?
-WHERE snapshot_id = 1
-`;
-
-function serializeState(state: RestoreExecutionState): string {
-    return JSON.stringify(state);
 }
 
 function parseState(stateJson: string): RestoreExecutionState {
@@ -150,96 +116,49 @@ function parseState(stateJson: string): RestoreExecutionState {
     });
 }
 
-export class SqliteRestoreExecutionStateStore
+export class PostgresRestoreExecutionStateStore
     implements RestoreExecutionStateStore {
-    private readonly database: DatabaseSync;
+    private readonly snapshots: PostgresSnapshotStore<RestoreExecutionState>;
 
-    constructor(private readonly dbPath: string) {
-        this.database = new DatabaseSync(dbPath);
-        this.database.exec('PRAGMA journal_mode = WAL');
-        this.database.exec('PRAGMA synchronous = NORMAL');
-        this.database.exec(CREATE_TABLE_SQL);
-        this.ensureSnapshotRow();
-    }
+    constructor(
+        pgUrl: string,
+        options: {
+            pool?: Pool;
+            poolConfig?: Omit<PoolConfig, 'connectionString'>;
+            schemaName?: string;
+            tableName?: string;
+        } = {},
+    ) {
+        this.snapshots = new PostgresSnapshotStore(
+            pgUrl,
+            createEmptyRestoreExecutionState,
+            (raw: unknown) => {
+                if (typeof raw === 'string') {
+                    return parseState(raw);
+                }
 
-    read(): RestoreExecutionState {
-        const row = this.selectSnapshot();
-
-        if (!row) {
-            return createEmptyRestoreExecutionState();
-        }
-
-        return parseState(row.state_json);
-    }
-
-    mutate<T>(mutator: (state: RestoreExecutionState) => T): T {
-        this.database.exec('BEGIN IMMEDIATE');
-
-        try {
-            const row = this.selectSnapshotForTransaction();
-            const currentState = row
-                ? parseState(row.state_json)
-                : createEmptyRestoreExecutionState();
-            const result = mutator(currentState);
-            const nextVersion = (row?.version ?? 0) + 1;
-            const updatedAt = new Date().toISOString();
-            const updateStatement = this.database.prepare(UPDATE_SNAPSHOT_SQL);
-
-            updateStatement.run(
-                nextVersion,
-                serializeState(currentState),
-                updatedAt,
-            );
-            this.database.exec('COMMIT');
-
-            return result;
-        } catch (error) {
-            this.database.exec('ROLLBACK');
-            throw error;
-        }
-    }
-
-    private ensureSnapshotRow(): void {
-        const row = this.selectSnapshot();
-
-        if (row) {
-            return;
-        }
-
-        const insert = this.database.prepare(INSERT_SNAPSHOT_SQL);
-
-        insert.run(
-            0,
-            serializeState(createEmptyRestoreExecutionState()),
-            new Date().toISOString(),
+                return parseState(JSON.stringify(raw));
+            },
+            {
+                ...options,
+                storeKey: 'execution_state',
+            },
         );
     }
 
-    private selectSnapshot(): SnapshotRow | undefined {
-        const statement = this.database.prepare(SELECT_SNAPSHOT_SQL);
-
-        return statement.get() as SnapshotRow | undefined;
+    async close(): Promise<void> {
+        await this.snapshots.close();
     }
 
-    private selectSnapshotForTransaction(): SnapshotRow | undefined {
-        const row = this.selectSnapshot();
+    async read(): Promise<RestoreExecutionState> {
+        return this.snapshots.read();
+    }
 
-        if (row) {
-            return row;
-        }
-
-        const emptyState = createEmptyRestoreExecutionState();
-        const insert = this.database.prepare(INSERT_SNAPSHOT_SQL);
-
-        insert.run(
-            0,
-            serializeState(emptyState),
-            new Date().toISOString(),
-        );
-
-        return {
-            version: 0,
-            state_json: serializeState(emptyState),
-        };
+    async mutate<T>(
+        mutator: (state: RestoreExecutionState) => T | Promise<T>,
+    ): Promise<T> {
+        return this.snapshots.mutate(mutator);
     }
 }
+
+export { PostgresRestoreExecutionStateStore as SqliteRestoreExecutionStateStore };

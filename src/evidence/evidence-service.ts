@@ -217,6 +217,10 @@ export class RestoreEvidenceService {
 
     private readonly signer: EvidenceSigner;
 
+    private initialized = false;
+
+    private initializationPromise: Promise<void> | null = null;
+
     constructor(
         private readonly jobs: RestoreJobService,
         private readonly plans: RestorePlanService,
@@ -227,19 +231,11 @@ export class RestoreEvidenceService {
             new InMemoryRestoreEvidenceStateStore(),
     ) {
         this.signer = createEvidenceSigner(config.signer);
-
-        const state = this.stateStore.read();
-
-        for (const [jobId, record] of Object.entries(state.by_job_id)) {
-            this.byJobId.set(jobId, record);
-        }
-
-        for (const [evidenceId, record] of Object.entries(state.by_evidence_id)) {
-            this.byEvidenceId.set(evidenceId, record);
-        }
     }
 
-    exportEvidence(jobId: string): ExportEvidenceResult {
+    async exportEvidence(jobId: string): Promise<ExportEvidenceResult> {
+        await this.ensureInitialized();
+
         const existing = this.byJobId.get(jobId);
 
         if (existing) {
@@ -251,7 +247,7 @@ export class RestoreEvidenceService {
             };
         }
 
-        const job = this.jobs.getJob(jobId);
+        const job = await this.jobs.getJob(jobId);
 
         if (!job) {
             return {
@@ -262,7 +258,7 @@ export class RestoreEvidenceService {
             };
         }
 
-        const plan = this.plans.getPlan(job.plan_id);
+        const plan = await this.plans.getPlan(job.plan_id);
 
         if (!plan) {
             return {
@@ -274,7 +270,7 @@ export class RestoreEvidenceService {
             };
         }
 
-        const execution = this.execute.getExecution(jobId);
+        const execution = await this.execute.getExecution(jobId);
 
         if (
             !execution ||
@@ -289,11 +285,11 @@ export class RestoreEvidenceService {
             };
         }
 
-        const rollbackJournal = this.execute.getRollbackJournal(jobId) || {
+        const rollbackJournal = await this.execute.getRollbackJournal(jobId) || {
             journal_entries: [],
             sn_mirror_entries: [],
         };
-        const events = this.jobs.listJobEvents(jobId);
+        const events = await this.jobs.listJobEvents(jobId);
         const generatedAt = normalizeIsoWithMillis(this.now());
         const evidenceId = buildEvidenceId(job, execution.completed_at);
         const artifacts = [
@@ -446,7 +442,7 @@ export class RestoreEvidenceService {
         record.verification = verification;
         record.evidence.manifest_signature.signature_verification =
             verification.signature_verification;
-        this.setEvidenceRecord(jobId, record);
+        await this.setEvidenceRecord(jobId, record);
 
         return {
             success: true,
@@ -456,11 +452,13 @@ export class RestoreEvidenceService {
         };
     }
 
-    ensureEvidence(jobId: string): ExportEvidenceResult {
+    async ensureEvidence(jobId: string): Promise<ExportEvidenceResult> {
         return this.exportEvidence(jobId);
     }
 
-    getEvidence(jobId: string): EvidenceExportRecord | null {
+    async getEvidence(jobId: string): Promise<EvidenceExportRecord | null> {
+        await this.ensureInitialized();
+
         const existing = this.byJobId.get(jobId);
 
         if (!existing) {
@@ -471,12 +469,16 @@ export class RestoreEvidenceService {
         updated.verification = this.validateEvidenceRecord(updated);
         updated.evidence.manifest_signature.signature_verification =
             updated.verification.signature_verification;
-        this.setEvidenceRecord(jobId, updated);
+        await this.setEvidenceRecord(jobId, updated);
 
         return updated;
     }
 
-    getEvidenceById(evidenceId: string): EvidenceExportRecord | null {
+    async getEvidenceById(
+        evidenceId: string,
+    ): Promise<EvidenceExportRecord | null> {
+        await this.ensureInitialized();
+
         const existing = this.byEvidenceId.get(evidenceId);
 
         if (!existing) {
@@ -486,7 +488,9 @@ export class RestoreEvidenceService {
         return cloneRecord(existing);
     }
 
-    listEvidence(): EvidenceExportRecord[] {
+    async listEvidence(): Promise<EvidenceExportRecord[]> {
+        await this.ensureInitialized();
+
         return Array.from(this.byJobId.values())
             .map((record) => cloneRecord(record))
             .sort((left, right) => {
@@ -494,19 +498,19 @@ export class RestoreEvidenceService {
             });
     }
 
-    private setEvidenceRecord(
+    private async setEvidenceRecord(
         jobId: string,
         record: EvidenceExportRecord,
-    ): void {
+    ): Promise<void> {
         this.byJobId.set(jobId, cloneRecord(record));
         this.byEvidenceId.set(record.evidence.evidence_id, cloneRecord(record));
-        this.persistState();
+        await this.persistState();
     }
 
-    private persistState(): void {
+    private async persistState(): Promise<void> {
         const snapshot = this.snapshotState();
 
-        this.stateStore.mutate((state) => {
+        await this.stateStore.mutate((state) => {
             state.by_job_id = snapshot.by_job_id;
             state.by_evidence_id = snapshot.by_evidence_id;
         });
@@ -607,5 +611,31 @@ export class RestoreEvidenceService {
             signature_valid,
             verified_at: verifiedAt,
         };
+    }
+
+    private async ensureInitialized(): Promise<void> {
+        if (this.initialized) {
+            return;
+        }
+
+        if (!this.initializationPromise) {
+            this.initializationPromise = this.initialize();
+        }
+
+        await this.initializationPromise;
+    }
+
+    private async initialize(): Promise<void> {
+        const state = await this.stateStore.read();
+
+        for (const [jobId, record] of Object.entries(state.by_job_id)) {
+            this.byJobId.set(jobId, record);
+        }
+
+        for (const [evidenceId, record] of Object.entries(state.by_evidence_id)) {
+            this.byEvidenceId.set(evidenceId, record);
+        }
+
+        this.initialized = true;
     }
 }

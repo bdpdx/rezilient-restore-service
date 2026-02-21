@@ -15,3 +15,7 @@
   linkage table.
 - `migrations/0006_restore_resume_journal_roles.sql`: grants restore-service
   read/write and read-only role access for RS-10 resume/journal tables.
+- `migrations/0007_restore_runtime_state_plane.sql`: creates Postgres-backed
+  runtime snapshot persistence table used by plan/job/execute/evidence stores.
+- `migrations/0008_restore_runtime_state_roles.sql`: grants restore-service
+  read/write and read-only role access for runtime snapshot persistence.

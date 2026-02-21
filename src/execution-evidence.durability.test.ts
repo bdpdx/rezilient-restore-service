@@ -1,24 +1,22 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { test } from 'node:test';
+import { newDb } from 'pg-mem';
 import {
     RestoreEvidenceService,
 } from './evidence/evidence-service';
 import {
-    SqliteRestoreEvidenceStateStore,
+    PostgresRestoreEvidenceStateStore,
 } from './evidence/evidence-state-store';
 import {
     RestoreExecutionService,
 } from './execute/execute-service';
 import {
-    SqliteRestoreExecutionStateStore,
+    PostgresRestoreExecutionStateStore,
 } from './execute/execute-state-store';
-import { SqliteRestoreJobStateStore } from './jobs/job-state-store';
+import { PostgresRestoreJobStateStore } from './jobs/job-state-store';
 import { RestoreJobService } from './jobs/job-service';
 import { RestoreLockManager } from './locks/lock-manager';
-import { SqliteRestorePlanStateStore } from './plans/plan-state-store';
+import { PostgresRestorePlanStateStore } from './plans/plan-state-store';
 import { RestorePlanService } from './plans/plan-service';
 import { SourceRegistry } from './registry/source-registry';
 import {
@@ -26,11 +24,13 @@ import {
     TEST_EVIDENCE_SIGNING_PUBLIC_KEY_PEM,
 } from './test-helpers';
 
-function createTempDbPath(name: string): string {
-    const directory = mkdtempSync(join(tmpdir(), 'rrs-stage11-'));
-
-    return join(directory, `${name}.sqlite`);
-}
+type Fixture = {
+    close: () => Promise<void>;
+    jobs: RestoreJobService;
+    plans: RestorePlanService;
+    execute: RestoreExecutionService;
+    evidence: RestoreEvidenceService;
+};
 
 function now(): Date {
     return new Date('2026-02-18T18:00:00.000Z');
@@ -172,14 +172,11 @@ function createJobRequest(
 }
 
 function createFixture(
-    dbPath: string,
+    db: ReturnType<typeof newDb>,
     maxChunksPerAttempt: number,
-): {
-    jobs: RestoreJobService;
-    plans: RestorePlanService;
-    execute: RestoreExecutionService;
-    evidence: RestoreEvidenceService;
-} {
+): Fixture {
+    const pgAdapter = db.adapters.createPg();
+    const pool = new pgAdapter.Pool();
     const sourceRegistry = new SourceRegistry([
         {
             tenantId: 'tenant-acme',
@@ -190,13 +187,17 @@ function createFixture(
     const plans = new RestorePlanService(
         sourceRegistry,
         now,
-        new SqliteRestorePlanStateStore(dbPath),
+        new PostgresRestorePlanStateStore('postgres://unused', {
+            pool: pool as any,
+        }),
     );
     const jobs = new RestoreJobService(
         new RestoreLockManager(),
         sourceRegistry,
         now,
-        new SqliteRestoreJobStateStore(dbPath),
+        new PostgresRestoreJobStateStore('postgres://unused', {
+            pool: pool as any,
+        }),
     );
     const execute = new RestoreExecutionService(
         jobs,
@@ -205,7 +206,9 @@ function createFixture(
             maxChunksPerAttempt,
         },
         now,
-        new SqliteRestoreExecutionStateStore(dbPath),
+        new PostgresRestoreExecutionStateStore('postgres://unused', {
+            pool: pool as any,
+        }),
     );
     const evidence = new RestoreEvidenceService(
         jobs,
@@ -223,10 +226,15 @@ function createFixture(
             },
         },
         now,
-        new SqliteRestoreEvidenceStateStore(dbPath),
+        new PostgresRestoreEvidenceStateStore('postgres://unused', {
+            pool: pool as any,
+        }),
     );
 
     return {
+        close: async () => {
+            await pool.end();
+        },
         jobs,
         plans,
         execute,
@@ -234,18 +242,18 @@ function createFixture(
     };
 }
 
-function createPlanAndJob(
+async function createPlanAndJob(
     fixture: {
         jobs: RestoreJobService;
         plans: RestorePlanService;
     },
     planId: string,
     rowIds: string[],
-): {
+): Promise<{
     jobId: string;
     planHash: string;
-} {
-    const dryRun = fixture.plans.createDryRunPlan(
+}> {
+    const dryRun = await fixture.plans.createDryRunPlan(
         createDryRunRequest(planId, rowIds),
         claims(),
     );
@@ -255,7 +263,7 @@ function createPlanAndJob(
         throw new Error('failed to create dry-run plan fixture');
     }
 
-    const job = fixture.jobs.createJob(
+    const job = await fixture.jobs.createJob(
         createJobRequest(planId, dryRun.record.plan.plan_hash),
         claims(),
     );
@@ -271,172 +279,199 @@ function createPlanAndJob(
     };
 }
 
-test('paused execution resumes from persisted checkpoint after restart', () => {
-    const dbPath = createTempDbPath('execution-restart-resume');
-    const first = createFixture(dbPath, 1);
-    const plan = createPlanAndJob(first, 'plan-stage11-restart', [
-        'row-01',
-        'row-02',
-        'row-03',
-    ]);
-    const firstAttempt = first.execute.executeJob(
-        plan.jobId,
-        {
-            operator_id: 'operator@example.com',
-            operator_capabilities: ['restore_execute'],
-            chunk_size: 1,
-        },
-        claims(),
-    );
+test('paused execution resumes from persisted checkpoint after restart', async () => {
+    const db = newDb();
+    db.public.none('CREATE SCHEMA IF NOT EXISTS rez_restore_index');
+    const first = createFixture(db, 1);
+    let restarted: Fixture | null = null;
+    let restartedAgain: Fixture | null = null;
 
-    assert.equal(firstAttempt.success, true);
-    if (!firstAttempt.success) {
-        return;
+    try {
+        const plan = await createPlanAndJob(first, 'plan-stage11-restart', [
+            'row-01',
+            'row-02',
+            'row-03',
+        ]);
+        const firstAttempt = await first.execute.executeJob(
+            plan.jobId,
+            {
+                operator_id: 'operator@example.com',
+                operator_capabilities: ['restore_execute'],
+                chunk_size: 1,
+            },
+            claims(),
+        );
+
+        assert.equal(firstAttempt.success, true);
+        if (!firstAttempt.success) {
+            return;
+        }
+
+        assert.equal(firstAttempt.statusCode, 202);
+        assert.equal(firstAttempt.record.status, 'paused');
+        assert.equal(firstAttempt.record.checkpoint.next_chunk_index, 1);
+
+        restarted = createFixture(db, 1);
+        const checkpointAfterRestart = await restarted.execute.getCheckpoint(plan.jobId);
+        const journalAfterRestart = await restarted.execute.getRollbackJournal(plan.jobId);
+
+        assert.notEqual(checkpointAfterRestart, null);
+        assert.equal(checkpointAfterRestart?.next_chunk_index, 1);
+        assert.equal(journalAfterRestart?.journal_entries.length, 1);
+        assert.equal(journalAfterRestart?.sn_mirror_entries.length, 1);
+
+        const resumeOne = await restarted.execute.resumeJob(
+            plan.jobId,
+            {
+                operator_id: 'operator@example.com',
+                operator_capabilities: ['restore_execute'],
+                expected_plan_checksum: firstAttempt.record.plan_checksum,
+                expected_precondition_checksum:
+                    firstAttempt.record.precondition_checksum,
+            },
+            claims(),
+        );
+
+        assert.equal(resumeOne.success, true);
+        if (!resumeOne.success) {
+            return;
+        }
+
+        assert.equal(resumeOne.statusCode, 202);
+        assert.equal(resumeOne.record.status, 'paused');
+        assert.equal(resumeOne.record.checkpoint.next_chunk_index, 2);
+
+        restartedAgain = createFixture(db, 1);
+        const checkpointSecondRestart = await restartedAgain.execute.getCheckpoint(
+            plan.jobId,
+        );
+
+        assert.notEqual(checkpointSecondRestart, null);
+        assert.equal(checkpointSecondRestart?.next_chunk_index, 2);
+
+        const resumeTwo = await restartedAgain.execute.resumeJob(
+            plan.jobId,
+            {
+                operator_id: 'operator@example.com',
+                operator_capabilities: ['restore_execute'],
+                expected_plan_checksum: firstAttempt.record.plan_checksum,
+                expected_precondition_checksum:
+                    firstAttempt.record.precondition_checksum,
+            },
+            claims(),
+        );
+
+        assert.equal(resumeTwo.success, true);
+        if (!resumeTwo.success) {
+            return;
+        }
+
+        assert.equal(resumeTwo.statusCode, 200);
+        assert.equal(resumeTwo.record.status, 'completed');
+        assert.equal(resumeTwo.record.checkpoint.next_chunk_index, 3);
+        assert.equal(resumeTwo.record.summary.applied_rows, 3);
+
+        const journalFinal = await restartedAgain.execute.getRollbackJournal(plan.jobId);
+
+        assert.notEqual(journalFinal, null);
+        assert.equal(journalFinal?.journal_entries.length, 3);
+        assert.equal(journalFinal?.sn_mirror_entries.length, 3);
+        assert.equal(
+            journalFinal?.journal_entries[0].journal_id,
+            journalFinal?.sn_mirror_entries[0].journal_id,
+        );
+    } finally {
+        await first.close();
+
+        if (restarted) {
+            await restarted.close();
+        }
+
+        if (restartedAgain) {
+            await restartedAgain.close();
+        }
     }
-
-    assert.equal(firstAttempt.statusCode, 202);
-    assert.equal(firstAttempt.record.status, 'paused');
-    assert.equal(firstAttempt.record.checkpoint.next_chunk_index, 1);
-
-    const restarted = createFixture(dbPath, 1);
-    const checkpointAfterRestart = restarted.execute.getCheckpoint(plan.jobId);
-    const journalAfterRestart = restarted.execute.getRollbackJournal(plan.jobId);
-
-    assert.notEqual(checkpointAfterRestart, null);
-    assert.equal(checkpointAfterRestart?.next_chunk_index, 1);
-    assert.equal(journalAfterRestart?.journal_entries.length, 1);
-    assert.equal(journalAfterRestart?.sn_mirror_entries.length, 1);
-
-    const resumeOne = restarted.execute.resumeJob(
-        plan.jobId,
-        {
-            operator_id: 'operator@example.com',
-            operator_capabilities: ['restore_execute'],
-            expected_plan_checksum: firstAttempt.record.plan_checksum,
-            expected_precondition_checksum:
-                firstAttempt.record.precondition_checksum,
-        },
-        claims(),
-    );
-
-    assert.equal(resumeOne.success, true);
-    if (!resumeOne.success) {
-        return;
-    }
-
-    assert.equal(resumeOne.statusCode, 202);
-    assert.equal(resumeOne.record.status, 'paused');
-    assert.equal(resumeOne.record.checkpoint.next_chunk_index, 2);
-
-    const restartedAgain = createFixture(dbPath, 1);
-    const checkpointSecondRestart = restartedAgain.execute.getCheckpoint(
-        plan.jobId,
-    );
-
-    assert.notEqual(checkpointSecondRestart, null);
-    assert.equal(checkpointSecondRestart?.next_chunk_index, 2);
-
-    const resumeTwo = restartedAgain.execute.resumeJob(
-        plan.jobId,
-        {
-            operator_id: 'operator@example.com',
-            operator_capabilities: ['restore_execute'],
-            expected_plan_checksum: firstAttempt.record.plan_checksum,
-            expected_precondition_checksum:
-                firstAttempt.record.precondition_checksum,
-        },
-        claims(),
-    );
-
-    assert.equal(resumeTwo.success, true);
-    if (!resumeTwo.success) {
-        return;
-    }
-
-    assert.equal(resumeTwo.statusCode, 200);
-    assert.equal(resumeTwo.record.status, 'completed');
-    assert.equal(resumeTwo.record.checkpoint.next_chunk_index, 3);
-    assert.equal(resumeTwo.record.summary.applied_rows, 3);
-
-    const journalFinal = restartedAgain.execute.getRollbackJournal(plan.jobId);
-
-    assert.notEqual(journalFinal, null);
-    assert.equal(journalFinal?.journal_entries.length, 3);
-    assert.equal(journalFinal?.sn_mirror_entries.length, 3);
-    assert.equal(
-        journalFinal?.journal_entries[0].journal_id,
-        journalFinal?.sn_mirror_entries[0].journal_id,
-    );
 });
 
-test('evidence export and verification remain consistent after restart', () => {
-    const dbPath = createTempDbPath('evidence-restart-consistency');
-    const first = createFixture(dbPath, 0);
-    const plan = createPlanAndJob(first, 'plan-stage11-evidence', [
-        'row-a',
-        'row-b',
-    ]);
-    const executed = first.execute.executeJob(
-        plan.jobId,
-        {
-            operator_id: 'operator@example.com',
-            operator_capabilities: ['restore_execute'],
-        },
-        claims(),
-    );
+test('evidence export and verification remain consistent after restart', async () => {
+    const db = newDb();
+    db.public.none('CREATE SCHEMA IF NOT EXISTS rez_restore_index');
+    const first = createFixture(db, 0);
+    let restarted: Fixture | null = null;
 
-    assert.equal(executed.success, true);
-    if (!executed.success) {
-        return;
+    try {
+        const plan = await createPlanAndJob(first, 'plan-stage11-evidence', [
+            'row-a',
+            'row-b',
+        ]);
+        const executed = await first.execute.executeJob(
+            plan.jobId,
+            {
+                operator_id: 'operator@example.com',
+                operator_capabilities: ['restore_execute'],
+            },
+            claims(),
+        );
+
+        assert.equal(executed.success, true);
+        if (!executed.success) {
+            return;
+        }
+
+        assert.equal(executed.record.status, 'completed');
+
+        const firstExport = await first.evidence.exportEvidence(plan.jobId);
+
+        assert.equal(firstExport.success, true);
+        if (!firstExport.success) {
+            return;
+        }
+
+        assert.equal(firstExport.statusCode, 201);
+        assert.equal(firstExport.reused, false);
+        const firstEvidenceId = firstExport.record.evidence.evidence_id;
+        const firstReportHash = firstExport.record.evidence.report_hash;
+
+        restarted = createFixture(db, 0);
+        const evidenceAfterRestart = await restarted.evidence.getEvidence(plan.jobId);
+
+        assert.notEqual(evidenceAfterRestart, null);
+        assert.equal(evidenceAfterRestart?.evidence.evidence_id, firstEvidenceId);
+        assert.equal(evidenceAfterRestart?.evidence.report_hash, firstReportHash);
+        assert.equal(
+            evidenceAfterRestart?.verification.signature_verification,
+            'verified',
+        );
+
+        const evidenceById = await restarted.evidence.getEvidenceById(firstEvidenceId);
+
+        assert.notEqual(evidenceById, null);
+        assert.equal(evidenceById?.evidence.report_hash, firstReportHash);
+
+        const exportAfterRestart = await restarted.evidence.exportEvidence(plan.jobId);
+
+        assert.equal(exportAfterRestart.success, true);
+        if (!exportAfterRestart.success) {
+            return;
+        }
+
+        assert.equal(exportAfterRestart.statusCode, 200);
+        assert.equal(exportAfterRestart.reused, true);
+        assert.equal(
+            exportAfterRestart.record.evidence.evidence_id,
+            firstEvidenceId,
+        );
+        const verification = restarted.evidence.validateEvidenceRecord(
+            exportAfterRestart.record,
+        );
+
+        assert.equal(verification.signature_verification, 'verified');
+        assert.equal(verification.reason_code, 'none');
+    } finally {
+        await first.close();
+
+        if (restarted) {
+            await restarted.close();
+        }
     }
-
-    assert.equal(executed.record.status, 'completed');
-
-    const firstExport = first.evidence.exportEvidence(plan.jobId);
-
-    assert.equal(firstExport.success, true);
-    if (!firstExport.success) {
-        return;
-    }
-
-    assert.equal(firstExport.statusCode, 201);
-    assert.equal(firstExport.reused, false);
-    const firstEvidenceId = firstExport.record.evidence.evidence_id;
-    const firstReportHash = firstExport.record.evidence.report_hash;
-
-    const restarted = createFixture(dbPath, 0);
-    const evidenceAfterRestart = restarted.evidence.getEvidence(plan.jobId);
-
-    assert.notEqual(evidenceAfterRestart, null);
-    assert.equal(evidenceAfterRestart?.evidence.evidence_id, firstEvidenceId);
-    assert.equal(evidenceAfterRestart?.evidence.report_hash, firstReportHash);
-    assert.equal(
-        evidenceAfterRestart?.verification.signature_verification,
-        'verified',
-    );
-
-    const evidenceById = restarted.evidence.getEvidenceById(firstEvidenceId);
-
-    assert.notEqual(evidenceById, null);
-    assert.equal(evidenceById?.evidence.report_hash, firstReportHash);
-
-    const exportAfterRestart = restarted.evidence.exportEvidence(plan.jobId);
-
-    assert.equal(exportAfterRestart.success, true);
-    if (!exportAfterRestart.success) {
-        return;
-    }
-
-    assert.equal(exportAfterRestart.statusCode, 200);
-    assert.equal(exportAfterRestart.reused, true);
-    assert.equal(
-        exportAfterRestart.record.evidence.evidence_id,
-        firstEvidenceId,
-    );
-    const verification = restarted.evidence.validateEvidenceRecord(
-        exportAfterRestart.record,
-    );
-
-    assert.equal(verification.signature_verification, 'verified');
-    assert.equal(verification.reason_code, 'none');
 });

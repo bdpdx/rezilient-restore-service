@@ -3,32 +3,51 @@ import { parseRestoreServiceEnv } from './env';
 import { RequestAuthenticator } from './auth/authenticator';
 import { RestoreOpsAdminService } from './admin/ops-admin-service';
 import { RestoreEvidenceService } from './evidence/evidence-service';
-import { SqliteRestoreEvidenceStateStore } from './evidence/evidence-state-store';
+import { PostgresRestoreEvidenceStateStore } from './evidence/evidence-state-store';
 import { RestoreExecutionService } from './execute/execute-service';
-import { SqliteRestoreExecutionStateStore } from './execute/execute-state-store';
+import { PostgresRestoreExecutionStateStore } from './execute/execute-state-store';
 import { RestoreLockManager } from './locks/lock-manager';
-import { SqliteRestoreJobStateStore } from './jobs/job-state-store';
+import { PostgresRestoreJobStateStore } from './jobs/job-state-store';
 import { RestoreJobService } from './jobs/job-service';
-import { SqliteRestorePlanStateStore } from './plans/plan-state-store';
+import { PostgresRestorePlanStateStore } from './plans/plan-state-store';
 import { RestorePlanService } from './plans/plan-service';
 import { SourceRegistry } from './registry/source-registry';
+import { Pool } from 'pg';
 
 export * from './constants';
 
 async function main(): Promise<void> {
     const env = parseRestoreServiceEnv(process.env);
     const sourceRegistry = new SourceRegistry(env.sourceMappings);
-    const planStateStore = new SqliteRestorePlanStateStore(
-        env.coreStateDbPath,
+    const statePool = new Pool({
+        allowExitOnIdle: false,
+        connectionString: env.restorePgUrl,
+        idleTimeoutMillis: 30000,
+        max: 10,
+    });
+    const planStateStore = new PostgresRestorePlanStateStore(
+        env.restorePgUrl,
+        {
+            pool: statePool,
+        },
     );
-    const jobStateStore = new SqliteRestoreJobStateStore(
-        env.coreStateDbPath,
+    const jobStateStore = new PostgresRestoreJobStateStore(
+        env.restorePgUrl,
+        {
+            pool: statePool,
+        },
     );
-    const executeStateStore = new SqliteRestoreExecutionStateStore(
-        env.coreStateDbPath,
+    const executeStateStore = new PostgresRestoreExecutionStateStore(
+        env.restorePgUrl,
+        {
+            pool: statePool,
+        },
     );
-    const evidenceStateStore = new SqliteRestoreEvidenceStateStore(
-        env.coreStateDbPath,
+    const evidenceStateStore = new PostgresRestoreEvidenceStateStore(
+        env.restorePgUrl,
+        {
+            pool: statePool,
+        },
     );
     const lockManager = new RestoreLockManager();
     const jobs = new RestoreJobService(
@@ -124,7 +143,7 @@ async function main(): Promise<void> {
         staging_mode_enabled: env.stagingModeEnabled,
         ga_runbooks_signed_off: env.gaRunbooksSignedOff,
         max_json_body_bytes: env.maxJsonBodyBytes,
-        core_state_db_path: env.coreStateDbPath,
+        restore_pg_url_configured: env.restorePgUrl.length > 0,
         mapping_count: sourceRegistry.list().length,
         port: env.port,
     });

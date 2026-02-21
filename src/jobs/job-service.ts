@@ -66,20 +66,24 @@ function cloneValue<T>(value: T): T {
 }
 
 export class RestoreJobService {
+    private initialized = false;
+
+    private initializationPromise: Promise<void> | null = null;
+
     constructor(
         private readonly lockManager: RestoreLockManager,
         private readonly sourceRegistry: SourceRegistry,
         private readonly now: () => Date = () => new Date(),
         private readonly stateStore: RestoreJobStateStore =
             new InMemoryRestoreJobStateStore(),
-    ) {
-        this.lockManager.loadState(this.stateStore.read().lock_state);
-    }
+    ) {}
 
-    createJob(
+    async createJob(
         requestBody: unknown,
         claims: AuthTokenClaims,
-    ): CreateRestoreJobResult {
+    ): Promise<CreateRestoreJobResult> {
+        await this.ensureInitialized();
+
         const parsed = CreateRestoreJobRequestSchema.safeParse(requestBody);
 
         if (!parsed.success) {
@@ -220,10 +224,12 @@ export class RestoreJobService {
         });
     }
 
-    completeJob(
+    async completeJob(
         jobId: string,
         requestBody: unknown,
-    ): CompleteRestoreJobResult {
+    ): Promise<CompleteRestoreJobResult> {
+        await this.ensureInitialized();
+
         const parsed = CompleteRestoreJobRequestSchema.safeParse(requestBody);
 
         if (!parsed.success) {
@@ -240,8 +246,11 @@ export class RestoreJobService {
         return this.completeJobInternal(jobId, request);
     }
 
-    getJob(jobId: string): RestoreJobRecord | null {
-        const job = this.stateStore.read().jobs_by_id[jobId];
+    async getJob(jobId: string): Promise<RestoreJobRecord | null> {
+        await this.ensureInitialized();
+
+        const state = await this.stateStore.read();
+        const job = state.jobs_by_id[jobId];
 
         if (!job) {
             return null;
@@ -250,10 +259,12 @@ export class RestoreJobService {
         return cloneValue(job);
     }
 
-    pauseJob(
+    async pauseJob(
         jobId: string,
         reasonCode: RestoreReasonCode = 'paused_token_refresh_grace_exhausted',
-    ): PauseRestoreJobResult {
+    ): Promise<PauseRestoreJobResult> {
+        await this.ensureInitialized();
+
         return this.mutateState((state) => {
             const job = state.jobs_by_id[jobId];
 
@@ -309,7 +320,9 @@ export class RestoreJobService {
         });
     }
 
-    resumePausedJob(jobId: string): ResumeRestoreJobResult {
+    async resumePausedJob(jobId: string): Promise<ResumeRestoreJobResult> {
+        await this.ensureInitialized();
+
         return this.mutateState((state) => {
             const job = state.jobs_by_id[jobId];
 
@@ -367,15 +380,22 @@ export class RestoreJobService {
         });
     }
 
-    listJobEvents(jobId: string): RestoreJobAuditEvent[] {
-        const events = this.stateStore.read().events_by_job_id[jobId] || [];
+    async listJobEvents(jobId: string): Promise<RestoreJobAuditEvent[]> {
+        await this.ensureInitialized();
+
+        const state = await this.stateStore.read();
+        const events = state.events_by_job_id[jobId] || [];
 
         return cloneValue(events);
     }
 
-    listCrossServiceJobEvents(jobId: string): CrossServiceAuditEvent[] {
-        const events =
-            this.stateStore.read().cross_service_events_by_job_id[jobId] || [];
+    async listCrossServiceJobEvents(
+        jobId: string,
+    ): Promise<CrossServiceAuditEvent[]> {
+        await this.ensureInitialized();
+
+        const state = await this.stateStore.read();
+        const events = state.cross_service_events_by_job_id[jobId] || [];
         const ordered = cloneValue(events);
 
         ordered.sort((left, right) =>
@@ -385,35 +405,45 @@ export class RestoreJobService {
         return ordered;
     }
 
-    listJobs(): RestoreJobRecord[] {
-        return Object.values(this.stateStore.read().jobs_by_id)
+    async listJobs(): Promise<RestoreJobRecord[]> {
+        await this.ensureInitialized();
+
+        const state = await this.stateStore.read();
+
+        return Object.values(state.jobs_by_id)
             .map((job) => cloneValue(job))
             .sort((left, right) => {
                 return left.requested_at.localeCompare(right.requested_at);
             });
     }
 
-    getLockSnapshot(): {
+    async getLockSnapshot(): Promise<{
         running: Array<{ jobId: string; tables: string[] }>;
         queued: Array<{ jobId: string; tables: string[] }>;
-    } {
-        const state = this.stateStore.read();
+    }> {
+        await this.ensureInitialized();
+
+        const state = await this.stateStore.read();
 
         this.lockManager.loadState(state.lock_state);
 
         return this.lockManager.snapshot();
     }
 
-    listPlans(): RestorePlanMetadataRecord[] {
-        return Object.values(this.stateStore.read().plans_by_id)
+    async listPlans(): Promise<RestorePlanMetadataRecord[]> {
+        await this.ensureInitialized();
+
+        const state = await this.stateStore.read();
+
+        return Object.values(state.plans_by_id)
             .map((plan) => cloneValue(plan))
             .sort((left, right) => left.requested_at.localeCompare(right.requested_at));
     }
 
-    private completeJobInternal(
+    private async completeJobInternal(
         jobId: string,
         request: CompleteRestoreJobRequest,
-    ): CompleteRestoreJobResult {
+    ): Promise<CompleteRestoreJobResult> {
         return this.mutateState((state) => {
             const job = state.jobs_by_id[jobId];
 
@@ -514,15 +544,36 @@ export class RestoreJobService {
         });
     }
 
-    private mutateState<T>(mutator: (state: RestoreJobState) => T): T {
-        return this.stateStore.mutate((state) => {
+    private async mutateState<T>(
+        mutator: (state: RestoreJobState) => T | Promise<T>,
+    ): Promise<T> {
+        return this.stateStore.mutate(async (state) => {
             this.lockManager.loadState(state.lock_state);
-            const result = mutator(state);
+            const result = await mutator(state);
 
             state.lock_state = this.lockManager.exportState();
 
             return result;
         });
+    }
+
+    private async ensureInitialized(): Promise<void> {
+        if (this.initialized) {
+            return;
+        }
+
+        if (!this.initializationPromise) {
+            this.initializationPromise = this.initialize();
+        }
+
+        await this.initializationPromise;
+    }
+
+    private async initialize(): Promise<void> {
+        const state = await this.stateStore.read();
+
+        this.lockManager.loadState(state.lock_state);
+        this.initialized = true;
     }
 
     private appendEvent(

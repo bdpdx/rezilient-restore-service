@@ -11,7 +11,7 @@ import {
     verifyCanonicalSignature,
 } from './signature';
 
-test('createEvidenceSigner fails when private key PEM is missing', () => {
+test('createEvidenceSigner fails when private key PEM is missing', async () => {
     assert.throws(() => {
         createEvidenceSigner({
             signer_key_id: 'rrs-test-signer',
@@ -21,7 +21,7 @@ test('createEvidenceSigner fails when private key PEM is missing', () => {
     }, /RRS_EVIDENCE_SIGNING_PRIVATE_KEY_PEM is required/);
 });
 
-test('createEvidenceSigner fails when public key PEM is missing', () => {
+test('createEvidenceSigner fails when public key PEM is missing', async () => {
     assert.throws(() => {
         createEvidenceSigner({
             signer_key_id: 'rrs-test-signer',
@@ -31,7 +31,7 @@ test('createEvidenceSigner fails when public key PEM is missing', () => {
     }, /RRS_EVIDENCE_SIGNING_PUBLIC_KEY_PEM is required/);
 });
 
-test('createEvidenceSigner fails when private/public keypair does not match', () => {
+test('createEvidenceSigner fails when private/public keypair does not match', async () => {
     const mismatchedPublicKey = generateKeyPairSync('ed25519')
         .publicKey
         .export({
@@ -49,7 +49,7 @@ test('createEvidenceSigner fails when private/public keypair does not match', ()
     }, /RRS_EVIDENCE_SIGNING_PUBLIC_KEY_PEM must match/);
 });
 
-test('createEvidenceSigner accepts escaped-newline PEM and signs/verifies', () => {
+test('createEvidenceSigner accepts escaped-newline PEM and signs/verifies', async () => {
     const signer = createEvidenceSigner({
         signer_key_id: 'rrs-test-signer',
         private_key_pem: TEST_EVIDENCE_SIGNING_PRIVATE_KEY_PEM.replace(

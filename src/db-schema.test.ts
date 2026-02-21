@@ -21,8 +21,14 @@ const jobSchemaSql = readMigration('0003_restore_job_plane.sql');
 const jobRoleSql = readMigration('0004_restore_job_roles.sql');
 const resumeSchemaSql = readMigration('0005_restore_resume_journal_plane.sql');
 const resumeRoleSql = readMigration('0006_restore_resume_journal_roles.sql');
+const runtimeStateSchemaSql = readMigration(
+    '0007_restore_runtime_state_plane.sql',
+);
+const runtimeStateRoleSql = readMigration(
+    '0008_restore_runtime_state_roles.sql',
+);
 
-test('RS-06 schema migration defines restore index data-plane tables', () => {
+test('RS-06 schema migration defines restore index data-plane tables', async () => {
     assert.match(
         indexSchemaSql,
         /CREATE TABLE IF NOT EXISTS\s+rez_restore_index\.index_events/i,
@@ -49,7 +55,7 @@ test('RS-06 schema migration defines restore index data-plane tables', () => {
     );
 });
 
-test('RS-06 role migration scopes rw and ro DB privileges', () => {
+test('RS-06 role migration scopes rw and ro DB privileges', async () => {
     assert.match(
         indexRoleSql,
         /CREATE ROLE\s+rez_restore_indexer_rw/i,
@@ -75,7 +81,7 @@ test('RS-06 role migration scopes rw and ro DB privileges', () => {
     );
 });
 
-test('RS-07 schema migration defines job, plan, and lock queue tables', () => {
+test('RS-07 schema migration defines job, plan, and lock queue tables', async () => {
     assert.match(
         jobSchemaSql,
         /CREATE TABLE IF NOT EXISTS\s+rez_restore_index\.source_registry/i,
@@ -102,7 +108,7 @@ test('RS-07 schema migration defines job, plan, and lock queue tables', () => {
     );
 });
 
-test('RS-07 schema migration persists approval placeholder metadata fields', () => {
+test('RS-07 schema migration persists approval placeholder metadata fields', async () => {
     assert.match(jobSchemaSql, /approval_required\s+BOOLEAN\s+NOT NULL/i);
     assert.match(jobSchemaSql, /approval_state\s+TEXT\s+NOT NULL/i);
     assert.match(
@@ -111,7 +117,7 @@ test('RS-07 schema migration persists approval placeholder metadata fields', () 
     );
 });
 
-test('RS-07 schema migration excludes plaintext restore payload columns', () => {
+test('RS-07 schema migration excludes plaintext restore payload columns', async () => {
     const combinedSql = `${indexSchemaSql}\n${jobSchemaSql}`;
 
     assert.equal(/\bdiff_plain\b/i.test(combinedSql), false);
@@ -119,7 +125,7 @@ test('RS-07 schema migration excludes plaintext restore payload columns', () => 
     assert.equal(/\bafter_image_plain\b/i.test(combinedSql), false);
 });
 
-test('RS-07 role migration grants restore service write scope', () => {
+test('RS-07 role migration grants restore service write scope', async () => {
     assert.match(
         jobRoleSql,
         /CREATE ROLE\s+rez_restore_service_rw/i,
@@ -134,7 +140,7 @@ test('RS-07 role migration grants restore service write scope', () => {
     );
 });
 
-test('RS-10 schema migration defines checkpoint and rollback journal tables', () => {
+test('RS-10 schema migration defines checkpoint and rollback journal tables', async () => {
     assert.match(
         resumeSchemaSql,
         /CREATE TABLE IF NOT EXISTS\s+rez_restore_index\.restore_execution_checkpoints/i,
@@ -153,12 +159,12 @@ test('RS-10 schema migration defines checkpoint and rollback journal tables', ()
     );
 });
 
-test('RS-10 schema migration keeps journal before-image encrypted only', () => {
+test('RS-10 schema migration keeps journal before-image encrypted only', async () => {
     assert.match(resumeSchemaSql, /before_image_enc\s+JSONB/i);
     assert.equal(/\bbefore_image_plain\b/i.test(resumeSchemaSql), false);
 });
 
-test('RS-10 role migration grants resume/journal table privileges', () => {
+test('RS-10 role migration grants resume/journal table privileges', async () => {
     assert.match(
         resumeRoleSql,
         /GRANT SELECT, INSERT, UPDATE, DELETE[\s\S]+restore_execution_checkpoints/i,
@@ -170,5 +176,25 @@ test('RS-10 role migration grants resume/journal table privileges', () => {
     assert.match(
         resumeRoleSql,
         /GRANT SELECT[\s\S]+restore_rollback_sn_mirror/i,
+    );
+});
+
+test('RS-10 schema migration defines runtime snapshot state table', async () => {
+    assert.match(
+        runtimeStateSchemaSql,
+        /CREATE TABLE IF NOT EXISTS\s+rez_restore_index\.rrs_state_snapshots/i,
+    );
+    assert.match(runtimeStateSchemaSql, /store_key\s+TEXT/i);
+    assert.match(runtimeStateSchemaSql, /state_json\s+JSONB/i);
+});
+
+test('RS-10 role migration grants runtime snapshot table privileges', async () => {
+    assert.match(
+        runtimeStateRoleSql,
+        /GRANT SELECT, INSERT, UPDATE, DELETE[\s\S]+rrs_state_snapshots/i,
+    );
+    assert.match(
+        runtimeStateRoleSql,
+        /GRANT SELECT[\s\S]+rrs_state_snapshots/i,
     );
 });

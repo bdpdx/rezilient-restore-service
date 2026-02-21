@@ -419,6 +419,10 @@ export class RestoreExecutionService {
 
     private readonly config: ExecuteServiceConfig;
 
+    private initialized = false;
+
+    private initializationPromise: Promise<void> | null = null;
+
     constructor(
         private readonly jobs: RestoreJobService,
         private readonly plans: RestorePlanService,
@@ -431,31 +435,15 @@ export class RestoreExecutionService {
             ...DEFAULT_EXECUTE_CONFIG,
             ...(config || {}),
         };
-
-        const state = this.stateStore.read();
-
-        for (const [jobId, record] of Object.entries(state.records_by_job_id)) {
-            this.records.set(jobId, record);
-        }
-
-        for (
-            const [jobId, entries] of Object.entries(
-                state.rollback_journal_by_job_id,
-            )
-        ) {
-            this.rollbackJournal.set(jobId, entries);
-        }
-
-        for (const [jobId, entries] of Object.entries(state.sn_mirror_by_job_id)) {
-            this.snMirrors.set(jobId, entries);
-        }
     }
 
-    executeJob(
+    async executeJob(
         jobId: string,
         requestBody: unknown,
         claims: AuthTokenClaims,
-    ): ExecuteRestoreJobResult {
+    ): Promise<ExecuteRestoreJobResult> {
+        await this.ensureInitialized();
+
         const existing = this.records.get(jobId);
 
         if (existing) {
@@ -476,7 +464,7 @@ export class RestoreExecutionService {
             };
         }
 
-        const job = this.jobs.getJob(jobId);
+        const job = await this.jobs.getJob(jobId);
 
         if (!job) {
             return buildFailure(404, 'not_found', 'job not found');
@@ -512,7 +500,7 @@ export class RestoreExecutionService {
         }
 
         const request = parsed.data;
-        const planLookup = this.lookupAndValidateExecutablePlan(job);
+        const planLookup = await this.lookupAndValidateExecutablePlan(job);
 
         if (!planLookup.ok) {
             return planLookup.failure;
@@ -627,11 +615,13 @@ export class RestoreExecutionService {
         );
     }
 
-    resumeJob(
+    async resumeJob(
         jobId: string,
         requestBody: unknown,
         claims: AuthTokenClaims,
-    ): ExecuteRestoreJobResult {
+    ): Promise<ExecuteRestoreJobResult> {
+        await this.ensureInitialized();
+
         const existing = this.records.get(jobId);
 
         if (!existing) {
@@ -661,7 +651,7 @@ export class RestoreExecutionService {
             );
         }
 
-        const job = this.jobs.getJob(jobId);
+        const job = await this.jobs.getJob(jobId);
 
         if (!job) {
             return buildFailure(404, 'not_found', 'job not found');
@@ -704,7 +694,7 @@ export class RestoreExecutionService {
             );
         }
 
-        const planLookup = this.lookupAndValidateExecutablePlan(job);
+        const planLookup = await this.lookupAndValidateExecutablePlan(job);
 
         if (!planLookup.ok) {
             return planLookup.failure;
@@ -787,7 +777,7 @@ export class RestoreExecutionService {
             );
         }
 
-        const resume = this.jobs.resumePausedJob(jobId);
+        const resume = await this.jobs.resumePausedJob(jobId);
 
         if (!resume.success) {
             return buildFailure(
@@ -806,11 +796,21 @@ export class RestoreExecutionService {
         );
     }
 
-    getExecution(jobId: string): RestoreExecutionRecord | null {
-        return this.records.get(jobId) || null;
+    async getExecution(jobId: string): Promise<RestoreExecutionRecord | null> {
+        await this.ensureInitialized();
+
+        const record = this.records.get(jobId);
+
+        if (!record) {
+            return null;
+        }
+
+        return JSON.parse(JSON.stringify(record)) as RestoreExecutionRecord;
     }
 
-    listExecutions(): RestoreExecutionRecord[] {
+    async listExecutions(): Promise<RestoreExecutionRecord[]> {
+        await this.ensureInitialized();
+
         return Array.from(this.records.values())
             .map((record) =>
                 JSON.parse(JSON.stringify(record)) as RestoreExecutionRecord
@@ -820,7 +820,9 @@ export class RestoreExecutionService {
             });
     }
 
-    getCheckpoint(jobId: string): ExecutionResumeCheckpoint | null {
+    async getCheckpoint(jobId: string): Promise<ExecutionResumeCheckpoint | null> {
+        await this.ensureInitialized();
+
         const record = this.records.get(jobId);
 
         if (!record) {
@@ -835,7 +837,11 @@ export class RestoreExecutionService {
         };
     }
 
-    getRollbackJournal(jobId: string): RestoreRollbackJournalBundle | null {
+    async getRollbackJournal(
+        jobId: string,
+    ): Promise<RestoreRollbackJournalBundle | null> {
+        await this.ensureInitialized();
+
         const journalEntries = this.rollbackJournal.get(jobId);
         const mirrorEntries = this.snMirrors.get(jobId);
 
@@ -849,18 +855,18 @@ export class RestoreExecutionService {
         };
     }
 
-    private setExecutionRecord(
+    private async setExecutionRecord(
         jobId: string,
         record: RestoreExecutionRecord,
-    ): void {
+    ): Promise<void> {
         this.records.set(jobId, record);
-        this.persistState();
+        await this.persistState();
     }
 
-    private persistState(): void {
+    private async persistState(): Promise<void> {
         const snapshot = this.snapshotState();
 
-        this.stateStore.mutate((state) => {
+        await this.stateStore.mutate((state) => {
             state.records_by_job_id = snapshot.records_by_job_id;
             state.rollback_journal_by_job_id =
                 snapshot.rollback_journal_by_job_id;
@@ -896,12 +902,12 @@ export class RestoreExecutionService {
         ) as RestoreExecutionState;
     }
 
-    private processAttempt(
+    private async processAttempt(
         job: RestoreJobRecord,
         plan: RestoreDryRunPlanRecord,
         record: RestoreExecutionRecord,
         runtimeConflictByRow: Map<string, ExecuteRuntimeConflictInput>,
-    ): ExecuteRestoreJobResult {
+    ): Promise<ExecuteRestoreJobResult> {
         const chunks = chunkRows(plan.plan_hash_input.rows, record.chunk_size);
 
         if (record.checkpoint.total_chunks !== chunks.length) {
@@ -914,7 +920,7 @@ export class RestoreExecutionService {
         }
 
         if (record.checkpoint.next_chunk_index >= chunks.length) {
-            const completion = this.jobs.completeJob(job.job_id, {
+            const completion = await this.jobs.completeJob(job.job_id, {
                 status: 'completed',
                 reason_code: 'none',
             });
@@ -938,7 +944,7 @@ export class RestoreExecutionService {
                 record.media_outcomes,
             );
 
-            this.setExecutionRecord(job.job_id, record);
+            await this.setExecutionRecord(job.job_id, record);
 
             return {
                 success: true,
@@ -1069,7 +1075,7 @@ export class RestoreExecutionService {
         );
 
         if (record.checkpoint.next_chunk_index < chunks.length) {
-            const pause = this.jobs.pauseJob(
+            const pause = await this.jobs.pauseJob(
                 job.job_id,
                 'paused_token_refresh_grace_exhausted',
             );
@@ -1087,7 +1093,7 @@ export class RestoreExecutionService {
             record.reason_code = 'paused_token_refresh_grace_exhausted';
             record.completed_at = null;
 
-            this.setExecutionRecord(job.job_id, record);
+            await this.setExecutionRecord(job.job_id, record);
 
             return {
                 success: true,
@@ -1117,7 +1123,7 @@ export class RestoreExecutionService {
         const terminalReason: RestoreReasonCode = hasFailures
             ? 'failed_internal_error'
             : 'none';
-        const completion = this.jobs.completeJob(job.job_id, {
+        const completion = await this.jobs.completeJob(job.job_id, {
             status: terminalStatus,
             reason_code: terminalReason,
         });
@@ -1134,7 +1140,7 @@ export class RestoreExecutionService {
         record.reason_code = terminalReason;
         record.completed_at = normalizeIsoWithMillis(this.now());
 
-        this.setExecutionRecord(job.job_id, record);
+        await this.setExecutionRecord(job.job_id, record);
 
         return {
             success: true,
@@ -1373,16 +1379,16 @@ export class RestoreExecutionService {
         }
     }
 
-    private lookupAndValidateExecutablePlan(
+    private async lookupAndValidateExecutablePlan(
         job: RestoreJobRecord,
-    ): {
+    ): Promise<{
         ok: true;
         plan: RestoreDryRunPlanRecord;
     } | {
         ok: false;
         failure: ExecuteRestoreJobResult;
-    } {
-        const plan = this.plans.getPlan(job.plan_id);
+    }> {
+        const plan = await this.plans.getPlan(job.plan_id);
 
         if (!plan) {
             return {
@@ -1475,6 +1481,40 @@ export class RestoreExecutionService {
             ok: true,
             plan,
         };
+    }
+
+    private async ensureInitialized(): Promise<void> {
+        if (this.initialized) {
+            return;
+        }
+
+        if (!this.initializationPromise) {
+            this.initializationPromise = this.initialize();
+        }
+
+        await this.initializationPromise;
+    }
+
+    private async initialize(): Promise<void> {
+        const state = await this.stateStore.read();
+
+        for (const [jobId, record] of Object.entries(state.records_by_job_id)) {
+            this.records.set(jobId, record);
+        }
+
+        for (
+            const [jobId, entries] of Object.entries(
+                state.rollback_journal_by_job_id,
+            )
+        ) {
+            this.rollbackJournal.set(jobId, entries);
+        }
+
+        for (const [jobId, entries] of Object.entries(state.sn_mirror_by_job_id)) {
+            this.snMirrors.set(jobId, entries);
+        }
+
+        this.initialized = true;
     }
 
     private validateRuntimeConflictRows(

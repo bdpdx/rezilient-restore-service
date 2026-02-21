@@ -1,20 +1,18 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { test } from 'node:test';
-import { SqliteRestoreJobStateStore } from './jobs/job-state-store';
+import { newDb } from 'pg-mem';
+import { PostgresRestoreJobStateStore } from './jobs/job-state-store';
 import { RestoreJobService } from './jobs/job-service';
 import { RestoreLockManager } from './locks/lock-manager';
-import { SqliteRestorePlanStateStore } from './plans/plan-state-store';
+import { PostgresRestorePlanStateStore } from './plans/plan-state-store';
 import { RestorePlanService } from './plans/plan-service';
 import { SourceRegistry } from './registry/source-registry';
 
-function createTempDbPath(name: string): string {
-    const directory = mkdtempSync(join(tmpdir(), 'rrs-stage10-'));
-
-    return join(directory, `${name}.sqlite`);
-}
+type Fixture = {
+    close: () => Promise<void>;
+    jobs: RestoreJobService;
+    plans: RestorePlanService;
+};
 
 function now(): Date {
     return new Date('2026-02-18T15:30:00.000Z');
@@ -150,10 +148,11 @@ function createJobRequest(
     };
 }
 
-function createFixture(dbPath: string): {
-    jobs: RestoreJobService;
-    plans: RestorePlanService;
-} {
+function createFixture(
+    db: ReturnType<typeof newDb>,
+): Fixture {
+    const pgAdapter = db.adapters.createPg();
+    const pool = new pgAdapter.Pool();
     const sourceRegistry = new SourceRegistry([
         {
             tenantId: 'tenant-acme',
@@ -165,157 +164,191 @@ function createFixture(dbPath: string): {
         new RestoreLockManager(),
         sourceRegistry,
         now,
-        new SqliteRestoreJobStateStore(dbPath),
+        new PostgresRestoreJobStateStore('postgres://unused', {
+            pool: pool as any,
+        }),
     );
     const plans = new RestorePlanService(
         sourceRegistry,
         now,
-        new SqliteRestorePlanStateStore(dbPath),
+        new PostgresRestorePlanStateStore('postgres://unused', {
+            pool: pool as any,
+        }),
     );
 
     return {
+        close: async () => {
+            await pool.end();
+        },
         jobs,
         plans,
     };
 }
 
-test('durable core state survives restart for plans/jobs/events/locks', () => {
-    const dbPath = createTempDbPath('core-restart-survival');
-    const first = createFixture(dbPath);
-    const dryRun = first.plans.createDryRunPlan(
-        createDryRunRequest('plan-stage10-restart'),
-        claims(),
-    );
+test('durable core state survives restart for plans/jobs/events/locks', async () => {
+    const db = newDb();
+    db.public.none('CREATE SCHEMA IF NOT EXISTS rez_restore_index');
+    const first = createFixture(db);
+    let restarted: Fixture | null = null;
 
-    assert.equal(dryRun.success, true);
-    if (!dryRun.success) {
-        return;
+    try {
+        const dryRun = await first.plans.createDryRunPlan(
+            createDryRunRequest('plan-stage10-restart'),
+            claims(),
+        );
+
+        assert.equal(dryRun.success, true);
+        if (!dryRun.success) {
+            return;
+        }
+
+        const running = await first.jobs.createJob(
+            createJobRequest(
+                'plan-stage10-restart',
+                dryRun.record.plan.plan_hash,
+            ),
+            claims(),
+        );
+        const queued = await first.jobs.createJob(
+            createJobRequest(
+                'plan-stage10-queued',
+                'b'.repeat(64),
+            ),
+            claims(),
+        );
+
+        assert.equal(running.success, true);
+        assert.equal(queued.success, true);
+        if (!running.success || !queued.success) {
+            return;
+        }
+
+        restarted = createFixture(db);
+        const planAfterRestart = await restarted.plans.getPlan('plan-stage10-restart');
+        const runningAfterRestart = await restarted.jobs.getJob(running.job.job_id);
+        const queuedAfterRestart = await restarted.jobs.getJob(queued.job.job_id);
+
+        assert.notEqual(planAfterRestart, null);
+        assert.notEqual(runningAfterRestart, null);
+        assert.notEqual(queuedAfterRestart, null);
+        assert.equal(planAfterRestart?.tenant_id, 'tenant-acme');
+        assert.equal(planAfterRestart?.instance_id, 'sn-dev-01');
+        assert.equal(planAfterRestart?.source, 'sn://acme-dev.service-now.com');
+        assert.equal(runningAfterRestart?.tenant_id, 'tenant-acme');
+        assert.equal(runningAfterRestart?.instance_id, 'sn-dev-01');
+        assert.equal(runningAfterRestart?.source, 'sn://acme-dev.service-now.com');
+        assert.equal(queuedAfterRestart?.tenant_id, 'tenant-acme');
+        assert.equal(queuedAfterRestart?.instance_id, 'sn-dev-01');
+        assert.equal(queuedAfterRestart?.source, 'sn://acme-dev.service-now.com');
+        assert.equal(runningAfterRestart?.status, 'running');
+        assert.equal(queuedAfterRestart?.status, 'queued');
+
+        const runningEvents = await restarted.jobs.listJobEvents(running.job.job_id);
+        const queuedEvents = await restarted.jobs.listJobEvents(queued.job.job_id);
+
+        assert.equal(runningEvents.length >= 2, true);
+        assert.equal(queuedEvents.length >= 2, true);
+
+        const lockSnapshot = await restarted.jobs.getLockSnapshot();
+
+        assert.deepEqual(
+            lockSnapshot.running.map((entry) => entry.jobId),
+            [running.job.job_id],
+        );
+        assert.deepEqual(
+            lockSnapshot.queued.map((entry) => entry.jobId),
+            [queued.job.job_id],
+        );
+
+        const completion = await restarted.jobs.completeJob(running.job.job_id, {
+            status: 'completed',
+        });
+
+        assert.equal(completion.success, true);
+        if (!completion.success) {
+            return;
+        }
+
+        assert.deepEqual(completion.promoted_job_ids, [queued.job.job_id]);
+        const promoted = await restarted.jobs.getJob(queued.job.job_id);
+
+        assert.equal(promoted?.status, 'running');
+    } finally {
+        await first.close();
+
+        if (restarted) {
+            await restarted.close();
+        }
     }
-
-    const running = first.jobs.createJob(
-        createJobRequest(
-            'plan-stage10-restart',
-            dryRun.record.plan.plan_hash,
-        ),
-        claims(),
-    );
-    const queued = first.jobs.createJob(
-        createJobRequest(
-            'plan-stage10-queued',
-            'b'.repeat(64),
-        ),
-        claims(),
-    );
-
-    assert.equal(running.success, true);
-    assert.equal(queued.success, true);
-    if (!running.success || !queued.success) {
-        return;
-    }
-
-    const restarted = createFixture(dbPath);
-    const planAfterRestart = restarted.plans.getPlan('plan-stage10-restart');
-    const runningAfterRestart = restarted.jobs.getJob(running.job.job_id);
-    const queuedAfterRestart = restarted.jobs.getJob(queued.job.job_id);
-
-    assert.notEqual(planAfterRestart, null);
-    assert.notEqual(runningAfterRestart, null);
-    assert.notEqual(queuedAfterRestart, null);
-    assert.equal(planAfterRestart?.tenant_id, 'tenant-acme');
-    assert.equal(planAfterRestart?.instance_id, 'sn-dev-01');
-    assert.equal(planAfterRestart?.source, 'sn://acme-dev.service-now.com');
-    assert.equal(runningAfterRestart?.tenant_id, 'tenant-acme');
-    assert.equal(runningAfterRestart?.instance_id, 'sn-dev-01');
-    assert.equal(runningAfterRestart?.source, 'sn://acme-dev.service-now.com');
-    assert.equal(queuedAfterRestart?.tenant_id, 'tenant-acme');
-    assert.equal(queuedAfterRestart?.instance_id, 'sn-dev-01');
-    assert.equal(queuedAfterRestart?.source, 'sn://acme-dev.service-now.com');
-    assert.equal(runningAfterRestart?.status, 'running');
-    assert.equal(queuedAfterRestart?.status, 'queued');
-
-    const runningEvents = restarted.jobs.listJobEvents(running.job.job_id);
-    const queuedEvents = restarted.jobs.listJobEvents(queued.job.job_id);
-
-    assert.equal(runningEvents.length >= 2, true);
-    assert.equal(queuedEvents.length >= 2, true);
-
-    const lockSnapshot = restarted.jobs.getLockSnapshot();
-
-    assert.deepEqual(
-        lockSnapshot.running.map((entry) => entry.jobId),
-        [running.job.job_id],
-    );
-    assert.deepEqual(
-        lockSnapshot.queued.map((entry) => entry.jobId),
-        [queued.job.job_id],
-    );
-
-    const completion = restarted.jobs.completeJob(running.job.job_id, {
-        status: 'completed',
-    });
-
-    assert.equal(completion.success, true);
-    if (!completion.success) {
-        return;
-    }
-
-    assert.deepEqual(completion.promoted_job_ids, [queued.job.job_id]);
-    const promoted = restarted.jobs.getJob(queued.job.job_id);
-
-    assert.equal(promoted?.status, 'running');
 });
 
-test('lock queue preserves FIFO promotion order across restart', () => {
-    const dbPath = createTempDbPath('lock-fairness-restart');
-    const first = createFixture(dbPath);
-    const firstJob = first.jobs.createJob(
-        createJobRequest('plan-fair-01', 'c'.repeat(64)),
-        claims(),
-    );
-    const secondJob = first.jobs.createJob(
-        createJobRequest('plan-fair-02', 'd'.repeat(64)),
-        claims(),
-    );
-    const thirdJob = first.jobs.createJob(
-        createJobRequest('plan-fair-03', 'e'.repeat(64)),
-        claims(),
-    );
+test('lock queue preserves FIFO promotion order across restart', async () => {
+    const db = newDb();
+    db.public.none('CREATE SCHEMA IF NOT EXISTS rez_restore_index');
+    const first = createFixture(db);
+    let restartedOnce: Fixture | null = null;
+    let restartedTwice: Fixture | null = null;
 
-    assert.equal(firstJob.success, true);
-    assert.equal(secondJob.success, true);
-    assert.equal(thirdJob.success, true);
-    if (!firstJob.success || !secondJob.success || !thirdJob.success) {
-        return;
+    try {
+        const firstJob = await first.jobs.createJob(
+            createJobRequest('plan-fair-01', 'c'.repeat(64)),
+            claims(),
+        );
+        const secondJob = await first.jobs.createJob(
+            createJobRequest('plan-fair-02', 'd'.repeat(64)),
+            claims(),
+        );
+        const thirdJob = await first.jobs.createJob(
+            createJobRequest('plan-fair-03', 'e'.repeat(64)),
+            claims(),
+        );
+
+        assert.equal(firstJob.success, true);
+        assert.equal(secondJob.success, true);
+        assert.equal(thirdJob.success, true);
+        if (!firstJob.success || !secondJob.success || !thirdJob.success) {
+            return;
+        }
+
+        assert.equal(firstJob.job.status, 'running');
+        assert.equal(secondJob.job.status, 'queued');
+        assert.equal(thirdJob.job.status, 'queued');
+
+        restartedOnce = createFixture(db);
+        const firstCompletion = await restartedOnce.jobs.completeJob(firstJob.job.job_id, {
+            status: 'completed',
+        });
+
+        assert.equal(firstCompletion.success, true);
+        if (!firstCompletion.success) {
+            return;
+        }
+
+        assert.deepEqual(firstCompletion.promoted_job_ids, [secondJob.job.job_id]);
+
+        restartedTwice = createFixture(db);
+        const secondCompletion = await restartedTwice.jobs.completeJob(secondJob.job.job_id, {
+            status: 'completed',
+        });
+
+        assert.equal(secondCompletion.success, true);
+        if (!secondCompletion.success) {
+            return;
+        }
+
+        assert.deepEqual(secondCompletion.promoted_job_ids, [thirdJob.job.job_id]);
+        const thirdAfterPromotion = await restartedTwice.jobs.getJob(thirdJob.job.job_id);
+
+        assert.equal(thirdAfterPromotion?.status, 'running');
+    } finally {
+        await first.close();
+
+        if (restartedOnce) {
+            await restartedOnce.close();
+        }
+
+        if (restartedTwice) {
+            await restartedTwice.close();
+        }
     }
-
-    assert.equal(firstJob.job.status, 'running');
-    assert.equal(secondJob.job.status, 'queued');
-    assert.equal(thirdJob.job.status, 'queued');
-
-    const restartedOnce = createFixture(dbPath);
-    const firstCompletion = restartedOnce.jobs.completeJob(firstJob.job.job_id, {
-        status: 'completed',
-    });
-
-    assert.equal(firstCompletion.success, true);
-    if (!firstCompletion.success) {
-        return;
-    }
-
-    assert.deepEqual(firstCompletion.promoted_job_ids, [secondJob.job.job_id]);
-
-    const restartedTwice = createFixture(dbPath);
-    const secondCompletion = restartedTwice.jobs.completeJob(secondJob.job.job_id, {
-        status: 'completed',
-    });
-
-    assert.equal(secondCompletion.success, true);
-    if (!secondCompletion.success) {
-        return;
-    }
-
-    assert.deepEqual(secondCompletion.promoted_job_ids, [thirdJob.job.job_id]);
-    const thirdAfterPromotion = restartedTwice.jobs.getJob(thirdJob.job.job_id);
-
-    assert.equal(thirdAfterPromotion?.status, 'running');
 });
