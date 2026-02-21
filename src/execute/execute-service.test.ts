@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { RestoreWatermark as RestoreWatermarkSchema } from '@rezilient/types';
 import { RestoreJobService } from '../jobs/job-service';
 import { RestoreLockManager } from '../locks/lock-manager';
 import { RestorePlanService } from '../plans/plan-service';
 import { SourceRegistry } from '../registry/source-registry';
+import { InMemoryRestoreIndexStateReader } from '../restore-index/state-reader';
 import { RestoreExecutionService } from './execute-service';
 
 const FIXED_NOW = new Date('2026-02-16T12:00:00.000Z');
@@ -177,6 +179,26 @@ function createDryRunPayload(
     };
 }
 
+function createAuthoritativeWatermark(): Record<string, unknown> {
+    return {
+        contract_version: 'restore.contracts.v1',
+        tenant_id: 'tenant-acme',
+        instance_id: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        topic: 'rez.cdc',
+        partition: 1,
+        generation_id: 'gen-01',
+        indexed_through_offset: '100',
+        indexed_through_time: '2026-02-16T12:00:00.000Z',
+        coverage_start: '2026-02-16T00:00:00.000Z',
+        coverage_end: '2026-02-16T12:00:00.000Z',
+        freshness: 'fresh',
+        executability: 'executable',
+        reason_code: 'none',
+        measured_at: '2026-02-16T12:00:00.000Z',
+    };
+}
+
 async function buildFixture(options?: {
     executeConfig?: {
         defaultChunkSize?: number;
@@ -199,7 +221,18 @@ async function buildFixture(options?: {
             source: 'sn://acme-dev.service-now.com',
         },
     ]);
-    const plans = new RestorePlanService(registry, now);
+    const restoreIndexReader = new InMemoryRestoreIndexStateReader();
+
+    restoreIndexReader.upsertWatermark(RestoreWatermarkSchema.parse(
+        createAuthoritativeWatermark(),
+    ));
+
+    const plans = new RestorePlanService(
+        registry,
+        now,
+        undefined,
+        restoreIndexReader,
+    );
     const jobs = new RestoreJobService(
         new RestoreLockManager(),
         registry,

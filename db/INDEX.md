@@ -19,3 +19,7 @@
   runtime snapshot persistence table used by plan/job/execute/evidence stores.
 - `migrations/0008_restore_runtime_state_roles.sql`: grants restore-service
   read/write and read-only role access for runtime snapshot persistence.
+- `migrations/0009_restore_index_source_progress_plane.sql`: creates
+  authoritative source-progress checkpoint table used by RRI polling runtime.
+- `migrations/0010_restore_index_source_progress_roles.sql`: grants indexer
+  read/write and restore-service read-only access for source-progress rows.

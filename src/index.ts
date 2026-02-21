@@ -12,6 +12,7 @@ import { RestoreJobService } from './jobs/job-service';
 import { PostgresRestorePlanStateStore } from './plans/plan-state-store';
 import { RestorePlanService } from './plans/plan-service';
 import { SourceRegistry } from './registry/source-registry';
+import { PostgresRestoreIndexStateReader } from './restore-index/state-reader';
 import { Pool } from 'pg';
 
 export * from './constants';
@@ -50,6 +51,12 @@ async function main(): Promise<void> {
         },
     );
     const lockManager = new RestoreLockManager();
+    const restoreIndexStateReader = new PostgresRestoreIndexStateReader(
+        statePool,
+        {
+            staleAfterSeconds: env.restoreIndexStaleAfterSeconds,
+        },
+    );
     const jobs = new RestoreJobService(
         lockManager,
         sourceRegistry,
@@ -60,6 +67,7 @@ async function main(): Promise<void> {
         sourceRegistry,
         undefined,
         planStateStore,
+        restoreIndexStateReader,
     );
     const execute = new RestoreExecutionService(
         jobs,
@@ -105,6 +113,8 @@ async function main(): Promise<void> {
         plans,
         evidence,
         execute,
+        sourceRegistry,
+        restoreIndexStateReader,
         {
             stagingModeEnabled: env.stagingModeEnabled,
             runbooksSignedOff: env.gaRunbooksSignedOff,
@@ -140,6 +150,7 @@ async function main(): Promise<void> {
         evidence_signer_key_id: env.evidenceSignerKeyId,
         evidence_immutable_worm_enabled: env.evidenceImmutableWormEnabled,
         evidence_immutable_retention_class: env.evidenceImmutableRetentionClass,
+        restore_index_stale_after_seconds: env.restoreIndexStaleAfterSeconds,
         staging_mode_enabled: env.stagingModeEnabled,
         ga_runbooks_signed_off: env.gaRunbooksSignedOff,
         max_json_body_bytes: env.maxJsonBodyBytes,

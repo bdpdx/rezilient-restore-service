@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { once } from 'node:events';
 import { Server } from 'node:http';
 import { test } from 'node:test';
+import { RestoreWatermark as RestoreWatermarkSchema } from '@rezilient/types';
 import { RestoreOpsAdminService } from './admin/ops-admin-service';
 import { RequestAuthenticator } from './auth/authenticator';
 import { RestoreEvidenceService } from './evidence/evidence-service';
@@ -10,6 +11,7 @@ import { RestoreJobService } from './jobs/job-service';
 import { RestoreLockManager } from './locks/lock-manager';
 import { RestorePlanService } from './plans/plan-service';
 import { SourceRegistry } from './registry/source-registry';
+import { InMemoryRestoreIndexStateReader } from './restore-index/state-reader';
 import { createRestoreServiceServer } from './server';
 import {
     buildScopedToken,
@@ -164,6 +166,8 @@ function createService(
         };
         adminToken?: string;
         bodyMaxBytes?: number;
+        authoritativeWatermarks?: Record<string, unknown>[];
+        restoreIndexReader?: InMemoryRestoreIndexStateReader;
     },
 ): Server {
     const sourceRegistry = new SourceRegistry([
@@ -184,7 +188,30 @@ function createService(
         sourceRegistry,
         now,
     );
-    const plans = new RestorePlanService(sourceRegistry, now);
+    const restoreIndexReader = options?.restoreIndexReader
+        || new InMemoryRestoreIndexStateReader();
+    const seedWatermarks = options?.authoritativeWatermarks === undefined
+        ? [createWatermark()]
+        : options.authoritativeWatermarks;
+
+    for (let index = 0; index < seedWatermarks.length; index += 1) {
+        const parsed = RestoreWatermarkSchema.safeParse(seedWatermarks[index]);
+
+        if (!parsed.success) {
+            throw new Error(
+                `invalid authoritativeWatermarks[${index}] fixture`,
+            );
+        }
+
+        restoreIndexReader.upsertWatermark(parsed.data);
+    }
+
+    const plans = new RestorePlanService(
+        sourceRegistry,
+        now,
+        undefined,
+        restoreIndexReader,
+    );
     const execute = new RestoreExecutionService(
         jobs,
         plans,
@@ -208,7 +235,17 @@ function createService(
         },
         now,
     );
-    const admin = new RestoreOpsAdminService(jobs, plans, evidence, execute);
+    const admin = new RestoreOpsAdminService(
+        jobs,
+        plans,
+        evidence,
+        execute,
+        sourceRegistry,
+        restoreIndexReader,
+        {
+            now,
+        },
+    );
 
     return createRestoreServiceServer({
         admin,
@@ -978,7 +1015,7 @@ test('dry-run accepts large decimal-string offsets and returns string values', a
             unknown
         >;
 
-        assert.equal(watermarks[0].indexed_through_offset, largeOffset);
+        assert.equal(watermarks[0].indexed_through_offset, '100');
         assert.equal(parsedMetadataFields.offset, largeOffset);
     } finally {
         await closeServer(server);
@@ -1017,9 +1054,48 @@ test('dry-run rejects invalid watermark offset strings', async () => {
     }
 });
 
-test('dry-run freshness matrix enforces stale preview-only and unknown blocked', async () => {
+test('dry-run ignores caller-provided freshness when authoritative state is fresh', async () => {
     const signingKey = 'test-signing-key';
     const server = createService(signingKey);
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+
+    try {
+        const response = await postJson(
+            baseUrl,
+            '/v1/plans/dry-run',
+            token,
+            createDryRunPayload('plan-request-spoofed', {
+                watermarks: [
+                    createWatermark({
+                        freshness: 'unknown',
+                        executability: 'blocked',
+                        reasonCode: 'blocked_freshness_unknown',
+                    }),
+                ],
+            }),
+        );
+
+        assert.equal(response.status, 201);
+        const gate = response.body.gate as Record<string, unknown>;
+
+        assert.equal(gate.executability, 'executable');
+        assert.equal(gate.reason_code, 'none');
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('dry-run freshness matrix enforces authoritative stale and unknown states', async () => {
+    const signingKey = 'test-signing-key';
+    const staleAuthoritative = {
+        ...createWatermark(),
+        coverage_end: '2026-02-16T11:55:00.000Z',
+        indexed_through_time: '2026-02-16T11:55:00.000Z',
+    };
+    const server = createService(signingKey, {
+        authoritativeWatermarks: [staleAuthoritative],
+    });
     const baseUrl = await listen(server);
     const token = createToken(signingKey);
 
@@ -1028,15 +1104,7 @@ test('dry-run freshness matrix enforces stale preview-only and unknown blocked',
             baseUrl,
             '/v1/plans/dry-run',
             token,
-            createDryRunPayload('plan-stale', {
-                watermarks: [
-                    createWatermark({
-                        freshness: 'stale',
-                        executability: 'preview_only',
-                        reasonCode: 'blocked_freshness_stale',
-                    }),
-                ],
-            }),
+            createDryRunPayload('plan-stale'),
         );
 
         assert.equal(staleResponse.status, 201);
@@ -1045,18 +1113,19 @@ test('dry-run freshness matrix enforces stale preview-only and unknown blocked',
         assert.equal(staleGate.executability, 'preview_only');
         assert.equal(staleGate.reason_code, 'blocked_freshness_stale');
 
+        const unknownRow = createDryRunRow('row-unknown', 'rec-unknown');
+        const unknownRowMetadata = unknownRow.metadata as Record<string, unknown>;
+        const unknownMetadataFields = unknownRowMetadata
+            .metadata as Record<string, unknown>;
+
+        unknownMetadataFields.partition = 2;
+
         const unknownResponse = await postJson(
             baseUrl,
             '/v1/plans/dry-run',
             token,
             createDryRunPayload('plan-unknown', {
-                watermarks: [
-                    createWatermark({
-                        freshness: 'unknown',
-                        executability: 'blocked',
-                        reasonCode: 'blocked_freshness_unknown',
-                    }),
-                ],
+                rows: [unknownRow],
             }),
         );
 
@@ -1920,8 +1989,16 @@ test('oversized JSON request returns 413 request_body_too_large', async () => {
 test('admin ops endpoints expose queue, freshness, and evidence summaries', async () => {
     const signingKey = 'test-signing-key';
     const adminToken = 'admin-secret';
+    const restoreIndexReader = new InMemoryRestoreIndexStateReader();
+
+    restoreIndexReader.upsertWatermark(RestoreWatermarkSchema.parse(
+        createWatermark(),
+    ));
+
     const server = createService(signingKey, {
         adminToken,
+        authoritativeWatermarks: [],
+        restoreIndexReader,
     });
     const baseUrl = await listen(server);
     const token = createToken(signingKey);
@@ -1932,21 +2009,15 @@ test('admin ops endpoints expose queue, freshness, and evidence summaries', asyn
             token,
             'admin-plan-queue-01',
         );
+        restoreIndexReader.upsertWatermark(RestoreWatermarkSchema.parse({
+            ...createWatermark(),
+            coverage_end: '2026-02-16T11:55:00.000Z',
+            indexed_through_time: '2026-02-16T11:55:00.000Z',
+        }));
         const secondPlan = await createPlanAndJob(
             baseUrl,
             token,
             'admin-plan-queue-02',
-            {
-                dryRunOverrides: {
-                    watermarks: [
-                        createWatermark({
-                            freshness: 'stale',
-                            executability: 'preview_only',
-                            reasonCode: 'blocked_freshness_stale',
-                        }),
-                    ],
-                },
-            },
         );
 
         const queue = await getAdminJson(

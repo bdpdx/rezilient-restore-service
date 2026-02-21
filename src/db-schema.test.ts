@@ -27,6 +27,12 @@ const runtimeStateSchemaSql = readMigration(
 const runtimeStateRoleSql = readMigration(
     '0008_restore_runtime_state_roles.sql',
 );
+const sourceProgressSchemaSql = readMigration(
+    '0009_restore_index_source_progress_plane.sql',
+);
+const sourceProgressRoleSql = readMigration(
+    '0010_restore_index_source_progress_roles.sql',
+);
 
 test('RS-06 schema migration defines restore index data-plane tables', async () => {
     assert.match(
@@ -196,5 +202,25 @@ test('RS-10 role migration grants runtime snapshot table privileges', async () =
     assert.match(
         runtimeStateRoleSql,
         /GRANT SELECT[\s\S]+rrs_state_snapshots/i,
+    );
+});
+
+test('RS-06 schema migration defines source-progress checkpoint table', async () => {
+    assert.match(
+        sourceProgressSchemaSql,
+        /CREATE TABLE IF NOT EXISTS\s+rez_restore_index\.source_progress/i,
+    );
+    assert.match(sourceProgressSchemaSql, /last_indexed_offset\s+BIGINT/i);
+    assert.match(sourceProgressSchemaSql, /processed_count\s+BIGINT/i);
+});
+
+test('RS-06 role migration grants source-progress table privileges', async () => {
+    assert.match(
+        sourceProgressRoleSql,
+        /GRANT SELECT, INSERT, UPDATE, DELETE[\s\S]+source_progress/i,
+    );
+    assert.match(
+        sourceProgressRoleSql,
+        /GRANT SELECT[\s\S]+source_progress/i,
     );
 });

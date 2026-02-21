@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { RestoreWatermark as RestoreWatermarkSchema } from '@rezilient/types';
 import { RestoreExecutionService } from '../execute/execute-service';
 import { RestoreJobService } from '../jobs/job-service';
 import { RestoreLockManager } from '../locks/lock-manager';
 import { RestorePlanService } from '../plans/plan-service';
 import { SourceRegistry } from '../registry/source-registry';
+import { InMemoryRestoreIndexStateReader } from '../restore-index/state-reader';
 import {
     TEST_EVIDENCE_SIGNING_PRIVATE_KEY_PEM,
     TEST_EVIDENCE_SIGNING_PUBLIC_KEY_PEM,
@@ -71,6 +73,28 @@ function createRow(rowId: string) {
     };
 }
 
+function createAuthoritativeWatermark(): Record<string, unknown> {
+    const indexedThrough = FIXED_NOW.toISOString();
+
+    return {
+        contract_version: 'restore.contracts.v1',
+        tenant_id: 'tenant-acme',
+        instance_id: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        topic: 'rez.cdc',
+        partition: 1,
+        generation_id: 'gen-01',
+        indexed_through_offset: '100',
+        indexed_through_time: indexedThrough,
+        coverage_start: '2026-02-16T00:00:00.000Z',
+        coverage_end: indexedThrough,
+        freshness: 'fresh',
+        executability: 'executable',
+        reason_code: 'none',
+        measured_at: indexedThrough,
+    };
+}
+
 async function createFixture(): Promise<{
     evidence: RestoreEvidenceService;
     jobId: string;
@@ -82,7 +106,18 @@ async function createFixture(): Promise<{
             source: 'sn://acme-dev.service-now.com',
         },
     ]);
-    const plans = new RestorePlanService(sourceRegistry, now);
+    const restoreIndexReader = new InMemoryRestoreIndexStateReader();
+
+    restoreIndexReader.upsertWatermark(RestoreWatermarkSchema.parse(
+        createAuthoritativeWatermark(),
+    ));
+
+    const plans = new RestorePlanService(
+        sourceRegistry,
+        now,
+        undefined,
+        restoreIndexReader,
+    );
     const jobs = new RestoreJobService(
         new RestoreLockManager(),
         sourceRegistry,

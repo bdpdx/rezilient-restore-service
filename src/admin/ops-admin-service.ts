@@ -3,6 +3,8 @@ import { RestoreEvidenceService } from '../evidence/evidence-service';
 import { RestoreExecutionService } from '../execute/execute-service';
 import { RestoreJobService } from '../jobs/job-service';
 import { RestorePlanService } from '../plans/plan-service';
+import { SourceRegistry } from '../registry/source-registry';
+import { RestoreIndexStateReader } from '../restore-index/state-reader';
 
 interface FreshnessSummaryRow {
     tenant_id: string;
@@ -266,6 +268,8 @@ export class RestoreOpsAdminService {
         private readonly plans: RestorePlanService,
         private readonly evidence: RestoreEvidenceService,
         private readonly execute: RestoreExecutionService,
+        private readonly sourceRegistry: SourceRegistry,
+        private readonly restoreIndexStateReader: RestoreIndexStateReader,
         config?: RestoreOpsAdminConfig,
     ) {
         this.now = config?.now || (() => new Date());
@@ -398,30 +402,49 @@ export class RestoreOpsAdminService {
 
     async getFreshnessDashboard(): Promise<Record<string, unknown>> {
         const accumulators = new Map<string, FreshnessAccumulator>();
-        const plans = await this.plans.listPlans();
+        const measuredAt = normalizeIsoWithMillis(this.now());
+        const mappings = this.sourceRegistry.list();
 
-        for (const plan of plans) {
-            for (const watermark of plan.watermarks) {
-                const key = sourceKey({
-                    tenant_id: watermark.tenant_id,
-                    instance_id: watermark.instance_id,
-                    source: watermark.source,
+        for (const mapping of mappings) {
+            const key = sourceKey({
+                tenant_id: mapping.tenantId,
+                instance_id: mapping.instanceId,
+                source: mapping.source,
+            });
+            const existing = accumulators.get(key) || {
+                tenant_id: mapping.tenantId,
+                instance_id: mapping.instanceId,
+                source: mapping.source,
+                fresh_partitions: 0,
+                stale_partitions: 0,
+                unknown_partitions: 0,
+                executable_partitions: 0,
+                preview_only_partitions: 0,
+                blocked_partitions: 0,
+                coverage_start: null,
+                coverage_end: null,
+                latest_measured_at: null,
+            };
+            const watermarks =
+                await this.restoreIndexStateReader.listWatermarksForSource({
+                    instanceId: mapping.instanceId,
+                    measuredAt,
+                    source: mapping.source,
+                    tenantId: mapping.tenantId,
                 });
-                const existing = accumulators.get(key) || {
-                    tenant_id: watermark.tenant_id,
-                    instance_id: watermark.instance_id,
-                    source: watermark.source,
-                    fresh_partitions: 0,
-                    stale_partitions: 0,
-                    unknown_partitions: 0,
-                    executable_partitions: 0,
-                    preview_only_partitions: 0,
-                    blocked_partitions: 0,
-                    coverage_start: null,
-                    coverage_end: null,
-                    latest_measured_at: null,
-                };
 
+            if (watermarks.length === 0) {
+                existing.unknown_partitions += 1;
+                existing.blocked_partitions += 1;
+                existing.latest_measured_at = maxIso(
+                    existing.latest_measured_at,
+                    measuredAt,
+                );
+                accumulators.set(key, existing);
+                continue;
+            }
+
+            for (const watermark of watermarks) {
                 if (watermark.freshness === 'fresh') {
                     existing.fresh_partitions += 1;
                 } else if (watermark.freshness === 'stale') {
@@ -450,8 +473,9 @@ export class RestoreOpsAdminService {
                     existing.latest_measured_at,
                     watermark.measured_at,
                 );
-                accumulators.set(key, existing);
             }
+
+            accumulators.set(key, existing);
         }
 
         const sources = Array.from(accumulators.values())

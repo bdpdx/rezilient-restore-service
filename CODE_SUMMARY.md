@@ -32,9 +32,12 @@ Entrypoints:
   cross-service job audit read path.
 - `src/plans/models.ts`: RS-08 dry-run request/response/gate schemas.
 - `src/plans/plan-service.ts`: RS-08 dry-run orchestration, deterministic hash
-  generation, and freshness/deletion/conflict gate evaluation.
+  generation, and freshness/deletion/conflict gate evaluation from
+  authoritative restore-index state.
 - `src/plans/plan-state-store.ts`: durable/in-memory state stores for
   persisted dry-run plan records.
+- `src/restore-index/state-reader.ts`: authoritative restore-index watermark
+  readers (in-memory + Postgres-backed) with freshness derivation policy.
 - `src/execute/models.ts`: RS-09 execute request and result schemas.
 - `src/execute/execute-service.ts`: RS-09 execute engine plus RS-10 resume flow
   enforcing plan immutability, capability checks, conflict matrix rules, chunk
@@ -68,6 +71,10 @@ Entrypoints:
   snapshot state table for service-owned plan/job/execute/evidence state.
 - `db/migrations/0008_restore_runtime_state_roles.sql`: RS-10 grants for
   runtime snapshot table access by restore-service roles.
+- `db/migrations/0009_restore_index_source_progress_plane.sql`: RS-06 source
+  progress checkpoint table in `rez_restore_index`.
+- `db/migrations/0010_restore_index_source_progress_roles.sql`: RS-06 grants
+  for source progress checkpoint table access.
 
 Tests:
 - `src/db-schema.test.ts`: migration contract checks for RS-06 + RS-07 schema,
@@ -76,6 +83,8 @@ Tests:
 - `src/jobs/job-service.test.ts`: parallel non-overlap and queued overlap tests.
 - `src/core-state.durability.test.ts`: restart-survival and queue-fairness
   tests for durable plan/job/event/lock state.
+- `src/restore-index/state-reader.test.ts`: authoritative in-memory/pg reader
+  freshness derivation and unknown-partition behavior.
 - `src/execution-evidence.durability.test.ts`: restart-survival tests for
   paused execution resume and evidence export/read verification state.
 - `src/execute/execute-service.test.ts`: RS-09 conflict matrix and chunk

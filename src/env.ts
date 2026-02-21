@@ -8,6 +8,7 @@ export interface RestoreServiceEnv {
     authExpectedIssuer?: string;
     maxJsonBodyBytes: number;
     restorePgUrl: string;
+    restoreIndexStaleAfterSeconds: number;
     executeDefaultChunkSize: number;
     executeMaxRows: number;
     executeElevatedSkipRatioPercent: number;
@@ -226,6 +227,11 @@ export function parseRestoreServiceEnv(
         restorePgUrl: parseRequiredString(
             env.REZ_RESTORE_PG_URL || env.RRS_RESTORE_PG_URL,
             'REZ_RESTORE_PG_URL',
+        ),
+        restoreIndexStaleAfterSeconds: parseStrictPositiveInteger(
+            env.RRS_RESTORE_INDEX_STALE_AFTER_SECONDS,
+            'RRS_RESTORE_INDEX_STALE_AFTER_SECONDS',
+            120,
         ),
         executeDefaultChunkSize: parseStrictPositiveInteger(
             env.RRS_EXECUTE_DEFAULT_CHUNK_SIZE,

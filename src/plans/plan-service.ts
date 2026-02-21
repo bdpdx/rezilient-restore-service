@@ -6,6 +6,7 @@ import {
     RESTORE_METADATA_ALLOWLIST_VERSION,
     RestorePlan,
     RestoreReasonCode,
+    RestoreWatermark,
     selectLatestPitRowTuple,
 } from '@rezilient/types';
 import { AuthTokenClaims } from '../auth/claims';
@@ -26,6 +27,10 @@ import {
     InMemoryRestorePlanStateStore,
     RestorePlanStateStore,
 } from './plan-state-store';
+import {
+    InMemoryRestoreIndexStateReader,
+    RestoreIndexStateReader,
+} from '../restore-index/state-reader';
 
 function buildActionCounts(
     request: CreateDryRunPlanRequest,
@@ -119,14 +124,14 @@ function countUnresolvedMediaCandidates(
     return count;
 }
 
-function summarizeFreshness(request: CreateDryRunPlanRequest): {
+function summarizeFreshness(watermarks: RestoreWatermark[]): {
     stale: number;
     unknown: number;
 } {
     let stale = 0;
     let unknown = 0;
 
-    for (const watermark of request.watermarks) {
+    for (const watermark of watermarks) {
         if (
             watermark.freshness === 'unknown' ||
             watermark.reason_code === 'blocked_freshness_unknown'
@@ -151,16 +156,21 @@ function summarizeFreshness(request: CreateDryRunPlanRequest): {
 }
 
 function evaluateGate(
-    request: CreateDryRunPlanRequest,
+    input: {
+        request: CreateDryRunPlanRequest;
+        watermarks: RestoreWatermark[];
+    },
 ): RestoreDryRunGate {
-    const unresolvedDeleteCandidates = countUnresolvedDeleteCandidates(request);
+    const unresolvedDeleteCandidates = countUnresolvedDeleteCandidates(
+        input.request,
+    );
     const unresolvedHardBlockConflicts = countUnresolvedHardBlockConflicts(
-        request,
+        input.request,
     );
     const unresolvedMediaCandidates = countUnresolvedMediaCandidates(
-        request,
+        input.request,
     );
-    const freshness = summarizeFreshness(request);
+    const freshness = summarizeFreshness(input.watermarks);
 
     let executability: RestoreDryRunGate['executability'] = 'executable';
     let reasonCode: RestoreReasonCode = 'none';
@@ -193,6 +203,71 @@ function evaluateGate(
     };
 }
 
+function extractRequestedPartitions(
+    request: CreateDryRunPlanRequest,
+): Array<{
+    partition: number;
+    topic: string;
+}> {
+    const partitions = new Map<string, {
+        partition: number;
+        topic: string;
+    }>();
+
+    for (const row of request.rows) {
+        const topic = row.metadata.metadata.topic;
+        const partition = row.metadata.metadata.partition;
+
+        const normalizedPartition =
+            typeof partition === 'number'
+            && Number.isInteger(partition)
+            && partition >= 0
+                ? partition
+                : null;
+
+        if (typeof topic !== 'string' || normalizedPartition === null) {
+            continue;
+        }
+
+        const normalizedTopic = topic.trim();
+
+        if (!normalizedTopic) {
+            continue;
+        }
+
+        const key = `${normalizedTopic}|${partition}`;
+
+        if (!partitions.has(key)) {
+            partitions.set(key, {
+                partition: normalizedPartition,
+                topic: normalizedTopic,
+            });
+        }
+    }
+
+    if (partitions.size === 0) {
+        for (const watermark of request.watermarks) {
+            const key = `${watermark.topic}|${watermark.partition}`;
+
+            if (!partitions.has(key)) {
+                partitions.set(key, {
+                    partition: watermark.partition,
+                    topic: watermark.topic,
+                });
+            }
+        }
+    }
+
+    return Array.from(partitions.values())
+        .sort((left, right) => {
+            if (left.topic === right.topic) {
+                return left.partition - right.partition;
+            }
+
+            return left.topic.localeCompare(right.topic);
+        });
+}
+
 function buildPitResolutions(
     request: CreateDryRunPlanRequest,
 ): RestorePitResolutionRecord[] {
@@ -221,6 +296,8 @@ export class RestorePlanService {
         private readonly now: () => Date = () => new Date(),
         private readonly stateStore: RestorePlanStateStore =
             new InMemoryRestorePlanStateStore(),
+        private readonly restoreIndexStateReader: RestoreIndexStateReader =
+            new InMemoryRestoreIndexStateReader(),
     ) {}
 
     async createDryRunPlan(
@@ -251,6 +328,31 @@ export class RestorePlanService {
             };
         }
 
+        const measuredAt = normalizeIsoWithMillis(this.now());
+        const requestedPartitions = extractRequestedPartitions(request);
+        let authoritativeWatermarks: RestoreWatermark[];
+
+        try {
+            authoritativeWatermarks =
+                await this.restoreIndexStateReader.readWatermarksForPartitions({
+                    instanceId: request.instance_id,
+                    measuredAt,
+                    partitions: requestedPartitions,
+                    source: request.source,
+                    tenantId: request.tenant_id,
+                });
+        } catch (error: unknown) {
+            return {
+                success: false,
+                statusCode: 503,
+                error: 'restore_index_unavailable',
+                reasonCode: 'blocked_freshness_unknown',
+                message: `authoritative restore index read failed: ${
+                    String((error as Error)?.message || error)
+                }`,
+            };
+        }
+
         const actionCounts = buildActionCounts(request);
         const planHashInput = buildPlanHashInput(request, actionCounts);
         const planHashData = computeRestorePlanHash(planHashInput);
@@ -276,7 +378,10 @@ export class RestorePlanService {
             }
 
             const nowIso = normalizeIsoWithMillis(this.now());
-            const gate = evaluateGate(request);
+            const gate = evaluateGate({
+                request,
+                watermarks: authoritativeWatermarks,
+            });
             const plan = RestorePlan.parse({
                 contract_version: RESTORE_CONTRACT_VERSION,
                 plan_id: request.plan_id,
@@ -302,7 +407,7 @@ export class RestorePlanService {
                 delete_candidates: [...request.delete_candidates],
                 media_candidates: [...request.media_candidates],
                 pit_resolutions: buildPitResolutions(request),
-                watermarks: [...request.watermarks],
+                watermarks: [...authoritativeWatermarks],
             };
 
             state.plans_by_id[request.plan_id] = record;

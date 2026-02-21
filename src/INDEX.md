@@ -35,9 +35,12 @@
   fail-closed scope validation.
 - `plans/models.ts`: RS-08 dry-run request/response and gate model contracts.
 - `plans/plan-service.ts`: RS-08 deterministic dry-run plan generation and
-  freshness/deletion/conflict executability gating.
+  freshness/deletion/conflict executability gating from authoritative
+  restore-index state.
 - `plans/plan-state-store.ts`: durable Postgres + in-memory state store adapters
   for dry-run plans.
+- `restore-index/state-reader.ts`: in-memory and Postgres readers for
+  authoritative restore-index watermarks with freshness policy derivation.
 - `locks/lock-manager.ts`: `(tenant, instance, table)` lock acquisition,
   queueing, release, queued-job promotion, and lock-state import/export.
 - `jobs/models.ts`: request schemas and runtime record types for plans/jobs.
@@ -50,7 +53,9 @@
   primitive used by plan/job/execute/evidence state-store adapters.
 - `test-helpers.ts`: scoped-token fixtures used by integration tests.
 - `db-schema.test.ts`: migration contract tests for RS-06/RS-07/RS-10 schema/
-  role expectations including runtime snapshot persistence tables/grants.
+  role expectations including runtime snapshot and source-progress table grants.
+- `restore-index/state-reader.test.ts`: authoritative watermark reader tests
+  for freshness/staleness and unknown-partition fail-closed behavior.
 - `core-state.durability.test.ts`: stage-10 restart-survival and queue-fairness
   coverage for persisted plans/jobs/events/locks.
 - `execution-evidence.durability.test.ts`: stage-11 restart-survival coverage
