@@ -23,8 +23,24 @@ END$$;
 ALTER ROLE rez_restore_indexer_rw PASSWORD 'rez_restore_indexer_dev';
 ALTER ROLE rez_restore_service_ro PASSWORD 'rez_restore_service_dev';
 
-GRANT USAGE ON SCHEMA rez_restore_index TO rez_restore_indexer_rw;
+GRANT CONNECT, CREATE ON DATABASE rez_restore TO rez_restore_indexer_rw;
+GRANT CONNECT ON DATABASE rez_restore TO rez_restore_service_ro;
+
+GRANT USAGE, CREATE ON SCHEMA rez_restore_index TO rez_restore_indexer_rw;
 GRANT USAGE ON SCHEMA rez_restore_index TO rez_restore_service_ro;
+
+ALTER TABLE IF EXISTS rez_restore_index.index_events
+OWNER TO rez_restore_indexer_rw;
+ALTER TABLE IF EXISTS rez_restore_index.partition_watermarks
+OWNER TO rez_restore_indexer_rw;
+ALTER TABLE IF EXISTS rez_restore_index.partition_generations
+OWNER TO rez_restore_indexer_rw;
+ALTER TABLE IF EXISTS rez_restore_index.source_coverage
+OWNER TO rez_restore_indexer_rw;
+ALTER TABLE IF EXISTS rez_restore_index.backfill_runs
+OWNER TO rez_restore_indexer_rw;
+ALTER TABLE IF EXISTS rez_restore_index.source_progress
+OWNER TO rez_restore_indexer_rw;
 
 GRANT SELECT, INSERT, UPDATE, DELETE
 ON ALL TABLES IN SCHEMA rez_restore_index

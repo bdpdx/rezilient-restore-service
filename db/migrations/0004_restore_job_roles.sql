@@ -12,7 +12,9 @@ END$$;
 
 ALTER ROLE rez_restore_service_rw PASSWORD 'rez_restore_service_dev';
 
-GRANT USAGE ON SCHEMA rez_restore_index TO rez_restore_service_rw;
+GRANT CONNECT, CREATE ON DATABASE rez_restore TO rez_restore_service_rw;
+
+GRANT USAGE, CREATE ON SCHEMA rez_restore_index TO rez_restore_service_rw;
 
 GRANT SELECT, INSERT, UPDATE, DELETE
 ON TABLE
