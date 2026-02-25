@@ -854,3 +854,222 @@ test('rollback journal includes authoritative entries and SN mirror linkage', as
         bundle?.sn_mirror_entries[0].journal_id,
     );
 });
+
+test('executeJob rejects when job not in running state', async () => {
+    const fixture = await buildFixture();
+
+    const jobService = new RestoreJobService(
+        new RestoreLockManager(),
+        new SourceRegistry([
+            {
+                tenantId: 'tenant-acme',
+                instanceId: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+            },
+        ]),
+        now,
+    );
+    const restoreIndexReader =
+        new InMemoryRestoreIndexStateReader();
+    restoreIndexReader.upsertWatermark(
+        RestoreWatermarkSchema.parse(
+            createAuthoritativeWatermark(),
+        ),
+    );
+    const plans = new RestorePlanService(
+        new SourceRegistry([
+            {
+                tenantId: 'tenant-acme',
+                instanceId: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+            },
+        ]),
+        now,
+        undefined,
+        restoreIndexReader,
+    );
+    const plan = await plans.createDryRunPlan(
+        createDryRunPayload('plan-paused', [
+            createRow('row-01'),
+        ]),
+        claims(),
+    );
+    assert.equal(plan.success, true);
+    if (!plan.success) {
+        return;
+    }
+    const job = await jobService.createJob(
+        {
+            tenant_id: 'tenant-acme',
+            instance_id: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+            plan_id: plan.record.plan.plan_id,
+            plan_hash: plan.record.plan.plan_hash,
+            lock_scope_tables: ['incident'],
+            required_capabilities: ['restore_execute'],
+            requested_by: 'operator@example.com',
+        },
+        claims(),
+    );
+    assert.equal(job.success, true);
+    if (!job.success) {
+        return;
+    }
+
+    await jobService.pauseJob(
+        job.job.job_id,
+        'paused_token_refresh_grace_exhausted',
+    );
+
+    const execute = new RestoreExecutionService(
+        jobService,
+        plans,
+        {},
+        now,
+    );
+    const result = await execute.executeJob(
+        job.job.job_id,
+        {
+            operator_id: 'operator@example.com',
+            operator_capabilities: ['restore_execute'],
+        },
+        claims(),
+    );
+
+    assert.equal(result.success, false);
+    if (!result.success) {
+        assert.equal(result.statusCode, 409);
+    }
+});
+
+test('executeJob rejects when plan not found', async () => {
+    const registry = new SourceRegistry([
+        {
+            tenantId: 'tenant-acme',
+            instanceId: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+        },
+    ]);
+    const jobService = new RestoreJobService(
+        new RestoreLockManager(),
+        registry,
+        now,
+    );
+    const restoreIndexReader =
+        new InMemoryRestoreIndexStateReader();
+    restoreIndexReader.upsertWatermark(
+        RestoreWatermarkSchema.parse(
+            createAuthoritativeWatermark(),
+        ),
+    );
+    const planService = new RestorePlanService(
+        registry,
+        now,
+        undefined,
+        restoreIndexReader,
+    );
+    const plan = await planService.createDryRunPlan(
+        createDryRunPayload('plan-exec-missing', [
+            createRow('row-01'),
+        ]),
+        claims(),
+    );
+    assert.equal(plan.success, true);
+    if (!plan.success) {
+        return;
+    }
+    const job = await jobService.createJob(
+        {
+            tenant_id: 'tenant-acme',
+            instance_id: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+            plan_id: plan.record.plan.plan_id,
+            plan_hash: plan.record.plan.plan_hash,
+            lock_scope_tables: ['incident'],
+            required_capabilities: ['restore_execute'],
+            requested_by: 'operator@example.com',
+        },
+        claims(),
+    );
+    assert.equal(job.success, true);
+    if (!job.success) {
+        return;
+    }
+
+    const emptyPlanService = new RestorePlanService(
+        registry,
+        now,
+    );
+    const execute = new RestoreExecutionService(
+        jobService,
+        emptyPlanService,
+        {},
+        now,
+    );
+    const result = await execute.executeJob(
+        job.job.job_id,
+        {
+            operator_id: 'operator@example.com',
+            operator_capabilities: ['restore_execute'],
+        },
+        claims(),
+    );
+
+    assert.equal(result.success, false);
+    if (!result.success) {
+        assert.equal(result.statusCode, 409);
+        assert.match(result.message, /plan/i);
+    }
+});
+
+test('getExecution returns null for unknown job', async () => {
+    const registry = new SourceRegistry([
+        {
+            tenantId: 'tenant-acme',
+            instanceId: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+        },
+    ]);
+    const execute = new RestoreExecutionService(
+        new RestoreJobService(
+            new RestoreLockManager(),
+            registry,
+            now,
+        ),
+        new RestorePlanService(registry, now),
+        {},
+        now,
+    );
+
+    const result = await execute.getExecution(
+        'nonexistent',
+    );
+
+    assert.equal(result, null);
+});
+
+test('getCheckpoint returns null for unknown job', async () => {
+    const registry = new SourceRegistry([
+        {
+            tenantId: 'tenant-acme',
+            instanceId: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+        },
+    ]);
+    const execute = new RestoreExecutionService(
+        new RestoreJobService(
+            new RestoreLockManager(),
+            registry,
+            now,
+        ),
+        new RestorePlanService(registry, now),
+        {},
+        now,
+    );
+
+    const result = await execute.getCheckpoint(
+        'nonexistent',
+    );
+
+    assert.equal(result, null);
+});

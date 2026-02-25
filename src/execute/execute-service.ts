@@ -859,12 +859,18 @@ export class RestoreExecutionService {
         jobId: string,
         record: RestoreExecutionRecord,
     ): Promise<void> {
+        await this.persistStateWithPending(jobId, record);
         this.records.set(jobId, record);
-        await this.persistState();
     }
 
-    private async persistState(): Promise<void> {
+    private async persistStateWithPending(
+        jobId: string,
+        pending: RestoreExecutionRecord,
+    ): Promise<void> {
         const snapshot = this.snapshotState();
+        snapshot.records_by_job_id[jobId] = JSON.parse(
+            JSON.stringify(pending),
+        ) as RestoreExecutionRecord;
 
         await this.stateStore.mutate((state) => {
             state.records_by_job_id = snapshot.records_by_job_id;
@@ -1064,6 +1070,8 @@ export class RestoreExecutionService {
                 record.plan_hash,
                 record.checkpoint.next_chunk_index,
             );
+
+            await this.setExecutionRecord(job.job_id, record);
         }
 
         record.summary = summarizeExecution(

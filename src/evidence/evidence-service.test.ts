@@ -366,3 +366,229 @@ test('evidence verification detects signature tampering', async () => {
     );
     assert.equal(verification.signature_verification, 'verification_failed');
 });
+
+test('ensureEvidence is idempotent', async () => {
+    const fixture = await createFixture();
+    const first = await fixture.evidence.exportEvidence(
+        fixture.jobId,
+    );
+    const second = await fixture.evidence.exportEvidence(
+        fixture.jobId,
+    );
+
+    assert.equal(first.success, true);
+    assert.equal(second.success, true);
+
+    if (first.success && second.success) {
+        assert.equal(
+            first.record.evidence.evidence_id,
+            second.record.evidence.evidence_id,
+        );
+        assert.equal(second.reused, true);
+    }
+});
+
+test('getEvidence returns null for unknown job', async () => {
+    const fixture = await createFixture();
+    const result = await fixture.evidence.getEvidence(
+        'nonexistent',
+    );
+
+    assert.equal(result, null);
+});
+
+test('exportEvidence returns failure when job not found', async () => {
+    const sourceRegistry = new SourceRegistry([
+        {
+            tenantId: 'tenant-acme',
+            instanceId: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+        },
+    ]);
+    const restoreIndexReader =
+        new InMemoryRestoreIndexStateReader();
+    restoreIndexReader.upsertWatermark(
+        RestoreWatermarkSchema.parse(
+            createAuthoritativeWatermark(),
+        ),
+    );
+    const plans = new RestorePlanService(
+        sourceRegistry,
+        now,
+        undefined,
+        restoreIndexReader,
+    );
+    const jobs = new RestoreJobService(
+        new RestoreLockManager(),
+        sourceRegistry,
+        now,
+    );
+    const execute = new RestoreExecutionService(
+        jobs,
+        plans,
+        {},
+        now,
+    );
+    const evidence = new RestoreEvidenceService(
+        jobs,
+        plans,
+        execute,
+        {
+            signer: {
+                signer_key_id: 'rrs-test-signer',
+                private_key_pem:
+                    TEST_EVIDENCE_SIGNING_PRIVATE_KEY_PEM,
+                public_key_pem:
+                    TEST_EVIDENCE_SIGNING_PUBLIC_KEY_PEM,
+            },
+            immutable_storage: {
+                worm_enabled: true,
+                retention_class: 'compliance-7y',
+            },
+        },
+        now,
+    );
+
+    const result = await evidence.exportEvidence(
+        'nonexistent-job',
+    );
+
+    assert.equal(result.success, false);
+    if (!result.success) {
+        assert.equal(result.statusCode, 404);
+    }
+});
+
+test('exportEvidence returns failure when plan not found', async () => {
+    const sourceRegistry = new SourceRegistry([
+        {
+            tenantId: 'tenant-acme',
+            instanceId: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+        },
+    ]);
+    const restoreIndexReader =
+        new InMemoryRestoreIndexStateReader();
+    restoreIndexReader.upsertWatermark(
+        RestoreWatermarkSchema.parse(
+            createAuthoritativeWatermark(),
+        ),
+    );
+    const planServiceForJob = new RestorePlanService(
+        sourceRegistry,
+        now,
+        undefined,
+        restoreIndexReader,
+    );
+    const jobs = new RestoreJobService(
+        new RestoreLockManager(),
+        sourceRegistry,
+        now,
+    );
+    const dryRun = await planServiceForJob.createDryRunPlan(
+        {
+            tenant_id: 'tenant-acme',
+            instance_id: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+            plan_id: 'plan-orphaned',
+            requested_by: 'operator@example.com',
+            pit: {
+                restore_time: '2026-02-16T12:00:00.000Z',
+                restore_timezone: 'UTC',
+                pit_algorithm_version:
+                    'pit.v1.sys_updated_on-sys_mod_count-__time-event_id',
+                tie_breaker: [
+                    'sys_updated_on',
+                    'sys_mod_count',
+                    '__time',
+                    'event_id',
+                ],
+                tie_breaker_fallback: [
+                    'sys_updated_on',
+                    '__time',
+                    'event_id',
+                ],
+            },
+            scope: {
+                mode: 'record',
+                tables: ['incident'],
+                encoded_query: 'active=true',
+            },
+            execution_options: {
+                missing_row_mode: 'existing_only',
+                conflict_policy: 'review_required',
+                schema_compatibility_mode:
+                    'compatible_only',
+                workflow_mode: 'suppressed_default',
+            },
+            rows: [createRow('row-01')],
+            conflicts: [],
+            delete_candidates: [],
+            media_candidates: [],
+            watermarks: [createAuthoritativeWatermark()],
+            pit_candidates: [],
+        },
+        claims(),
+    );
+    assert.equal(dryRun.success, true);
+    if (!dryRun.success) {
+        return;
+    }
+
+    const job = await jobs.createJob(
+        {
+            tenant_id: 'tenant-acme',
+            instance_id: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+            plan_id: dryRun.record.plan.plan_id,
+            plan_hash: dryRun.record.plan.plan_hash,
+            lock_scope_tables: ['incident'],
+            required_capabilities: ['restore_execute'],
+            requested_by: 'operator@example.com',
+        },
+        claims(),
+    );
+    assert.equal(job.success, true);
+    if (!job.success) {
+        return;
+    }
+
+    const emptyPlanService = new RestorePlanService(
+        sourceRegistry,
+        now,
+    );
+    const execute = new RestoreExecutionService(
+        jobs,
+        emptyPlanService,
+        {},
+        now,
+    );
+    const evidence = new RestoreEvidenceService(
+        jobs,
+        emptyPlanService,
+        execute,
+        {
+            signer: {
+                signer_key_id: 'rrs-test-signer',
+                private_key_pem:
+                    TEST_EVIDENCE_SIGNING_PRIVATE_KEY_PEM,
+                public_key_pem:
+                    TEST_EVIDENCE_SIGNING_PUBLIC_KEY_PEM,
+            },
+            immutable_storage: {
+                worm_enabled: true,
+                retention_class: 'compliance-7y',
+            },
+        },
+        now,
+    );
+
+    const result = await evidence.exportEvidence(
+        job.job.job_id,
+    );
+
+    assert.equal(result.success, false);
+    if (!result.success) {
+        assert.equal(result.statusCode, 409);
+    }
+});

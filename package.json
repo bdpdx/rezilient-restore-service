@@ -12,7 +12,7 @@
         "build": "tsc -p tsconfig.json",
         "start": "node dist/index.js",
         "start:dev": "ts-node src/index.ts",
-        "test": "npm run build && node --test dist/db-schema.test.js dist/restore-index/state-reader.test.js dist/core-state.durability.test.js dist/execution-evidence.durability.test.js dist/locks/lock-manager.test.js dist/jobs/job-service.test.js dist/execute/execute-service.test.js dist/evidence/signature.test.js dist/evidence/evidence-service.test.js dist/server.integration.test.js dist/startup.security.test.js"
+        "test": "npm run build && node --test dist/db-schema.test.js dist/restore-index/state-reader.test.js dist/core-state.durability.test.js dist/execution-evidence.durability.test.js dist/locks/lock-manager.test.js dist/jobs/job-service.test.js dist/execute/execute-service.test.js dist/evidence/signature.test.js dist/evidence/evidence-service.test.js dist/server.integration.test.js dist/startup.security.test.js dist/auth/jwt.test.js dist/auth/claims.test.js dist/auth/authenticator.test.js dist/registry/source-registry.test.js dist/env.test.js dist/plans/models.test.js dist/jobs/models.test.js dist/execute/models.test.js dist/evidence/models.test.js dist/state/postgres-snapshot-store.test.js dist/plans/plan-state-store.test.js dist/jobs/job-state-store.test.js dist/execute/execute-state-store.test.js dist/evidence/evidence-state-store.test.js dist/plans/plan-service.test.js dist/admin/ops-admin-service.test.js"
     },
     "dependencies": {
         "@rezilient/types": "file:../rezilient-types",

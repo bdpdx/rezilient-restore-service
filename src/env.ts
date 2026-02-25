@@ -27,7 +27,7 @@ export interface RestoreServiceEnv {
     sourceMappings: SourceMappingInput[];
 }
 
-function parsePositiveInteger(
+function parseNonNegativeInteger(
     raw: string | undefined,
     fieldName: string,
     defaultValue: number,
@@ -50,7 +50,7 @@ function parseStrictPositiveInteger(
     fieldName: string,
     defaultValue: number,
 ): number {
-    const parsed = parsePositiveInteger(raw, fieldName, defaultValue);
+    const parsed = parseNonNegativeInteger(raw, fieldName, defaultValue);
 
     if (parsed <= 0) {
         throw new Error(`${fieldName} must be greater than zero`);
@@ -204,7 +204,7 @@ export function parseRestoreServiceEnv(
     );
 
     return {
-        port: parsePositiveInteger(env.PORT, 'PORT', 3100),
+        port: parseNonNegativeInteger(env.PORT, 'PORT', 3100),
         adminToken: parseRequiredString(
             env.RRS_ADMIN_TOKEN,
             'RRS_ADMIN_TOKEN',
@@ -213,7 +213,7 @@ export function parseRestoreServiceEnv(
             env.RRS_AUTH_SIGNING_KEY,
             'RRS_AUTH_SIGNING_KEY',
         ),
-        authClockSkewSeconds: parsePositiveInteger(
+        authClockSkewSeconds: parseNonNegativeInteger(
             env.RRS_AUTH_TOKEN_CLOCK_SKEW_SECONDS,
             'RRS_AUTH_TOKEN_CLOCK_SKEW_SECONDS',
             30,
@@ -248,7 +248,7 @@ export function parseRestoreServiceEnv(
             'RRS_EXECUTE_ELEVATED_SKIP_RATIO_PERCENT',
             20,
         ),
-        executeMaxChunksPerAttempt: parsePositiveInteger(
+        executeMaxChunksPerAttempt: parseNonNegativeInteger(
             env.RRS_EXECUTE_MAX_CHUNKS_PER_ATTEMPT,
             'RRS_EXECUTE_MAX_CHUNKS_PER_ATTEMPT',
             0,

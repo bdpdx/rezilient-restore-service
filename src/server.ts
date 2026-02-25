@@ -865,9 +865,17 @@ export function createRestoreServiceServer(
                 const executeJobId = asJobExecutionPath(pathname);
 
                 if (executeJobId) {
+                    const job = await getScopedJob(executeJobId);
+
+                    if (!job) {
+                        sendScopedNotFound(response);
+
+                        return;
+                    }
+
                     const body = await readJsonBody(request, maxJsonBodyBytes);
                     const result = await deps.execute.executeJob(
-                        executeJobId,
+                        job.job_id,
                         body,
                         claims,
                     );
@@ -960,13 +968,18 @@ export function createRestoreServiceServer(
                 return;
             }
 
-            const message = error instanceof Error
-                ? error.message
-                : 'unknown_error';
+            if (error instanceof SyntaxError) {
+                sendJson(response, 400, {
+                    error: 'bad_request',
+                    message: 'malformed JSON in request body',
+                });
 
-            sendJson(response, 400, {
-                error: 'bad_request',
-                message,
+                return;
+            }
+
+            sendJson(response, 500, {
+                error: 'internal_error',
+                message: 'an unexpected error occurred',
             });
         }
     });

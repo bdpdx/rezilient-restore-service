@@ -424,10 +424,11 @@ export class RestoreJobService {
         await this.ensureInitialized();
 
         const state = await this.stateStore.read();
+        const tempLockManager = new RestoreLockManager(
+            state.lock_state,
+        );
 
-        this.lockManager.loadState(state.lock_state);
-
-        return this.lockManager.snapshot();
+        return tempLockManager.snapshot();
     }
 
     async listPlans(): Promise<RestorePlanMetadataRecord[]> {
@@ -467,10 +468,6 @@ export class RestoreJobService {
 
             const status = assertStatus(request.status);
             const nowIso = normalizeIsoWithMillis(this.now());
-
-            if (job.status === 'queued') {
-                this.lockManager.dequeue(job.job_id);
-            }
 
             const release = this.lockManager.release(job.job_id);
             const reasonCode = request.reason_code || 'none';

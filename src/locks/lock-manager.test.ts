@@ -87,3 +87,112 @@ test('non-overlapping scopes can run in parallel', async () => {
     );
     assert.equal(snapshot.queued.length, 0);
 });
+
+test('acquire with empty table array throws', () => {
+    const locks = new RestoreLockManager();
+
+    assert.throws(
+        () =>
+            locks.acquire({
+                jobId: 'job-1',
+                tenantId: 'tenant-acme',
+                instanceId: 'sn-dev-01',
+                tables: [],
+            }),
+        /at least one table/,
+    );
+});
+
+test('getQueuePosition returns position for queued job', () => {
+    const locks = new RestoreLockManager();
+
+    locks.acquire({
+        jobId: 'job-1',
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        tables: ['incident'],
+    });
+    locks.acquire({
+        jobId: 'job-2',
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        tables: ['incident'],
+    });
+
+    assert.equal(locks.getQueuePosition('job-2'), 1);
+});
+
+test('getQueuePosition returns null for unknown job', () => {
+    const locks = new RestoreLockManager();
+
+    assert.equal(
+        locks.getQueuePosition('nonexistent'),
+        null,
+    );
+});
+
+test('loadState / exportState round-trips', () => {
+    const locks = new RestoreLockManager();
+
+    locks.acquire({
+        jobId: 'job-1',
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        tables: ['incident'],
+    });
+    locks.acquire({
+        jobId: 'job-2',
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        tables: ['incident'],
+    });
+
+    const exported = locks.exportState();
+    const restored = new RestoreLockManager(exported);
+    const snapshot = restored.snapshot();
+
+    assert.equal(snapshot.running.length, 1);
+    assert.equal(snapshot.running[0].jobId, 'job-1');
+    assert.equal(snapshot.queued.length, 1);
+    assert.equal(snapshot.queued[0].jobId, 'job-2');
+});
+
+test('release promotes multiple queued jobs when scopes free', () => {
+    const locks = new RestoreLockManager();
+
+    locks.acquire({
+        jobId: 'job-a',
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        tables: ['incident', 'task'],
+    });
+    locks.acquire({
+        jobId: 'job-b',
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        tables: ['incident'],
+    });
+    locks.acquire({
+        jobId: 'job-c',
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        tables: ['task'],
+    });
+
+    const released = locks.release('job-a');
+
+    assert.equal(released.released, true);
+    assert.equal(released.promoted.length, 2);
+
+    const promotedIds = released.promoted.map(
+        (entry) => entry.jobId,
+    );
+
+    assert.ok(promotedIds.includes('job-b'));
+    assert.ok(promotedIds.includes('job-c'));
+
+    const snapshot = locks.snapshot();
+
+    assert.equal(snapshot.queued.length, 0);
+    assert.equal(snapshot.running.length, 2);
+});

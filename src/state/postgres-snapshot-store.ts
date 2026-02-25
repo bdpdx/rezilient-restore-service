@@ -173,25 +173,15 @@ export class PostgresSnapshotStore<T> {
     }
 
     private async initialize(): Promise<void> {
-        await this.pool.query(this.createTableSql());
+        for (const ddl of this.createTableDdl()) {
+            await this.pool.query(ddl);
+        }
 
         await this.pool.query(
             `INSERT INTO ${this.tableQualified} (
-                store_key,
-                version,
-                state_json,
-                updated_at
-            )
-            SELECT
-                $1,
-                0,
-                $2::jsonb,
-                now()
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM ${this.tableQualified}
-                WHERE store_key = $1
-            )`,
+                store_key, version, state_json, updated_at
+            ) VALUES ($1, 0, $2::jsonb, now())
+            ON CONFLICT (store_key) DO NOTHING`,
             [
                 this.storeKey,
                 JSON.stringify(this.createEmptyState()),
@@ -255,21 +245,29 @@ export class PostgresSnapshotStore<T> {
 
         await client.query(
             `INSERT INTO ${this.tableQualified} (
-                store_key,
-                version,
-                state_json,
-                updated_at
-            ) VALUES (
-                $1,
-                0,
-                $2::jsonb,
-                now()
-            )`,
+                store_key, version, state_json, updated_at
+            ) VALUES ($1, 0, $2::jsonb, now())
+            ON CONFLICT (store_key) DO NOTHING`,
             [
                 this.storeKey,
                 JSON.stringify(emptyState),
             ],
         );
+
+        const reSelect = await client.query<SnapshotRow>(
+            `SELECT version, state_json
+            FROM ${this.tableQualified}
+            WHERE store_key = $1
+            FOR UPDATE`,
+            [this.storeKey],
+        );
+
+        if (reSelect.rowCount === 1) {
+            return {
+                version: parseVersion(reSelect.rows[0].version),
+                state_json: reSelect.rows[0].state_json,
+            };
+        }
 
         return {
             version: 0,
@@ -277,14 +275,16 @@ export class PostgresSnapshotStore<T> {
         };
     }
 
-    private createTableSql(): string {
-        return `
-CREATE TABLE IF NOT EXISTS ${this.tableQualified} (
+    private createTableDdl(): string[] {
+        return [
+            `CREATE TABLE IF NOT EXISTS ${this.tableQualified} (
     store_key TEXT,
     version BIGINT,
     state_json JSONB,
     updated_at TIMESTAMPTZ
-)
-`;
+)`,
+            `CREATE UNIQUE INDEX IF NOT EXISTS ux_rrs_snapshots_store_key
+    ON ${this.tableQualified} (store_key)`,
+        ];
     }
 }

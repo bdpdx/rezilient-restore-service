@@ -465,13 +465,7 @@ export class RestoreEvidenceService {
             return null;
         }
 
-        const updated = cloneRecord(existing);
-        updated.verification = this.validateEvidenceRecord(updated);
-        updated.evidence.manifest_signature.signature_verification =
-            updated.verification.signature_verification;
-        await this.setEvidenceRecord(jobId, updated);
-
-        return updated;
+        return cloneRecord(existing);
     }
 
     async getEvidenceById(
@@ -502,13 +496,24 @@ export class RestoreEvidenceService {
         jobId: string,
         record: EvidenceExportRecord,
     ): Promise<void> {
-        this.byJobId.set(jobId, cloneRecord(record));
-        this.byEvidenceId.set(record.evidence.evidence_id, cloneRecord(record));
-        await this.persistState();
+        const clonedForMemory = cloneRecord(record);
+        const clonedForIndex = cloneRecord(record);
+        await this.persistStateWithPending(jobId, record);
+        this.byJobId.set(jobId, clonedForMemory);
+        this.byEvidenceId.set(
+            record.evidence.evidence_id,
+            clonedForIndex,
+        );
     }
 
-    private async persistState(): Promise<void> {
+    private async persistStateWithPending(
+        jobId: string,
+        pending: EvidenceExportRecord,
+    ): Promise<void> {
         const snapshot = this.snapshotState();
+        snapshot.by_job_id[jobId] = cloneRecord(pending);
+        snapshot.by_evidence_id[pending.evidence.evidence_id] =
+            cloneRecord(pending);
 
         await this.stateStore.mutate((state) => {
             state.by_job_id = snapshot.by_job_id;

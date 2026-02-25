@@ -244,3 +244,133 @@ test('job lifecycle events emit normalized cross-service audit events', async ()
 
     assert.equal(hasQueued, true);
 });
+
+test('createJob rejects mismatched scope', async () => {
+    const service = new RestoreJobService(
+        new RestoreLockManager(),
+        new SourceRegistry([
+            {
+                tenantId: 'tenant-acme',
+                instanceId: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+            },
+        ]),
+        now,
+    );
+
+    const mismatchedClaims = claims();
+    mismatchedClaims.tenant_id = 'tenant-wrong';
+
+    const result = await service.createJob(
+        baseRequest('plan-bad', 'incident'),
+        mismatchedClaims,
+    );
+
+    assert.equal(result.success, false);
+});
+
+test('getJob returns null for unknown job', async () => {
+    const service = new RestoreJobService(
+        new RestoreLockManager(),
+        new SourceRegistry([
+            {
+                tenantId: 'tenant-acme',
+                instanceId: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+            },
+        ]),
+        now,
+    );
+
+    const job = await service.getJob('nonexistent');
+
+    assert.equal(job, null);
+});
+
+test('completeJob rejects non-terminal status', async () => {
+    const service = new RestoreJobService(
+        new RestoreLockManager(),
+        new SourceRegistry([
+            {
+                tenantId: 'tenant-acme',
+                instanceId: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+            },
+        ]),
+        now,
+    );
+
+    const created = await service.createJob(
+        baseRequest('plan-1', 'incident'),
+        claims(),
+    );
+
+    assert.equal(created.success, true);
+
+    if (!created.success) {
+        return;
+    }
+
+    const result = await service.completeJob(
+        created.job.job_id,
+        { status: 'running' },
+    );
+
+    assert.equal(result.success, false);
+});
+
+test('completeJob rejects completion for already-terminal job', async () => {
+    const service = new RestoreJobService(
+        new RestoreLockManager(),
+        new SourceRegistry([
+            {
+                tenantId: 'tenant-acme',
+                instanceId: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+            },
+        ]),
+        now,
+    );
+
+    const created = await service.createJob(
+        baseRequest('plan-1', 'incident'),
+        claims(),
+    );
+
+    assert.equal(created.success, true);
+
+    if (!created.success) {
+        return;
+    }
+
+    await service.completeJob(created.job.job_id, {
+        status: 'completed',
+    });
+
+    const result = await service.completeJob(
+        created.job.job_id,
+        { status: 'completed' },
+    );
+
+    assert.equal(result.success, false);
+});
+
+test('listJobEvents returns empty for unknown job', async () => {
+    const service = new RestoreJobService(
+        new RestoreLockManager(),
+        new SourceRegistry([
+            {
+                tenantId: 'tenant-acme',
+                instanceId: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+            },
+        ]),
+        now,
+    );
+
+    const events = await service.listJobEvents(
+        'nonexistent',
+    );
+
+    assert.deepEqual(events, []);
+});

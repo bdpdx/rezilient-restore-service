@@ -793,6 +793,15 @@ test('object-level authorization gates scoped reads and object actions', async (
             {
                 method: 'POST',
                 path:
+                    `/v1/jobs/${encodeURIComponent(readyFixture.jobId)}` +
+                    '/execution',
+                payload: createExecutePayload({
+                    capabilities: ['restore_execute'],
+                }),
+            },
+            {
+                method: 'POST',
+                path:
                     `/v1/jobs/${encodeURIComponent(pausedFixture.jobId)}` +
                     '/resume',
                 payload: resumePayload,
@@ -2253,6 +2262,113 @@ test('admin ops RS-15 SLO dashboard captures multi-job execute samples', async (
         const queue = slo.body.queue as Record<string, unknown>;
         assert.equal(typeof queue.queue_wait_p95_ms, 'number');
         assert.equal(typeof execution.execute_duration_p95_ms, 'number');
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('catch-all error handler returns 500 for unexpected internal errors', async () => {
+    const signingKey = 'test-signing-key';
+    const server = createService(signingKey);
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+
+    try {
+        const response = await postJson(
+            baseUrl,
+            '/v1/jobs/nonexistent-job-id/execution',
+            token,
+            createExecutePayload(),
+        );
+
+        assert.notEqual(response.status, 400);
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('malformed JSON request body returns 400 bad_request', async () => {
+    const signingKey = 'test-signing-key';
+    const server = createService(signingKey);
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+
+    try {
+        const response = await fetch(
+            `${baseUrl}/v1/plans/dry-run`,
+            {
+                method: 'POST',
+                headers: {
+                    'content-type': 'application/json',
+                    authorization: `Bearer ${token}`,
+                },
+                body: '{"invalid json',
+            },
+        );
+        const body = await response.json() as Record<string, unknown>;
+
+        assert.equal(response.status, 400);
+        assert.equal(body.error, 'bad_request');
+        assert.equal(
+            body.message,
+            'malformed JSON in request body',
+        );
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('token with future iat beyond clock skew is rejected', async () => {
+    const signingKey = 'test-signing-key';
+    const server = createService(signingKey);
+    const baseUrl = await listen(server);
+    const futureIat = Math.floor(now().getTime() / 1000) + 3600;
+    const token = buildScopedToken({
+        signingKey,
+        issuedAt: futureIat,
+        expiresInSeconds: 7200,
+    });
+
+    try {
+        const response = await getJson(
+            baseUrl,
+            '/v1/jobs',
+            token,
+        );
+
+        assert.equal(response.status, 401);
+        assert.equal(
+            response.body.reason_code,
+            'denied_token_malformed',
+        );
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('token with iat >= exp is rejected', async () => {
+    const signingKey = 'test-signing-key';
+    const server = createService(signingKey);
+    const baseUrl = await listen(server);
+    const issuedAt = Math.floor(now().getTime() / 1000);
+    const token = buildScopedToken({
+        signingKey,
+        issuedAt,
+        expiresInSeconds: -1,
+    });
+
+    try {
+        const response = await getJson(
+            baseUrl,
+            '/v1/jobs',
+            token,
+        );
+
+        assert.equal(response.status, 401);
+        assert.equal(
+            response.body.reason_code,
+            'denied_token_malformed',
+        );
     } finally {
         await closeServer(server);
     }

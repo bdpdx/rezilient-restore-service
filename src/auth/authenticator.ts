@@ -132,6 +132,20 @@ export class RequestAuthenticator {
             };
         }
 
+        if (claims.iat > nowSeconds + this.config.tokenClockSkewSeconds) {
+            return {
+                success: false,
+                reasonCode: 'denied_token_malformed',
+            };
+        }
+
+        if (claims.iat >= claims.exp) {
+            return {
+                success: false,
+                reasonCode: 'denied_token_malformed',
+            };
+        }
+
         return {
             success: true,
             auth: {
