@@ -21,6 +21,7 @@ import {
 import {
     SourceMappingResolver,
 } from './registry/source-mapping-resolver';
+import { CachedAcpSourceMappingProvider } from './registry/acp-source-mapping-provider';
 import { SourceRegistry } from './registry/source-registry';
 import { InMemoryRestoreIndexStateReader } from './restore-index/state-reader';
 import { createRestoreServiceServer } from './server';
@@ -648,9 +649,11 @@ async function createPlanAndJob(
     };
 }
 
-test('valid scoped token and source mapping can create restore job', async () => {
+test('valid scoped token and ACP mapping can create restore job', async () => {
     const signingKey = 'test-signing-key';
-    const server = createService(signingKey);
+    const server = createService(signingKey, {
+        sourceMappingResolver: createResolver(createResolveResult()),
+    });
     const baseUrl = await listen(server);
     const token = createToken(signingKey);
 
@@ -664,6 +667,34 @@ test('valid scoped token and source mapping can create restore job', async () =>
 
         assert.equal(response.status, 201);
         assert.equal(typeof response.body.job, 'object');
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('ACP missing mapping fails closed on job create', async () => {
+    const signingKey = 'test-signing-key';
+    const server = createService(signingKey, {
+        sourceMappingResolver: createResolver({
+            status: 'not_found',
+        }),
+    });
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+
+    try {
+        const response = await postJson(
+            baseUrl,
+            '/v1/jobs',
+            token,
+            createJobPayload('sn://acme-dev.service-now.com'),
+        );
+
+        assert.equal(response.status, 403);
+        assert.equal(
+            response.body.reason_code,
+            'blocked_unknown_source_mapping',
+        );
     } finally {
         await closeServer(server);
     }
@@ -1092,9 +1123,11 @@ test('object-level authorization gates scoped reads and object actions', async (
     }
 });
 
-test('dry-run returns executable gate for fresh watermark state', async () => {
+test('dry-run returns executable gate when ACP mapping exists', async () => {
     const signingKey = 'test-signing-key';
-    const server = createService(signingKey);
+    const server = createService(signingKey, {
+        sourceMappingResolver: createResolver(createResolveResult()),
+    });
     const baseUrl = await listen(server);
     const token = createToken(signingKey);
 
@@ -1111,6 +1144,34 @@ test('dry-run returns executable gate for fresh watermark state', async () => {
 
         assert.equal(gate.executability, 'executable');
         assert.equal(gate.reason_code, 'none');
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('dry-run fails closed when ACP mapping is missing', async () => {
+    const signingKey = 'test-signing-key';
+    const server = createService(signingKey, {
+        sourceMappingResolver: createResolver({
+            status: 'not_found',
+        }),
+    });
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+
+    try {
+        const response = await postJson(
+            baseUrl,
+            '/v1/plans/dry-run',
+            token,
+            createDryRunPayload('plan-acp-missing'),
+        );
+
+        assert.equal(response.status, 403);
+        assert.equal(
+            response.body.reason_code,
+            'blocked_unknown_source_mapping',
+        );
     } finally {
         await closeServer(server);
     }
@@ -1140,6 +1201,80 @@ test('dry-run returns explicit outage block when ACP mapping lookup fails', asyn
             response.body.reason_code,
             'blocked_auth_control_plane_outage',
         );
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('dry-run refreshes ACP mapping cache after TTL expiry', async () => {
+    const signingKey = 'test-signing-key';
+    let resolverNowMs = now().getTime();
+    let canonicalSource = 'sn://acme-dev.service-now.com';
+    let resolveCalls = 0;
+    const sourceMappingResolver = new CachedAcpSourceMappingProvider(
+        {
+            async resolveSourceMapping(): Promise<AcpResolveSourceMappingResult> {
+                resolveCalls += 1;
+
+                return createResolveResult({
+                    source: canonicalSource,
+                });
+            },
+            async listSourceMappings(): Promise<AcpListSourceMappingsResult> {
+                return {
+                    status: 'ok',
+                    mappings: [],
+                };
+            },
+        },
+        {
+            positiveTtlSeconds: 60,
+            negativeTtlSeconds: 5,
+            now: () => new Date(resolverNowMs),
+        },
+    );
+    const server = createService(signingKey, {
+        sourceMappingResolver,
+    });
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+
+    try {
+        const firstResponse = await postJson(
+            baseUrl,
+            '/v1/plans/dry-run',
+            token,
+            createDryRunPayload('plan-acp-cache-first'),
+        );
+
+        assert.equal(firstResponse.status, 201);
+        assert.equal(resolveCalls, 1);
+
+        canonicalSource = 'sn://changed.service-now.com';
+        const cachedResponse = await postJson(
+            baseUrl,
+            '/v1/plans/dry-run',
+            token,
+            createDryRunPayload('plan-acp-cache-hit'),
+        );
+
+        assert.equal(cachedResponse.status, 201);
+        assert.equal(resolveCalls, 1);
+
+        resolverNowMs += 61 * 1000;
+        const refreshedResponse = await postJson(
+            baseUrl,
+            '/v1/plans/dry-run',
+            token,
+            createDryRunPayload('plan-acp-cache-expired'),
+        );
+
+        assert.equal(refreshedResponse.status, 403);
+        assert.equal(
+            refreshedResponse.body.reason_code,
+            'blocked_unknown_source_mapping',
+        );
+        assert.equal(resolveCalls, 2);
     } finally {
         await closeServer(server);
     }
