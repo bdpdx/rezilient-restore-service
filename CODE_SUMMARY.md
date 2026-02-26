@@ -32,8 +32,9 @@ Entrypoints:
   cross-service job audit read path.
 - `src/plans/models.ts`: RS-08 dry-run request/response/gate schemas.
 - `src/plans/plan-service.ts`: RS-08 dry-run orchestration, deterministic hash
-  generation, and freshness/deletion/conflict gate evaluation from
-  authoritative restore-index state.
+  generation, freshness/deletion/conflict gate evaluation from authoritative
+  restore-index state, and ACP-backed mapping enforcement for scoped dry-run
+  requests.
 - `src/plans/plan-state-store.ts`: durable/in-memory state stores for
   persisted dry-run plan records.
 - `src/restore-index/state-reader.ts`: authoritative restore-index watermark
@@ -58,7 +59,10 @@ Entrypoints:
 - `src/admin/ops-admin-service.ts`: RS-14/RS-15 admin ops summary service for
   queue/freshness/evidence plus SLO burn-rate and GA gate readiness checks.
 - `src/jobs/job-service.ts`: restore job orchestration, legacy queue audit
-  events, and normalized cross-service audit event emission.
+  events, normalized cross-service audit event emission, and ACP-backed
+  mapping enforcement for scoped job create requests.
+- `src/registry/source-mapping-resolver.ts`: mapping resolver abstraction with
+  a temporary SourceRegistry-backed adapter used during staged migration.
 - `src/jobs/job-state-store.ts`: durable/in-memory state stores for plan/job/
   event metadata and persisted lock queue snapshots.
 - `src/locks/lock-manager.ts`: lock acquisition/release and queued-job

@@ -11,6 +11,8 @@ import { PostgresRestoreJobStateStore } from './jobs/job-state-store';
 import { RestoreJobService } from './jobs/job-service';
 import { PostgresRestorePlanStateStore } from './plans/plan-state-store';
 import { RestorePlanService } from './plans/plan-service';
+import { AcpSourceMappingClient } from './registry/acp-source-mapping-client';
+import { createCachedAcpSourceMappingProvider } from './registry/acp-source-mapping-provider';
 import { SourceRegistry } from './registry/source-registry';
 import { PostgresRestoreIndexStateReader } from './restore-index/state-reader';
 import { Pool } from 'pg';
@@ -20,6 +22,19 @@ export * from './constants';
 async function main(): Promise<void> {
     const env = parseRestoreServiceEnv(process.env);
     const sourceRegistry = new SourceRegistry(env.sourceMappings);
+    const acpSourceMappingClient = new AcpSourceMappingClient({
+        baseUrl: env.acpBaseUrl,
+        internalToken: env.acpInternalToken,
+        timeoutMs: env.acpRequestTimeoutMs,
+        defaultServiceScope: 'rrs',
+    });
+    const acpSourceMappingProvider = createCachedAcpSourceMappingProvider(
+        acpSourceMappingClient,
+        {
+            positiveTtlSeconds: env.acpPositiveCacheTtlSeconds,
+            negativeTtlSeconds: env.acpNegativeCacheTtlSeconds,
+        },
+    );
     const statePool = new Pool({
         allowExitOnIdle: false,
         connectionString: env.restorePgUrl,
@@ -62,12 +77,14 @@ async function main(): Promise<void> {
         sourceRegistry,
         undefined,
         jobStateStore,
+        acpSourceMappingProvider,
     );
     const plans = new RestorePlanService(
         sourceRegistry,
         undefined,
         planStateStore,
         restoreIndexStateReader,
+        acpSourceMappingProvider,
     );
     const execute = new RestoreExecutionService(
         jobs,

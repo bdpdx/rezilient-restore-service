@@ -10,7 +10,14 @@ import {
 } from '../constants';
 import { AuthTokenClaims } from '../auth/claims';
 import { RestoreLockManager } from '../locks/lock-manager';
+import {
+    AcpResolveSourceMappingResult,
+} from '../registry/acp-source-mapping-client';
 import { SourceRegistry } from '../registry/source-registry';
+import {
+    createSourceRegistryBackedResolver,
+    SourceMappingResolver,
+} from '../registry/source-mapping-resolver';
 import {
     InMemoryRestoreJobStateStore,
     RestoreJobState,
@@ -70,13 +77,19 @@ export class RestoreJobService {
 
     private initializationPromise: Promise<void> | null = null;
 
+    private readonly sourceMappingResolver: SourceMappingResolver;
+
     constructor(
         private readonly lockManager: RestoreLockManager,
-        private readonly sourceRegistry: SourceRegistry,
+        sourceRegistry: SourceRegistry,
         private readonly now: () => Date = () => new Date(),
         private readonly stateStore: RestoreJobStateStore =
             new InMemoryRestoreJobStateStore(),
-    ) {}
+        sourceMappingResolver?: SourceMappingResolver,
+    ) {
+        this.sourceMappingResolver = sourceMappingResolver
+            || createSourceRegistryBackedResolver(sourceRegistry);
+    }
 
     async createJob(
         requestBody: unknown,
@@ -96,12 +109,15 @@ export class RestoreJobService {
         }
 
         const request = parsed.data;
-        const mappingCheck = this.validateScopeRequest(request, claims);
+        const mappingCheck = await this.validateScopeRequest(
+            request,
+            claims,
+        );
 
         if (!mappingCheck.allowed) {
             return {
                 success: false,
-                statusCode: 403,
+                statusCode: mappingCheck.statusCode,
                 error: 'scope_blocked',
                 reasonCode: mappingCheck.reasonCode,
                 message: mappingCheck.message,
@@ -608,17 +624,19 @@ export class RestoreJobService {
         }
     }
 
-    private validateScopeRequest(
+    private async validateScopeRequest(
         request: CreateRestoreJobRequest,
         claims: AuthTokenClaims,
-    ): {
+    ): Promise<{
         allowed: boolean;
+        statusCode: number;
         reasonCode: RestoreReasonCode;
         message: string;
-    } {
+    }> {
         if (claims.tenant_id !== request.tenant_id) {
             return {
                 allowed: false,
+                statusCode: 403,
                 reasonCode: 'blocked_unknown_source_mapping',
                 message: 'tenant_id does not match token scope',
             };
@@ -627,6 +645,7 @@ export class RestoreJobService {
         if (claims.instance_id !== request.instance_id) {
             return {
                 allowed: false,
+                statusCode: 403,
                 reasonCode: 'blocked_unknown_source_mapping',
                 message: 'instance_id does not match token scope',
             };
@@ -635,15 +654,101 @@ export class RestoreJobService {
         if (claims.source !== request.source) {
             return {
                 allowed: false,
+                statusCode: 403,
                 reasonCode: 'blocked_unknown_source_mapping',
                 message: 'source does not match token scope',
             };
         }
 
-        return this.sourceRegistry.validateScope({
-            tenantId: request.tenant_id,
-            instanceId: request.instance_id,
-            source: request.source,
-        });
+        let mappingResolution: AcpResolveSourceMappingResult;
+
+        try {
+            mappingResolution =
+                await this.sourceMappingResolver.resolveSourceMapping({
+                    tenantId: request.tenant_id,
+                    instanceId: request.instance_id,
+                    serviceScope: 'rrs',
+                });
+        } catch (error: unknown) {
+            return {
+                allowed: false,
+                statusCode: 503,
+                reasonCode: 'blocked_auth_control_plane_outage',
+                message:
+                    'auth control plane source mapping resolve failed: '
+                    + String((error as Error)?.message || error),
+            };
+        }
+
+        if (mappingResolution.status === 'outage') {
+            return {
+                allowed: false,
+                statusCode: 503,
+                reasonCode: 'blocked_auth_control_plane_outage',
+                message: mappingResolution.message,
+            };
+        }
+
+        if (mappingResolution.status === 'not_found') {
+            return {
+                allowed: false,
+                statusCode: 403,
+                reasonCode: 'blocked_unknown_source_mapping',
+                message: 'tenant/instance mapping not found in ACP',
+            };
+        }
+
+        const mapping = mappingResolution.mapping;
+
+        if (
+            mapping.tenantId !== request.tenant_id ||
+            mapping.instanceId !== request.instance_id
+        ) {
+            return {
+                allowed: false,
+                statusCode: 403,
+                reasonCode: 'blocked_unknown_source_mapping',
+                message: 'ACP returned mismatched tenant/instance mapping',
+            };
+        }
+
+        if (mapping.source !== request.source) {
+            return {
+                allowed: false,
+                statusCode: 403,
+                reasonCode: 'blocked_unknown_source_mapping',
+                message: 'source does not match canonical ACP mapping',
+            };
+        }
+
+        if (!mapping.serviceAllowed) {
+            return {
+                allowed: false,
+                statusCode: 403,
+                reasonCode: 'blocked_unknown_source_mapping',
+                message: 'service scope is not allowed by ACP mapping',
+            };
+        }
+
+        if (
+            mapping.tenantState !== 'active' ||
+            mapping.entitlementState !== 'active' ||
+            mapping.instanceState !== 'active'
+        ) {
+            return {
+                allowed: false,
+                statusCode: 403,
+                reasonCode: 'blocked_unknown_source_mapping',
+                message:
+                    'ACP mapping is not active for tenant/entitlement/instance',
+            };
+        }
+
+        return {
+            allowed: true,
+            statusCode: 200,
+            reasonCode: 'none',
+            message: 'scope validated',
+        };
     }
 }

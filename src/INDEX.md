@@ -33,6 +33,9 @@
   adapters for evidence export and signature-verification state.
 - `registry/source-registry.ts`: tenant/instance/source mapping registry and
   fail-closed scope validation.
+- `registry/source-mapping-resolver.ts`: resolver abstraction for scope checks
+  with a temporary SourceRegistry-backed adapter used during staged ACP
+  migration.
 - `registry/acp-source-mapping-client.ts`: ACP internal source-mapping HTTP
   client for resolve/list requests with timeout/auth/outage handling.
 - `registry/acp-source-mapping-provider.ts`: ACP mapping provider with positive
@@ -40,7 +43,8 @@
 - `plans/models.ts`: RS-08 dry-run request/response and gate model contracts.
 - `plans/plan-service.ts`: RS-08 deterministic dry-run plan generation and
   freshness/deletion/conflict executability gating from authoritative
-  restore-index state.
+  restore-index state, including ACP-backed tenant/instance/source mapping
+  enforcement.
 - `plans/plan-state-store.ts`: durable Postgres + in-memory state store adapters
   for dry-run plans.
 - `restore-index/state-reader.ts`: in-memory and Postgres readers for
@@ -50,7 +54,8 @@
 - `jobs/models.ts`: request schemas and runtime record types for plans/jobs.
 - `jobs/job-service.ts`: restore job orchestration with plan metadata,
   lock-state transitions, legacy queue audit events, normalized cross-service
-  audit emission, and durable state-store writes.
+  audit emission, durable state-store writes, and ACP-backed mapping
+  enforcement.
 - `jobs/job-state-store.ts`: durable Postgres + in-memory state store adapters
   for plan/job/event/cross-service-audit and lock-queue snapshots.
 - `state/postgres-snapshot-store.ts`: shared Postgres JSON snapshot persistence

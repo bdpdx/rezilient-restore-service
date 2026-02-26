@@ -2,6 +2,13 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { RestoreWatermark as RestoreWatermarkSchema } from '@rezilient/types';
 import { AuthTokenClaims } from '../auth/claims';
+import {
+    AcpResolveSourceMappingResult,
+    ResolveSourceMappingInput,
+} from '../registry/acp-source-mapping-client';
+import {
+    SourceMappingResolver,
+} from '../registry/source-mapping-resolver';
 import { SourceRegistry } from '../registry/source-registry';
 import { InMemoryRestoreIndexStateReader } from '../restore-index/state-reader';
 import { InMemoryRestorePlanStateStore } from './plan-state-store';
@@ -120,7 +127,55 @@ type Fixture = {
     indexReader: InMemoryRestoreIndexStateReader;
 };
 
-function createFixture(): Fixture {
+type FoundMapping = Extract<
+    AcpResolveSourceMappingResult,
+    { status: 'found' }
+>;
+
+function createResolveResult(
+    overrides: Partial<FoundMapping['mapping']> = {},
+): FoundMapping {
+    return {
+        status: 'found',
+        mapping: {
+            tenantId: 'tenant-acme',
+            instanceId: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+            tenantState: 'active',
+            entitlementState: 'active',
+            instanceState: 'active',
+            allowedServices: ['rrs'],
+            updatedAt: '2026-02-18T15:30:00.000Z',
+            requestedServiceScope: 'rrs',
+            serviceAllowed: true,
+            ...overrides,
+        },
+    };
+}
+
+function createResolver(
+    resolveHandler?: (
+        input: ResolveSourceMappingInput,
+    ) => Promise<AcpResolveSourceMappingResult>,
+): SourceMappingResolver {
+    return {
+        async resolveSourceMapping(
+            input: ResolveSourceMappingInput,
+        ): Promise<AcpResolveSourceMappingResult> {
+            if (resolveHandler) {
+                return resolveHandler(input);
+            }
+
+            return createResolveResult();
+        },
+    };
+}
+
+function createFixture(options?: {
+    resolveHandler?: (
+        input: ResolveSourceMappingInput,
+    ) => Promise<AcpResolveSourceMappingResult>;
+}): Fixture {
     const registry = new SourceRegistry([
         {
             tenantId: 'tenant-acme',
@@ -137,6 +192,7 @@ function createFixture(): Fixture {
         fixedNow,
         new InMemoryRestorePlanStateStore(),
         indexReader,
+        createResolver(options?.resolveHandler),
     );
     return { service, indexReader };
 }
@@ -324,13 +380,100 @@ describe('RestorePlanService', () => {
         }
     });
 
-    test('createDryRunPlan validates scope against source registry', async () => {
+    test('createDryRunPlan validates scope against ACP mapping resolver', async () => {
         const { service } = createFixture();
         const result = await service.createDryRunPlan(
             buildDryRunRequest('plan-scope'),
             claims(),
         );
         assert.equal(result.success, true);
+    });
+
+    test('createDryRunPlan rejects when ACP mapping is missing', async () => {
+        const { service } = createFixture({
+            resolveHandler: async () => ({
+                status: 'not_found',
+            }),
+        });
+        const result = await service.createDryRunPlan(
+            buildDryRunRequest('plan-missing-mapping'),
+            claims(),
+        );
+
+        assert.equal(result.success, false);
+        if (!result.success) {
+            assert.equal(result.statusCode, 403);
+            assert.equal(
+                result.reasonCode,
+                'blocked_unknown_source_mapping',
+            );
+        }
+    });
+
+    test('createDryRunPlan rejects mismatched ACP canonical source', async () => {
+        const { service } = createFixture({
+            resolveHandler: async () =>
+                createResolveResult({
+                    source: 'sn://different.service-now.com',
+                }),
+        });
+        const result = await service.createDryRunPlan(
+            buildDryRunRequest('plan-acp-source-mismatch'),
+            claims(),
+        );
+
+        assert.equal(result.success, false);
+        if (!result.success) {
+            assert.equal(result.statusCode, 403);
+            assert.equal(
+                result.reasonCode,
+                'blocked_unknown_source_mapping',
+            );
+        }
+    });
+
+    test('createDryRunPlan rejects inactive ACP mapping', async () => {
+        const { service } = createFixture({
+            resolveHandler: async () =>
+                createResolveResult({
+                    instanceState: 'suspended',
+                }),
+        });
+        const result = await service.createDryRunPlan(
+            buildDryRunRequest('plan-acp-inactive'),
+            claims(),
+        );
+
+        assert.equal(result.success, false);
+        if (!result.success) {
+            assert.equal(result.statusCode, 403);
+            assert.equal(
+                result.reasonCode,
+                'blocked_unknown_source_mapping',
+            );
+        }
+    });
+
+    test('createDryRunPlan rejects ACP outages explicitly', async () => {
+        const { service } = createFixture({
+            resolveHandler: async () => ({
+                status: 'outage',
+                message: 'ACP timeout',
+            }),
+        });
+        const result = await service.createDryRunPlan(
+            buildDryRunRequest('plan-acp-outage'),
+            claims(),
+        );
+
+        assert.equal(result.success, false);
+        if (!result.success) {
+            assert.equal(result.statusCode, 503);
+            assert.equal(
+                result.reasonCode,
+                'blocked_auth_control_plane_outage',
+            );
+        }
     });
 
     test('createDryRunPlan rejects mismatched scope', async () => {

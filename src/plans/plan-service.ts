@@ -11,7 +11,14 @@ import {
 } from '@rezilient/types';
 import { AuthTokenClaims } from '../auth/claims';
 import { normalizeIsoWithMillis } from '../jobs/models';
+import {
+    AcpResolveSourceMappingResult,
+} from '../registry/acp-source-mapping-client';
 import { SourceRegistry } from '../registry/source-registry';
+import {
+    createSourceRegistryBackedResolver,
+    SourceMappingResolver,
+} from '../registry/source-mapping-resolver';
 import {
     buildApprovalPlaceholder,
     buildPlanHashInput,
@@ -291,14 +298,20 @@ function buildPitResolutions(
 }
 
 export class RestorePlanService {
+    private readonly sourceMappingResolver: SourceMappingResolver;
+
     constructor(
-        private readonly sourceRegistry: SourceRegistry,
+        sourceRegistry: SourceRegistry,
         private readonly now: () => Date = () => new Date(),
         private readonly stateStore: RestorePlanStateStore =
             new InMemoryRestorePlanStateStore(),
         private readonly restoreIndexStateReader: RestoreIndexStateReader =
             new InMemoryRestoreIndexStateReader(),
-    ) {}
+        sourceMappingResolver?: SourceMappingResolver,
+    ) {
+        this.sourceMappingResolver = sourceMappingResolver
+            || createSourceRegistryBackedResolver(sourceRegistry);
+    }
 
     async createDryRunPlan(
         requestBody: unknown,
@@ -316,12 +329,12 @@ export class RestorePlanService {
         }
 
         const request = parsed.data;
-        const scopeCheck = this.validateScopeRequest(request, claims);
+        const scopeCheck = await this.validateScopeRequest(request, claims);
 
         if (!scopeCheck.allowed) {
             return {
                 success: false,
-                statusCode: 403,
+                statusCode: scopeCheck.statusCode,
                 error: 'scope_blocked',
                 reasonCode: scopeCheck.reasonCode,
                 message: scopeCheck.message,
@@ -445,14 +458,15 @@ export class RestorePlanService {
             });
     }
 
-    private validateScopeRequest(
+    private async validateScopeRequest(
         request: CreateDryRunPlanRequest,
         claims: AuthTokenClaims,
-    ): {
+    ): Promise<{
         allowed: boolean;
+        statusCode: number;
         reasonCode: RestoreReasonCode;
         message: string;
-    } {
+    }> {
         if (
             claims.tenant_id !== request.tenant_id ||
             claims.instance_id !== request.instance_id ||
@@ -460,28 +474,100 @@ export class RestorePlanService {
         ) {
             return {
                 allowed: false,
+                statusCode: 403,
                 reasonCode: 'blocked_unknown_source_mapping',
                 message:
                     'token scope does not match tenant/instance/source request',
             };
         }
 
-        const mappingValidation = this.sourceRegistry.validateScope({
-            tenantId: request.tenant_id,
-            instanceId: request.instance_id,
-            source: request.source,
-        });
+        let mappingResolution: AcpResolveSourceMappingResult;
 
-        if (!mappingValidation.allowed) {
+        try {
+            mappingResolution =
+                await this.sourceMappingResolver.resolveSourceMapping({
+                    tenantId: request.tenant_id,
+                    instanceId: request.instance_id,
+                    serviceScope: 'rrs',
+                });
+        } catch (error: unknown) {
             return {
                 allowed: false,
-                reasonCode: mappingValidation.reasonCode,
-                message: mappingValidation.message,
+                statusCode: 503,
+                reasonCode: 'blocked_auth_control_plane_outage',
+                message:
+                    'auth control plane source mapping resolve failed: '
+                    + String((error as Error)?.message || error),
+            };
+        }
+
+        if (mappingResolution.status === 'outage') {
+            return {
+                allowed: false,
+                statusCode: 503,
+                reasonCode: 'blocked_auth_control_plane_outage',
+                message: mappingResolution.message,
+            };
+        }
+
+        if (mappingResolution.status === 'not_found') {
+            return {
+                allowed: false,
+                statusCode: 403,
+                reasonCode: 'blocked_unknown_source_mapping',
+                message: 'tenant/instance mapping not found in ACP',
+            };
+        }
+
+        const mapping = mappingResolution.mapping;
+
+        if (
+            mapping.tenantId !== request.tenant_id ||
+            mapping.instanceId !== request.instance_id
+        ) {
+            return {
+                allowed: false,
+                statusCode: 403,
+                reasonCode: 'blocked_unknown_source_mapping',
+                message: 'ACP returned mismatched tenant/instance mapping',
+            };
+        }
+
+        if (mapping.source !== request.source) {
+            return {
+                allowed: false,
+                statusCode: 403,
+                reasonCode: 'blocked_unknown_source_mapping',
+                message: 'source does not match canonical ACP mapping',
+            };
+        }
+
+        if (!mapping.serviceAllowed) {
+            return {
+                allowed: false,
+                statusCode: 403,
+                reasonCode: 'blocked_unknown_source_mapping',
+                message: 'service scope is not allowed by ACP mapping',
+            };
+        }
+
+        if (
+            mapping.tenantState !== 'active' ||
+            mapping.entitlementState !== 'active' ||
+            mapping.instanceState !== 'active'
+        ) {
+            return {
+                allowed: false,
+                statusCode: 403,
+                reasonCode: 'blocked_unknown_source_mapping',
+                message:
+                    'ACP mapping is not active for tenant/entitlement/instance',
             };
         }
 
         return {
             allowed: true,
+            statusCode: 200,
             reasonCode: 'none',
             message: 'scope validated',
         };

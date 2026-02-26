@@ -1,6 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { RestoreJobService } from './job-service';
+import {
+    AcpResolveSourceMappingResult,
+    ResolveSourceMappingInput,
+} from '../registry/acp-source-mapping-client';
+import {
+    SourceMappingResolver,
+} from '../registry/source-mapping-resolver';
 import { SourceRegistry } from '../registry/source-registry';
 import { RestoreLockManager } from '../locks/lock-manager';
 
@@ -36,6 +43,68 @@ function baseRequest(planId: string, table: string) {
         required_capabilities: ['restore_execute'],
         requested_by: 'operator@example.com',
     };
+}
+
+type FoundMapping = Extract<
+    AcpResolveSourceMappingResult,
+    { status: 'found' }
+>;
+
+function createResolveResult(
+    overrides: Partial<FoundMapping['mapping']> = {},
+): FoundMapping {
+    return {
+        status: 'found',
+        mapping: {
+            tenantId: 'tenant-acme',
+            instanceId: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+            tenantState: 'active',
+            entitlementState: 'active',
+            instanceState: 'active',
+            allowedServices: ['rrs'],
+            updatedAt: '2026-02-16T12:00:00.000Z',
+            requestedServiceScope: 'rrs',
+            serviceAllowed: true,
+            ...overrides,
+        },
+    };
+}
+
+function createResolver(
+    resolveHandler?: (
+        input: ResolveSourceMappingInput,
+    ) => Promise<AcpResolveSourceMappingResult>,
+): SourceMappingResolver {
+    return {
+        async resolveSourceMapping(
+            input: ResolveSourceMappingInput,
+        ): Promise<AcpResolveSourceMappingResult> {
+            if (resolveHandler) {
+                return resolveHandler(input);
+            }
+
+            return createResolveResult();
+        },
+    };
+}
+
+function createService(
+    resolver?: SourceMappingResolver,
+): RestoreJobService {
+    return new RestoreJobService(
+        new RestoreLockManager(),
+        new SourceRegistry([
+            {
+                tenantId: 'tenant-acme',
+                instanceId: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+            },
+        ]),
+        now,
+        undefined,
+        resolver,
+    );
 }
 
 test('parallel non-overlapping jobs run immediately', async () => {
@@ -267,6 +336,66 @@ test('createJob rejects mismatched scope', async () => {
     );
 
     assert.equal(result.success, false);
+});
+
+test('createJob rejects missing ACP mapping', async () => {
+    const service = createService(createResolver(async () => ({
+        status: 'not_found',
+    })));
+    const result = await service.createJob(
+        baseRequest('plan-missing-mapping', 'incident'),
+        claims(),
+    );
+
+    assert.equal(result.success, false);
+    if (!result.success) {
+        assert.equal(result.statusCode, 403);
+        assert.equal(
+            result.reasonCode,
+            'blocked_unknown_source_mapping',
+        );
+    }
+});
+
+test('createJob rejects ACP mapping when service is not allowed', async () => {
+    const service = createService(createResolver(async () =>
+        createResolveResult({
+            allowedServices: ['reg'],
+            serviceAllowed: false,
+        })));
+    const result = await service.createJob(
+        baseRequest('plan-service-not-allowed', 'incident'),
+        claims(),
+    );
+
+    assert.equal(result.success, false);
+    if (!result.success) {
+        assert.equal(result.statusCode, 403);
+        assert.equal(
+            result.reasonCode,
+            'blocked_unknown_source_mapping',
+        );
+    }
+});
+
+test('createJob rejects ACP outages explicitly', async () => {
+    const service = createService(createResolver(async () => ({
+        status: 'outage',
+        message: 'ACP unavailable',
+    })));
+    const result = await service.createJob(
+        baseRequest('plan-acp-outage', 'incident'),
+        claims(),
+    );
+
+    assert.equal(result.success, false);
+    if (!result.success) {
+        assert.equal(result.statusCode, 503);
+        assert.equal(
+            result.reasonCode,
+            'blocked_auth_control_plane_outage',
+        );
+    }
 });
 
 test('getJob returns null for unknown job', async () => {

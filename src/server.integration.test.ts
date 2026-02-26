@@ -10,6 +10,12 @@ import { RestoreExecutionService } from './execute/execute-service';
 import { RestoreJobService } from './jobs/job-service';
 import { RestoreLockManager } from './locks/lock-manager';
 import { RestorePlanService } from './plans/plan-service';
+import {
+    AcpResolveSourceMappingResult,
+} from './registry/acp-source-mapping-client';
+import {
+    SourceMappingResolver,
+} from './registry/source-mapping-resolver';
 import { SourceRegistry } from './registry/source-registry';
 import { InMemoryRestoreIndexStateReader } from './restore-index/state-reader';
 import { createRestoreServiceServer } from './server';
@@ -168,6 +174,7 @@ function createService(
         bodyMaxBytes?: number;
         authoritativeWatermarks?: Record<string, unknown>[];
         restoreIndexReader?: InMemoryRestoreIndexStateReader;
+        sourceMappingResolver?: SourceMappingResolver;
     },
 ): Server {
     const sourceRegistry = new SourceRegistry([
@@ -187,6 +194,8 @@ function createService(
         new RestoreLockManager(),
         sourceRegistry,
         now,
+        undefined,
+        options?.sourceMappingResolver,
     );
     const restoreIndexReader = options?.restoreIndexReader
         || new InMemoryRestoreIndexStateReader();
@@ -211,6 +220,7 @@ function createService(
         now,
         undefined,
         restoreIndexReader,
+        options?.sourceMappingResolver,
     );
     const execute = new RestoreExecutionService(
         jobs,
@@ -280,6 +290,42 @@ function createToken(
         instanceId: overrides?.instanceId,
         source: overrides?.source,
     });
+}
+
+type FoundMapping = Extract<
+    AcpResolveSourceMappingResult,
+    { status: 'found' }
+>;
+
+function createResolveResult(
+    overrides: Partial<FoundMapping['mapping']> = {},
+): FoundMapping {
+    return {
+        status: 'found',
+        mapping: {
+            tenantId: 'tenant-acme',
+            instanceId: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+            tenantState: 'active',
+            entitlementState: 'active',
+            instanceState: 'active',
+            allowedServices: ['rrs'],
+            updatedAt: '2026-02-16T12:00:00.000Z',
+            requestedServiceScope: 'rrs',
+            serviceAllowed: true,
+            ...overrides,
+        },
+    };
+}
+
+function createResolver(
+    result: AcpResolveSourceMappingResult,
+): SourceMappingResolver {
+    return {
+        async resolveSourceMapping(): Promise<AcpResolveSourceMappingResult> {
+            return result;
+        },
+    };
 }
 
 function assertScopedNotFound(response: ResponseData): void {
@@ -593,7 +639,7 @@ test('valid scoped token and source mapping can create restore job', async () =>
     }
 });
 
-test('mismatched source mapping fails closed on job create', async () => {
+test('mismatched request source fails closed on job create', async () => {
     const signingKey = 'test-signing-key';
     const server = createService(signingKey);
     const baseUrl = await listen(server);
@@ -611,6 +657,65 @@ test('mismatched source mapping fails closed on job create', async () => {
         assert.equal(
             response.body.reason_code,
             'blocked_unknown_source_mapping',
+        );
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('ACP canonical source mismatch fails closed on job create', async () => {
+    const signingKey = 'test-signing-key';
+    const server = createService(signingKey, {
+        sourceMappingResolver: createResolver(
+            createResolveResult({
+                source: 'sn://different-instance.service-now.com',
+            }),
+        ),
+    });
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+
+    try {
+        const response = await postJson(
+            baseUrl,
+            '/v1/jobs',
+            token,
+            createJobPayload('sn://acme-dev.service-now.com'),
+        );
+
+        assert.equal(response.status, 403);
+        assert.equal(
+            response.body.reason_code,
+            'blocked_unknown_source_mapping',
+        );
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('ACP outage returns explicit block reason on job create', async () => {
+    const signingKey = 'test-signing-key';
+    const server = createService(signingKey, {
+        sourceMappingResolver: createResolver({
+            status: 'outage',
+            message: 'ACP timeout',
+        }),
+    });
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+
+    try {
+        const response = await postJson(
+            baseUrl,
+            '/v1/jobs',
+            token,
+            createJobPayload('sn://acme-dev.service-now.com'),
+        );
+
+        assert.equal(response.status, 503);
+        assert.equal(
+            response.body.reason_code,
+            'blocked_auth_control_plane_outage',
         );
     } finally {
         await closeServer(server);
@@ -976,6 +1081,35 @@ test('dry-run returns executable gate for fresh watermark state', async () => {
 
         assert.equal(gate.executability, 'executable');
         assert.equal(gate.reason_code, 'none');
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('dry-run returns explicit outage block when ACP mapping lookup fails', async () => {
+    const signingKey = 'test-signing-key';
+    const server = createService(signingKey, {
+        sourceMappingResolver: createResolver({
+            status: 'outage',
+            message: 'ACP unavailable',
+        }),
+    });
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+
+    try {
+        const response = await postJson(
+            baseUrl,
+            '/v1/plans/dry-run',
+            token,
+            createDryRunPayload('plan-acp-outage'),
+        );
+
+        assert.equal(response.status, 503);
+        assert.equal(
+            response.body.reason_code,
+            'blocked_auth_control_plane_outage',
+        );
     } finally {
         await closeServer(server);
     }
