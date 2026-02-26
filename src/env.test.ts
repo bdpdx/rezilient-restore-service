@@ -248,10 +248,10 @@ describe('parseBoolean (indirect)', () => {
     });
 });
 
-describe('legacy static mapping env (indirect)', () => {
-    test('ignores legacy RRS_SOURCE_MAPPINGS_JSON', () => {
+describe('unknown env vars (indirect)', () => {
+    test('ignores unrelated env vars', () => {
         const env = buildValidEnv();
-        env.RRS_SOURCE_MAPPINGS_JSON = 'not-json-and-now-ignored';
+        env.RRS_UNUSED_TEST_FLAG = 'not-json-and-now-ignored';
         const result = parseRestoreServiceEnv(env);
         assert.equal(result.acpBaseUrl, 'http://127.0.0.1:3010');
     });
