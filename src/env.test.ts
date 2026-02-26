@@ -248,39 +248,12 @@ describe('parseBoolean (indirect)', () => {
     });
 });
 
-describe('parseSourceMappings (indirect)', () => {
-    test('parses valid JSON array', () => {
+describe('legacy static mapping env (indirect)', () => {
+    test('ignores legacy RRS_SOURCE_MAPPINGS_JSON', () => {
         const env = buildValidEnv();
-        env.RRS_SOURCE_MAPPINGS_JSON = JSON.stringify([
-            {
-                tenant_id: 't1',
-                instance_id: 'i1',
-                source: 'sn://a.service-now.com',
-            },
-        ]);
+        env.RRS_SOURCE_MAPPINGS_JSON = 'not-json-and-now-ignored';
         const result = parseRestoreServiceEnv(env);
-        assert.equal(result.sourceMappings.length, 1);
-        assert.equal(result.sourceMappings[0].tenantId, 't1');
-    });
-
-    test('rejects invalid JSON', () => {
-        const env = buildValidEnv();
-        env.RRS_SOURCE_MAPPINGS_JSON = 'not json';
-        assert.throws(
-            () => parseRestoreServiceEnv(env),
-            /must be valid JSON/,
-        );
-    });
-
-    test('rejects entries with missing fields', () => {
-        const env = buildValidEnv();
-        env.RRS_SOURCE_MAPPINGS_JSON = JSON.stringify([
-            { instance_id: 'i1', source: 'sn://a.com' },
-        ]);
-        assert.throws(
-            () => parseRestoreServiceEnv(env),
-            /tenant_id.*must be non-empty/,
-        );
+        assert.equal(result.acpBaseUrl, 'http://127.0.0.1:3010');
     });
 });
 

@@ -13,7 +13,6 @@ import { PostgresRestorePlanStateStore } from './plans/plan-state-store';
 import { RestorePlanService } from './plans/plan-service';
 import { AcpSourceMappingClient } from './registry/acp-source-mapping-client';
 import { createCachedAcpSourceMappingProvider } from './registry/acp-source-mapping-provider';
-import { SourceRegistry } from './registry/source-registry';
 import { PostgresRestoreIndexStateReader } from './restore-index/state-reader';
 import { Pool } from 'pg';
 
@@ -21,7 +20,6 @@ export * from './constants';
 
 async function main(): Promise<void> {
     const env = parseRestoreServiceEnv(process.env);
-    const sourceRegistry = new SourceRegistry(env.sourceMappings);
     const acpSourceMappingClient = new AcpSourceMappingClient({
         baseUrl: env.acpBaseUrl,
         internalToken: env.acpInternalToken,
@@ -74,13 +72,13 @@ async function main(): Promise<void> {
     );
     const jobs = new RestoreJobService(
         lockManager,
-        sourceRegistry,
+        undefined,
         undefined,
         jobStateStore,
         acpSourceMappingProvider,
     );
     const plans = new RestorePlanService(
-        sourceRegistry,
+        undefined,
         undefined,
         planStateStore,
         restoreIndexStateReader,
@@ -172,7 +170,6 @@ async function main(): Promise<void> {
         ga_runbooks_signed_off: env.gaRunbooksSignedOff,
         max_json_body_bytes: env.maxJsonBodyBytes,
         restore_pg_url_configured: env.restorePgUrl.length > 0,
-        mapping_count: sourceRegistry.list().length,
         port: env.port,
     });
 }

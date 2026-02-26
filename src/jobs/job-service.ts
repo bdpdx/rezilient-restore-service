@@ -81,14 +81,27 @@ export class RestoreJobService {
 
     constructor(
         private readonly lockManager: RestoreLockManager,
-        sourceRegistry: SourceRegistry,
+        sourceRegistry?: SourceRegistry,
         private readonly now: () => Date = () => new Date(),
         private readonly stateStore: RestoreJobStateStore =
             new InMemoryRestoreJobStateStore(),
         sourceMappingResolver?: SourceMappingResolver,
     ) {
-        this.sourceMappingResolver = sourceMappingResolver
-            || createSourceRegistryBackedResolver(sourceRegistry);
+        if (sourceMappingResolver) {
+            this.sourceMappingResolver = sourceMappingResolver;
+            return;
+        }
+
+        if (!sourceRegistry) {
+            throw new Error(
+                'sourceMappingResolver is required when sourceRegistry '
+                + 'is not provided',
+            );
+        }
+
+        this.sourceMappingResolver = createSourceRegistryBackedResolver(
+            sourceRegistry,
+        );
     }
 
     async createJob(

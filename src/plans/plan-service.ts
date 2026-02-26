@@ -301,7 +301,7 @@ export class RestorePlanService {
     private readonly sourceMappingResolver: SourceMappingResolver;
 
     constructor(
-        sourceRegistry: SourceRegistry,
+        sourceRegistry?: SourceRegistry,
         private readonly now: () => Date = () => new Date(),
         private readonly stateStore: RestorePlanStateStore =
             new InMemoryRestorePlanStateStore(),
@@ -309,8 +309,21 @@ export class RestorePlanService {
             new InMemoryRestoreIndexStateReader(),
         sourceMappingResolver?: SourceMappingResolver,
     ) {
-        this.sourceMappingResolver = sourceMappingResolver
-            || createSourceRegistryBackedResolver(sourceRegistry);
+        if (sourceMappingResolver) {
+            this.sourceMappingResolver = sourceMappingResolver;
+            return;
+        }
+
+        if (!sourceRegistry) {
+            throw new Error(
+                'sourceMappingResolver is required when sourceRegistry '
+                + 'is not provided',
+            );
+        }
+
+        this.sourceMappingResolver = createSourceRegistryBackedResolver(
+            sourceRegistry,
+        );
     }
 
     async createDryRunPlan(

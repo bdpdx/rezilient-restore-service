@@ -1,5 +1,3 @@
-import { SourceMappingInput } from './registry/source-registry';
-
 export interface RestoreServiceEnv {
     port: number;
     adminToken: string;
@@ -29,7 +27,6 @@ export interface RestoreServiceEnv {
     acpRequestTimeoutMs: number;
     acpPositiveCacheTtlSeconds: number;
     acpNegativeCacheTtlSeconds: number;
-    sourceMappings: SourceMappingInput[];
 }
 
 function parseNonNegativeInteger(
@@ -82,68 +79,6 @@ function parsePercentage(
     }
 
     return parsed;
-}
-
-function parseSourceMappings(
-    raw: string | undefined,
-): SourceMappingInput[] {
-    if (!raw || raw.trim() === '') {
-        return [];
-    }
-
-    let parsed: unknown;
-
-    try {
-        parsed = JSON.parse(raw);
-    } catch {
-        throw new Error('RRS_SOURCE_MAPPINGS_JSON must be valid JSON');
-    }
-
-    if (!Array.isArray(parsed)) {
-        throw new Error(
-            'RRS_SOURCE_MAPPINGS_JSON must be a JSON array',
-        );
-    }
-
-    return parsed.map((entry, index) => {
-        if (!entry || typeof entry !== 'object') {
-            throw new Error(
-                `RRS_SOURCE_MAPPINGS_JSON[${index}] must be an object`,
-            );
-        }
-
-        const mapping = entry as Record<string, unknown>;
-        const tenantId = mapping.tenant_id;
-        const instanceId = mapping.instance_id;
-        const source = mapping.source;
-
-        if (typeof tenantId !== 'string' || tenantId.trim() === '') {
-            throw new Error(
-                `RRS_SOURCE_MAPPINGS_JSON[${index}].tenant_id ` +
-                'must be non-empty',
-            );
-        }
-
-        if (typeof instanceId !== 'string' || instanceId.trim() === '') {
-            throw new Error(
-                `RRS_SOURCE_MAPPINGS_JSON[${index}].instance_id ` +
-                'must be non-empty',
-            );
-        }
-
-        if (typeof source !== 'string' || source.trim() === '') {
-            throw new Error(
-                `RRS_SOURCE_MAPPINGS_JSON[${index}].source ` +
-                'must be non-empty',
-            );
-        }
-
-        return {
-            tenantId,
-            instanceId,
-            source,
-        };
-    });
 }
 
 function parseBoolean(
@@ -345,6 +280,5 @@ export function parseRestoreServiceEnv(
             'RRS_ACP_NEGATIVE_CACHE_TTL_SECONDS',
             5,
         ),
-        sourceMappings: parseSourceMappings(env.RRS_SOURCE_MAPPINGS_JSON),
     };
 }
