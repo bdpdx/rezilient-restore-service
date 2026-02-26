@@ -130,7 +130,7 @@ async function main(): Promise<void> {
         plans,
         evidence,
         execute,
-        sourceRegistry,
+        acpSourceMappingProvider,
         restoreIndexStateReader,
         {
             stagingModeEnabled: env.stagingModeEnabled,

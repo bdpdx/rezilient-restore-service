@@ -7,7 +7,10 @@ import {
 import { URL } from 'node:url';
 import { AuthTokenClaims } from './auth/claims';
 import { RequestAuthenticator } from './auth/authenticator';
-import { RestoreOpsAdminService } from './admin/ops-admin-service';
+import {
+    OpsAdminDependencyOutageError,
+    RestoreOpsAdminService,
+} from './admin/ops-admin-service';
 import { RestoreEvidenceService } from './evidence/evidence-service';
 import { RestoreExecutionService } from './execute/execute-service';
 import { RestoreJobRecord } from './jobs/models';
@@ -958,6 +961,17 @@ export function createRestoreServiceServer(
                 error: 'not_found',
             });
         } catch (error: unknown) {
+            if (error instanceof OpsAdminDependencyOutageError) {
+                sendJson(response, error.statusCode, {
+                    error: 'dependency_unavailable',
+                    reason_code: error.reasonCode,
+                    dependency: error.dependency,
+                    message: error.message,
+                });
+
+                return;
+            }
+
             if (error instanceof RequestBodyTooLargeError) {
                 sendJson(response, 413, {
                     error: 'payload_too_large',

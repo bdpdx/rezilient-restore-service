@@ -3,7 +3,10 @@ import { once } from 'node:events';
 import { Server } from 'node:http';
 import { test } from 'node:test';
 import { RestoreWatermark as RestoreWatermarkSchema } from '@rezilient/types';
-import { RestoreOpsAdminService } from './admin/ops-admin-service';
+import {
+    RestoreOpsAdminService,
+    SourceMappingListProvider,
+} from './admin/ops-admin-service';
 import { RequestAuthenticator } from './auth/authenticator';
 import { RestoreEvidenceService } from './evidence/evidence-service';
 import { RestoreExecutionService } from './execute/execute-service';
@@ -11,7 +14,9 @@ import { RestoreJobService } from './jobs/job-service';
 import { RestoreLockManager } from './locks/lock-manager';
 import { RestorePlanService } from './plans/plan-service';
 import {
+    AcpListSourceMappingsResult,
     AcpResolveSourceMappingResult,
+    AcpSourceMappingRecord,
 } from './registry/acp-source-mapping-client';
 import {
     SourceMappingResolver,
@@ -175,6 +180,7 @@ function createService(
         authoritativeWatermarks?: Record<string, unknown>[];
         restoreIndexReader?: InMemoryRestoreIndexStateReader;
         sourceMappingResolver?: SourceMappingResolver;
+        sourceMappingListProvider?: SourceMappingListProvider;
     },
 ): Server {
     const sourceRegistry = new SourceRegistry([
@@ -250,7 +256,7 @@ function createService(
         plans,
         evidence,
         execute,
-        sourceRegistry,
+        options?.sourceMappingListProvider || createSourceMappingListProvider(),
         restoreIndexReader,
         {
             now,
@@ -292,6 +298,37 @@ function createToken(
     });
 }
 
+function createSourceMappingRecord(
+    overrides: Partial<AcpSourceMappingRecord> = {},
+): AcpSourceMappingRecord {
+    return {
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        tenantState: 'active',
+        entitlementState: 'active',
+        instanceState: 'active',
+        allowedServices: ['rrs'],
+        updatedAt: '2026-02-16T12:00:00.000Z',
+        ...overrides,
+    };
+}
+
+function createSourceMappingListProvider(
+    result: AcpListSourceMappingsResult = {
+        status: 'ok',
+        mappings: [
+            createSourceMappingRecord(),
+        ],
+    },
+): SourceMappingListProvider {
+    return {
+        async listSourceMappings(): Promise<AcpListSourceMappingsResult> {
+            return result;
+        },
+    };
+}
+
 type FoundMapping = Extract<
     AcpResolveSourceMappingResult,
     { status: 'found' }
@@ -303,14 +340,7 @@ function createResolveResult(
     return {
         status: 'found',
         mapping: {
-            tenantId: 'tenant-acme',
-            instanceId: 'sn-dev-01',
-            source: 'sn://acme-dev.service-now.com',
-            tenantState: 'active',
-            entitlementState: 'active',
-            instanceState: 'active',
-            allowedServices: ['rrs'],
-            updatedAt: '2026-02-16T12:00:00.000Z',
+            ...createSourceMappingRecord(),
             requestedServiceScope: 'rrs',
             serviceAllowed: true,
             ...overrides,
@@ -2093,6 +2123,37 @@ test('admin ops endpoints require admin token when configured', async () => {
         assert.equal(typeof authorized.body.evidence, 'object');
         assert.equal(typeof authorized.body.slo, 'object');
         assert.equal(typeof authorized.body.ga_readiness, 'object');
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('admin ops freshness returns explicit ACP dependency outage details', async () => {
+    const signingKey = 'test-signing-key';
+    const server = createService(signingKey, {
+        adminToken: 'admin-secret',
+        sourceMappingListProvider: createSourceMappingListProvider({
+            status: 'outage',
+            message: 'ACP unavailable',
+        }),
+    });
+    const baseUrl = await listen(server);
+
+    try {
+        const response = await getAdminJson(
+            baseUrl,
+            '/v1/admin/ops/freshness',
+            'admin-secret',
+        );
+
+        assert.equal(response.status, 503);
+        assert.equal(response.body.error, 'dependency_unavailable');
+        assert.equal(
+            response.body.reason_code,
+            'blocked_auth_control_plane_outage',
+        );
+        assert.equal(response.body.dependency, 'auth_control_plane');
+        assert.equal(response.body.message, 'ACP unavailable');
     } finally {
         await closeServer(server);
     }

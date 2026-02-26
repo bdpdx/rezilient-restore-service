@@ -3,7 +3,10 @@ import { RestoreEvidenceService } from '../evidence/evidence-service';
 import { RestoreExecutionService } from '../execute/execute-service';
 import { RestoreJobService } from '../jobs/job-service';
 import { RestorePlanService } from '../plans/plan-service';
-import { SourceRegistry } from '../registry/source-registry';
+import {
+    AcpListSourceMappingsResult,
+    ListSourceMappingsInput,
+} from '../registry/acp-source-mapping-client';
 import { RestoreIndexStateReader } from '../restore-index/state-reader';
 
 interface FreshnessSummaryRow {
@@ -97,6 +100,25 @@ const AUTH_PAUSE_REASON_CODES = new Set([
     'paused_instance_disabled',
     'blocked_auth_control_plane_outage',
 ]);
+
+export interface SourceMappingListProvider {
+    listSourceMappings(
+        input?: ListSourceMappingsInput,
+    ): Promise<AcpListSourceMappingsResult>;
+}
+
+export class OpsAdminDependencyOutageError extends Error {
+    readonly dependency = 'auth_control_plane';
+
+    readonly reasonCode = 'blocked_auth_control_plane_outage';
+
+    readonly statusCode = 503;
+
+    constructor(message: string) {
+        super(message);
+        this.name = 'OpsAdminDependencyOutageError';
+    }
+}
 
 function sourceKey(input: {
     tenant_id: string;
@@ -268,7 +290,7 @@ export class RestoreOpsAdminService {
         private readonly plans: RestorePlanService,
         private readonly evidence: RestoreEvidenceService,
         private readonly execute: RestoreExecutionService,
-        private readonly sourceRegistry: SourceRegistry,
+        private readonly sourceMappingListProvider: SourceMappingListProvider,
         private readonly restoreIndexStateReader: RestoreIndexStateReader,
         config?: RestoreOpsAdminConfig,
     ) {
@@ -403,7 +425,27 @@ export class RestoreOpsAdminService {
     async getFreshnessDashboard(): Promise<Record<string, unknown>> {
         const accumulators = new Map<string, FreshnessAccumulator>();
         const measuredAt = normalizeIsoWithMillis(this.now());
-        const mappings = this.sourceRegistry.list();
+        let listResult: AcpListSourceMappingsResult;
+
+        try {
+            listResult = await this.sourceMappingListProvider.listSourceMappings({
+                serviceScope: 'rrs',
+                tenantState: 'active',
+                entitlementState: 'active',
+                instanceState: 'active',
+            });
+        } catch (error: unknown) {
+            throw new OpsAdminDependencyOutageError(
+                'auth control plane source mappings list failed: '
+                + String((error as Error)?.message || error),
+            );
+        }
+
+        if (listResult.status === 'outage') {
+            throw new OpsAdminDependencyOutageError(listResult.message);
+        }
+
+        const mappings = listResult.mappings;
 
         for (const mapping of mappings) {
             const key = sourceKey({

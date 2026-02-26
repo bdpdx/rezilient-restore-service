@@ -1,13 +1,18 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import {
+    OpsAdminDependencyOutageError,
     RestoreOpsAdminService,
+    SourceMappingListProvider,
 } from './ops-admin-service';
 import { RestoreJobService } from '../jobs/job-service';
 import { RestorePlanService } from '../plans/plan-service';
 import { RestoreEvidenceService } from '../evidence/evidence-service';
 import { RestoreExecutionService } from '../execute/execute-service';
-import { SourceRegistry } from '../registry/source-registry';
+import {
+    AcpListSourceMappingsResult,
+    AcpSourceMappingRecord,
+} from '../registry/acp-source-mapping-client';
 import {
     InMemoryRestoreIndexStateReader,
 } from '../restore-index/state-reader';
@@ -55,6 +60,35 @@ function buildMockExecutionService(
     } as unknown as RestoreExecutionService;
 }
 
+function buildSourceMapping(
+    overrides: Partial<AcpSourceMappingRecord> = {},
+): AcpSourceMappingRecord {
+    return {
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        tenantState: 'active',
+        entitlementState: 'active',
+        instanceState: 'active',
+        allowedServices: ['rrs'],
+        updatedAt: '2026-02-18T15:30:00.000Z',
+        ...overrides,
+    };
+}
+
+function buildSourceMappingListProvider(
+    result: AcpListSourceMappingsResult = {
+        status: 'ok',
+        mappings: [],
+    },
+): SourceMappingListProvider {
+    return {
+        async listSourceMappings(): Promise<AcpListSourceMappingsResult> {
+            return result;
+        },
+    };
+}
+
 function buildWatermark(
     overrides: Record<string, unknown> = {},
 ) {
@@ -99,7 +133,7 @@ describe('RestoreOpsAdminService', () => {
             buildMockPlanService(),
             buildMockEvidenceService(),
             buildMockExecutionService(),
-            new SourceRegistry([]),
+            buildSourceMappingListProvider(),
             new InMemoryRestoreIndexStateReader(),
             { now: fixedNow },
         );
@@ -118,7 +152,7 @@ describe('RestoreOpsAdminService', () => {
             buildMockPlanService(),
             buildMockEvidenceService(),
             buildMockExecutionService(),
-            new SourceRegistry([]),
+            buildSourceMappingListProvider(),
             new InMemoryRestoreIndexStateReader(),
             { now: fixedNow },
         );
@@ -133,13 +167,12 @@ describe('RestoreOpsAdminService', () => {
     });
 
     test('getFreshnessDashboard aggregates partition states', async () => {
-        const registry = new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]);
+        const sourceMappingProvider = buildSourceMappingListProvider({
+            status: 'ok',
+            mappings: [
+                buildSourceMapping(),
+            ],
+        });
         const indexReader =
             new InMemoryRestoreIndexStateReader();
         indexReader.upsertWatermark(
@@ -161,7 +194,7 @@ describe('RestoreOpsAdminService', () => {
             buildMockPlanService(),
             buildMockEvidenceService(),
             buildMockExecutionService(),
-            registry,
+            sourceMappingProvider,
             indexReader,
             { now: fixedNow },
         );
@@ -173,6 +206,64 @@ describe('RestoreOpsAdminService', () => {
         assert.equal(sources.length, 1);
         assert.equal(sources[0].fresh_partitions, 1);
         assert.equal(sources[0].stale_partitions, 1);
+    });
+
+    test('getFreshnessDashboard uses ACP list filters for active rrs mappings', async () => {
+        let capturedInput: Record<string, unknown> | undefined;
+        const sourceMappingProvider: SourceMappingListProvider = {
+            async listSourceMappings(input): Promise<AcpListSourceMappingsResult> {
+                capturedInput = input as Record<string, unknown>;
+
+                return {
+                    status: 'ok',
+                    mappings: [],
+                };
+            },
+        };
+        const service = new RestoreOpsAdminService(
+            buildMockJobService(),
+            buildMockPlanService(),
+            buildMockEvidenceService(),
+            buildMockExecutionService(),
+            sourceMappingProvider,
+            new InMemoryRestoreIndexStateReader(),
+            { now: fixedNow },
+        );
+
+        await service.getFreshnessDashboard();
+
+        assert.deepEqual(capturedInput, {
+            serviceScope: 'rrs',
+            tenantState: 'active',
+            entitlementState: 'active',
+            instanceState: 'active',
+        });
+    });
+
+    test('getFreshnessDashboard surfaces ACP list outages as dependency errors', async () => {
+        const service = new RestoreOpsAdminService(
+            buildMockJobService(),
+            buildMockPlanService(),
+            buildMockEvidenceService(),
+            buildMockExecutionService(),
+            buildSourceMappingListProvider({
+                status: 'outage',
+                message: 'ACP unavailable',
+            }),
+            new InMemoryRestoreIndexStateReader(),
+            { now: fixedNow },
+        );
+
+        await assert.rejects(async () => {
+            await service.getFreshnessDashboard();
+        }, (error: unknown) => {
+            assert.ok(error instanceof OpsAdminDependencyOutageError);
+            assert.equal(error.reasonCode, 'blocked_auth_control_plane_outage');
+            assert.equal(error.statusCode, 503);
+            assert.equal(error.message, 'ACP unavailable');
+
+            return true;
+        });
     });
 
     test('getEvidenceDashboard counts verification statuses', async () => {
@@ -210,7 +301,7 @@ describe('RestoreOpsAdminService', () => {
             buildMockPlanService(),
             buildMockEvidenceService(evidences),
             buildMockExecutionService(),
-            new SourceRegistry([]),
+            buildSourceMappingListProvider(),
             new InMemoryRestoreIndexStateReader(),
             { now: fixedNow },
         );
@@ -249,7 +340,7 @@ describe('RestoreOpsAdminService', () => {
             buildMockPlanService(),
             buildMockEvidenceService(),
             buildMockExecutionService(executions),
-            new SourceRegistry([]),
+            buildSourceMappingListProvider(),
             new InMemoryRestoreIndexStateReader(),
             { now: fixedNow },
         );
@@ -286,7 +377,7 @@ describe('RestoreOpsAdminService', () => {
             buildMockPlanService(),
             buildMockEvidenceService(),
             buildMockExecutionService(executions),
-            new SourceRegistry([]),
+            buildSourceMappingListProvider(),
             new InMemoryRestoreIndexStateReader(),
             { now: fixedNow },
         );
@@ -305,7 +396,7 @@ describe('RestoreOpsAdminService', () => {
             buildMockPlanService(),
             buildMockEvidenceService(),
             buildMockExecutionService(),
-            new SourceRegistry([]),
+            buildSourceMappingListProvider(),
             new InMemoryRestoreIndexStateReader(),
             {
                 now: fixedNow,
@@ -327,7 +418,7 @@ describe('RestoreOpsAdminService', () => {
             buildMockPlanService(),
             buildMockEvidenceService(),
             buildMockExecutionService(),
-            new SourceRegistry([]),
+            buildSourceMappingListProvider(),
             new InMemoryRestoreIndexStateReader(),
             {
                 now: fixedNow,
@@ -349,7 +440,7 @@ describe('RestoreOpsAdminService', () => {
             buildMockPlanService(),
             buildMockEvidenceService(),
             buildMockExecutionService(),
-            new SourceRegistry([]),
+            buildSourceMappingListProvider(),
             new InMemoryRestoreIndexStateReader(),
             {
                 now: fixedNow,
@@ -381,7 +472,7 @@ describe('RestoreOpsAdminService', () => {
             buildMockPlanService(),
             buildMockEvidenceService(),
             buildMockExecutionService(),
-            new SourceRegistry([]),
+            buildSourceMappingListProvider(),
             new InMemoryRestoreIndexStateReader(),
             { now: fixedNow },
         );
@@ -420,7 +511,7 @@ describe('RestoreOpsAdminService', () => {
             buildMockPlanService(),
             buildMockEvidenceService(),
             buildMockExecutionService(),
-            new SourceRegistry([]),
+            buildSourceMappingListProvider(),
             new InMemoryRestoreIndexStateReader(),
             { now: fixedNow },
         );
@@ -445,7 +536,7 @@ describe('RestoreOpsAdminService', () => {
             buildMockPlanService(),
             buildMockEvidenceService(),
             buildMockExecutionService(),
-            new SourceRegistry([]),
+            buildSourceMappingListProvider(),
             new InMemoryRestoreIndexStateReader(),
             {
                 now: fixedNow,
