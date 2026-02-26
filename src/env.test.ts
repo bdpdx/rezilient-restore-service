@@ -10,6 +10,8 @@ function buildValidEnv(): Record<string, string> {
     return {
         RRS_ADMIN_TOKEN: 'admin-tok-123',
         RRS_AUTH_SIGNING_KEY: 'signing-key-for-tests',
+        RRS_ACP_BASE_URL: 'http://127.0.0.1:3010',
+        RRS_ACP_INTERNAL_TOKEN: 'internal-token-for-tests',
         RRS_EVIDENCE_SIGNING_PRIVATE_KEY_PEM:
             TEST_EVIDENCE_SIGNING_PRIVATE_KEY_PEM,
         RRS_EVIDENCE_SIGNING_PUBLIC_KEY_PEM:
@@ -65,6 +67,14 @@ describe('parseRestoreServiceEnv', () => {
         );
         assert.equal(result.stagingModeEnabled, false);
         assert.equal(result.gaRunbooksSignedOff, false);
+        assert.equal(result.acpBaseUrl, 'http://127.0.0.1:3010');
+        assert.equal(
+            result.acpInternalToken,
+            'internal-token-for-tests',
+        );
+        assert.equal(result.acpRequestTimeoutMs, 2000);
+        assert.equal(result.acpPositiveCacheTtlSeconds, 30);
+        assert.equal(result.acpNegativeCacheTtlSeconds, 5);
     });
 
     test('throws for missing RRS_ADMIN_TOKEN', () => {
@@ -82,6 +92,33 @@ describe('parseRestoreServiceEnv', () => {
         assert.throws(
             () => parseRestoreServiceEnv(env),
             /RRS_AUTH_SIGNING_KEY is required/,
+        );
+    });
+
+    test('throws for missing RRS_ACP_BASE_URL', () => {
+        const env = buildValidEnv();
+        delete env.RRS_ACP_BASE_URL;
+        assert.throws(
+            () => parseRestoreServiceEnv(env),
+            /RRS_ACP_BASE_URL is required/,
+        );
+    });
+
+    test('throws for invalid RRS_ACP_BASE_URL', () => {
+        const env = buildValidEnv();
+        env.RRS_ACP_BASE_URL = 'not-a-url';
+        assert.throws(
+            () => parseRestoreServiceEnv(env),
+            /RRS_ACP_BASE_URL must be a valid URL/,
+        );
+    });
+
+    test('throws for missing RRS_ACP_INTERNAL_TOKEN', () => {
+        const env = buildValidEnv();
+        delete env.RRS_ACP_INTERNAL_TOKEN;
+        assert.throws(
+            () => parseRestoreServiceEnv(env),
+            /RRS_ACP_INTERNAL_TOKEN is required/,
         );
     });
 
@@ -149,6 +186,15 @@ describe('parseStrictPositiveInteger (indirect)', () => {
         assert.throws(
             () => parseRestoreServiceEnv(env),
             /RRS_MAX_JSON_BODY_BYTES must be greater than zero/,
+        );
+    });
+
+    test('rejects zero ACP request timeout', () => {
+        const env = buildValidEnv();
+        env.RRS_ACP_REQUEST_TIMEOUT_MS = '0';
+        assert.throws(
+            () => parseRestoreServiceEnv(env),
+            /RRS_ACP_REQUEST_TIMEOUT_MS must be greater than zero/,
         );
     });
 });
@@ -273,5 +319,8 @@ describe('all numeric defaults are correct', () => {
             result.evidenceImmutableRetentionClass,
             'standard-30d',
         );
+        assert.equal(result.acpRequestTimeoutMs, 2000);
+        assert.equal(result.acpPositiveCacheTtlSeconds, 30);
+        assert.equal(result.acpNegativeCacheTtlSeconds, 5);
     });
 });

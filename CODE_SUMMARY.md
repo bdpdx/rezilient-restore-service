@@ -51,6 +51,10 @@ Entrypoints:
   verifier (artifact hashes, report hash, signed manifest metadata).
 - `src/evidence/evidence-state-store.ts`: durable/in-memory state stores for
   evidence export records and signature-verification metadata.
+- `src/registry/acp-source-mapping-client.ts`: ACP internal source-mapping
+  client used for staged migration away from static source mapping config.
+- `src/registry/acp-source-mapping-provider.ts`: positive/negative TTL cache
+  provider for ACP source-mapping resolve calls.
 - `src/admin/ops-admin-service.ts`: RS-14/RS-15 admin ops summary service for
   queue/freshness/evidence plus SLO burn-rate and GA gate readiness checks.
 - `src/jobs/job-service.ts`: restore job orchestration, legacy queue audit
@@ -97,3 +101,7 @@ Tests:
   resume/checkpoint/journal API checks, RS-11 media dry-run/execute API
   coverage, RS-12 evidence export/read API coverage, and RS-14/RS-15 admin ops
   endpoint coverage.
+- `src/registry/acp-source-mapping-client.test.ts`: ACP client request, auth,
+  not-found, and timeout/outage behavior tests.
+- `src/registry/acp-source-mapping-provider.test.ts`: ACP cache TTL and
+  negative-cache behavior tests.

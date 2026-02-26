@@ -24,6 +24,11 @@ export interface RestoreServiceEnv {
     evidenceImmutableRetentionClass: string;
     stagingModeEnabled: boolean;
     gaRunbooksSignedOff: boolean;
+    acpBaseUrl: string;
+    acpInternalToken: string;
+    acpRequestTimeoutMs: number;
+    acpPositiveCacheTtlSeconds: number;
+    acpNegativeCacheTtlSeconds: number;
     sourceMappings: SourceMappingInput[];
 }
 
@@ -196,6 +201,21 @@ function parseRequiredString(
     return parsed;
 }
 
+function parseRequiredUrl(
+    raw: string | undefined,
+    fieldName: string,
+): string {
+    const value = parseRequiredString(raw, fieldName);
+
+    try {
+        new URL(value);
+    } catch {
+        throw new Error(`${fieldName} must be a valid URL`);
+    }
+
+    return value;
+}
+
 export function parseRestoreServiceEnv(
     env: NodeJS.ProcessEnv,
 ): RestoreServiceEnv {
@@ -301,6 +321,29 @@ export function parseRestoreServiceEnv(
             env.RRS_GA_RUNBOOKS_SIGNED_OFF,
             'RRS_GA_RUNBOOKS_SIGNED_OFF',
             false,
+        ),
+        acpBaseUrl: parseRequiredUrl(
+            env.RRS_ACP_BASE_URL,
+            'RRS_ACP_BASE_URL',
+        ),
+        acpInternalToken: parseRequiredString(
+            env.RRS_ACP_INTERNAL_TOKEN,
+            'RRS_ACP_INTERNAL_TOKEN',
+        ),
+        acpRequestTimeoutMs: parseStrictPositiveInteger(
+            env.RRS_ACP_REQUEST_TIMEOUT_MS,
+            'RRS_ACP_REQUEST_TIMEOUT_MS',
+            2000,
+        ),
+        acpPositiveCacheTtlSeconds: parseNonNegativeInteger(
+            env.RRS_ACP_POSITIVE_CACHE_TTL_SECONDS,
+            'RRS_ACP_POSITIVE_CACHE_TTL_SECONDS',
+            30,
+        ),
+        acpNegativeCacheTtlSeconds: parseNonNegativeInteger(
+            env.RRS_ACP_NEGATIVE_CACHE_TTL_SECONDS,
+            'RRS_ACP_NEGATIVE_CACHE_TTL_SECONDS',
+            5,
         ),
         sourceMappings: parseSourceMappings(env.RRS_SOURCE_MAPPINGS_JSON),
     };

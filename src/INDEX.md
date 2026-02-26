@@ -33,6 +33,10 @@
   adapters for evidence export and signature-verification state.
 - `registry/source-registry.ts`: tenant/instance/source mapping registry and
   fail-closed scope validation.
+- `registry/acp-source-mapping-client.ts`: ACP internal source-mapping HTTP
+  client for resolve/list requests with timeout/auth/outage handling.
+- `registry/acp-source-mapping-provider.ts`: ACP mapping provider with positive
+  and negative TTL caching primitives for staged scope-enforcement migration.
 - `plans/models.ts`: RS-08 dry-run request/response and gate model contracts.
 - `plans/plan-service.ts`: RS-08 deterministic dry-run plan generation and
   freshness/deletion/conflict executability gating from authoritative
@@ -63,6 +67,10 @@
 - `locks/lock-manager.test.ts`: unit tests for lock overlap and promotion.
 - `jobs/job-service.test.ts`: concurrency tests for non-overlapping job runs and
   queued overlap promotion.
+- `registry/acp-source-mapping-client.test.ts`: ACP client request/response and
+  outage handling coverage for resolve/list endpoints.
+- `registry/acp-source-mapping-provider.test.ts`: cache hit/expiry/negative
+  cache/outage behavior coverage for ACP mapping provider primitives.
 - `execute/execute-service.test.ts`: RS-09 conflict matrix/capability
   enforcement plus RS-10 checkpoint/resume/journal linkage coverage and RS-11
   media restore behavior tests.
