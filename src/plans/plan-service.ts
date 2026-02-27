@@ -210,7 +210,26 @@ function evaluateGate(
     };
 }
 
-function extractRequestedPartitions(
+function sortRequestedPartitions(
+    partitions: Map<string, {
+        partition: number;
+        topic: string;
+    }>,
+): Array<{
+    partition: number;
+    topic: string;
+}> {
+    return Array.from(partitions.values())
+        .sort((left, right) => {
+            if (left.topic === right.topic) {
+                return left.partition - right.partition;
+            }
+
+            return left.topic.localeCompare(right.topic);
+        });
+}
+
+function extractRequestedPartitionsFromRows(
     request: CreateDryRunPlanRequest,
 ): Array<{
     partition: number;
@@ -242,7 +261,7 @@ function extractRequestedPartitions(
             continue;
         }
 
-        const key = `${normalizedTopic}|${partition}`;
+        const key = `${normalizedTopic}|${normalizedPartition}`;
 
         if (!partitions.has(key)) {
             partitions.set(key, {
@@ -252,27 +271,74 @@ function extractRequestedPartitions(
         }
     }
 
-    if (partitions.size === 0) {
-        for (const watermark of request.watermarks) {
-            const key = `${watermark.topic}|${watermark.partition}`;
+    return sortRequestedPartitions(partitions);
+}
 
-            if (!partitions.has(key)) {
-                partitions.set(key, {
-                    partition: watermark.partition,
-                    topic: watermark.topic,
-                });
-            }
+function extractRequestedPartitionsFromWatermarks(
+    request: CreateDryRunPlanRequest,
+): Array<{
+    partition: number;
+    topic: string;
+}> {
+    const partitions = new Map<string, {
+        partition: number;
+        topic: string;
+    }>();
+
+    for (const watermark of request.watermarks) {
+        const key = `${watermark.topic}|${watermark.partition}`;
+
+        if (!partitions.has(key)) {
+            partitions.set(key, {
+                partition: watermark.partition,
+                topic: watermark.topic,
+            });
         }
     }
 
-    return Array.from(partitions.values())
-        .sort((left, right) => {
-            if (left.topic === right.topic) {
-                return left.partition - right.partition;
-            }
+    return sortRequestedPartitions(partitions);
+}
 
-            return left.topic.localeCompare(right.topic);
-        });
+function extractRequestedTopicsFromRows(
+    request: CreateDryRunPlanRequest,
+): Set<string> {
+    const topics = new Set<string>();
+
+    for (const row of request.rows) {
+        const topic = row.metadata.metadata.topic;
+
+        if (typeof topic !== 'string') {
+            continue;
+        }
+
+        const normalizedTopic = topic.trim();
+
+        if (!normalizedTopic) {
+            continue;
+        }
+
+        topics.add(normalizedTopic);
+    }
+
+    return topics;
+}
+
+function extractRequestedTopicsFromWatermarks(
+    request: CreateDryRunPlanRequest,
+): Set<string> {
+    const topics = new Set<string>();
+
+    for (const watermark of request.watermarks) {
+        const normalizedTopic = watermark.topic.trim();
+
+        if (!normalizedTopic) {
+            continue;
+        }
+
+        topics.add(normalizedTopic);
+    }
+
+    return topics;
 }
 
 function buildPitResolutions(
@@ -355,18 +421,69 @@ export class RestorePlanService {
         }
 
         const measuredAt = normalizeIsoWithMillis(this.now());
-        const requestedPartitions = extractRequestedPartitions(request);
+        const requestedRowPartitions =
+            extractRequestedPartitionsFromRows(request);
+        const fallbackPartitions =
+            extractRequestedPartitionsFromWatermarks(request);
         let authoritativeWatermarks: RestoreWatermark[];
 
         try {
-            authoritativeWatermarks =
-                await this.restoreIndexStateReader.readWatermarksForPartitions({
-                    instanceId: request.instance_id,
-                    measuredAt,
-                    partitions: requestedPartitions,
-                    source: request.source,
-                    tenantId: request.tenant_id,
-                });
+            if (requestedRowPartitions.length > 0) {
+                authoritativeWatermarks =
+                    await this.restoreIndexStateReader
+                        .readWatermarksForPartitions({
+                            instanceId: request.instance_id,
+                            measuredAt,
+                            partitions: requestedRowPartitions,
+                            source: request.source,
+                            tenantId: request.tenant_id,
+                        });
+            } else {
+                const sourceWatermarks =
+                    await this.restoreIndexStateReader
+                        .listWatermarksForSource({
+                            instanceId: request.instance_id,
+                            measuredAt,
+                            source: request.source,
+                            tenantId: request.tenant_id,
+                        });
+                const requestedRowTopics = extractRequestedTopicsFromRows(
+                    request,
+                );
+                const requestedTopics = requestedRowTopics.size > 0
+                    ? requestedRowTopics
+                    : extractRequestedTopicsFromWatermarks(request);
+
+                if (sourceWatermarks.length === 0) {
+                    authoritativeWatermarks =
+                        await this.restoreIndexStateReader
+                            .readWatermarksForPartitions({
+                                instanceId: request.instance_id,
+                                measuredAt,
+                                partitions: fallbackPartitions,
+                                source: request.source,
+                                tenantId: request.tenant_id,
+                            });
+                } else if (requestedTopics.size === 0) {
+                    authoritativeWatermarks = sourceWatermarks;
+                } else {
+                    authoritativeWatermarks = sourceWatermarks.filter(
+                        (watermark) => requestedTopics.has(watermark.topic),
+                    );
+
+                    if (authoritativeWatermarks.length === 0) {
+                        authoritativeWatermarks =
+                            await this.restoreIndexStateReader
+                                .readWatermarksForPartitions({
+                                    instanceId: request.instance_id,
+                                    measuredAt,
+                                    partitions: fallbackPartitions,
+                                    source: request.source,
+                                    tenantId: request.tenant_id,
+                                });
+                    }
+                }
+            }
         } catch (error: unknown) {
             return {
                 success: false,
@@ -499,8 +616,8 @@ export class RestorePlanService {
         try {
             mappingResolution =
                 await this.sourceMappingResolver.resolveSourceMapping({
-                    tenantId: request.tenant_id,
                     instanceId: request.instance_id,
+                    tenantId: request.tenant_id,
                     serviceScope: 'rrs',
                 });
         } catch (error: unknown) {

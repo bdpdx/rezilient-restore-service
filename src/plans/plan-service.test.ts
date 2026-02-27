@@ -300,6 +300,59 @@ describe('RestorePlanService', () => {
         }
     });
 
+    test(
+        'createDryRunPlan derives non-zero partition from authoritative '
+        + 'source watermarks when rows omit partition metadata',
+        async () => {
+            const registry = new SourceRegistry([
+                {
+                    tenantId: 'tenant-acme',
+                    instanceId: 'sn-dev-01',
+                    source: 'sn://acme-dev.service-now.com',
+                },
+            ]);
+            const indexReader =
+                new InMemoryRestoreIndexStateReader();
+            indexReader.upsertWatermark(
+                RestoreWatermarkSchema.parse(
+                    buildWatermark({
+                        partition: 7,
+                    }),
+                ),
+            );
+            const service = new RestorePlanService(
+                registry,
+                fixedNow,
+                new InMemoryRestorePlanStateStore(),
+                indexReader,
+            );
+            const result = await service.createDryRunPlan(
+                buildDryRunRequest('plan-derived-non-zero', {
+                    watermarks: [buildWatermark({
+                        partition: 0,
+                        freshness: 'unknown',
+                        executability: 'blocked',
+                        reason_code: 'blocked_freshness_unknown',
+                    })],
+                }),
+                claims(),
+            );
+            assert.equal(result.success, true);
+            if (result.success) {
+                assert.equal(
+                    result.record.gate.executability,
+                    'executable',
+                );
+                assert.equal(
+                    result.record.gate.reason_code,
+                    'none',
+                );
+                assert.equal(result.record.watermarks.length, 1);
+                assert.equal(result.record.watermarks[0].partition, 7);
+            }
+        },
+    );
+
     test('createDryRunPlan returns blocked gate for unknown freshness', async () => {
         const registry = new SourceRegistry([
             {
@@ -339,6 +392,50 @@ describe('RestorePlanService', () => {
             );
         }
     });
+
+    test(
+        'createDryRunPlan remains fail-closed when authoritative source '
+        + 'watermarks are absent and rows omit partition metadata',
+        async () => {
+            const registry = new SourceRegistry([
+                {
+                    tenantId: 'tenant-acme',
+                    instanceId: 'sn-dev-01',
+                    source: 'sn://acme-dev.service-now.com',
+                },
+            ]);
+            const indexReader =
+                new InMemoryRestoreIndexStateReader();
+            const service = new RestorePlanService(
+                registry,
+                fixedNow,
+                new InMemoryRestorePlanStateStore(),
+                indexReader,
+            );
+            const result = await service.createDryRunPlan(
+                buildDryRunRequest('plan-derived-missing-authoritative', {
+                    watermarks: [buildWatermark({
+                        partition: 0,
+                        freshness: 'fresh',
+                        executability: 'executable',
+                        reason_code: 'none',
+                    })],
+                }),
+                claims(),
+            );
+            assert.equal(result.success, true);
+            if (result.success) {
+                assert.equal(
+                    result.record.gate.executability,
+                    'blocked',
+                );
+                assert.equal(
+                    result.record.gate.reason_code,
+                    'blocked_freshness_unknown',
+                );
+            }
+        },
+    );
 
     test('createDryRunPlan returns preview_only for stale partitions', async () => {
         const registry = new SourceRegistry([

@@ -1394,6 +1394,122 @@ test('dry-run ignores caller-provided freshness when authoritative state is fres
     }
 });
 
+test(
+    'dry-run derives non-zero partition from authoritative source '
+    + 'watermarks when row partition metadata is absent',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const server = createService(signingKey, {
+            authoritativeWatermarks: [
+                {
+                    ...createWatermark(),
+                    partition: 7,
+                },
+            ],
+        });
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+        const row = createDryRunRow(
+            'row-derived-partition',
+            'rec-derived-partition',
+        );
+        const rowMetadata = row.metadata as Record<string, unknown>;
+        const rowMetadataFields = rowMetadata.metadata as Record<
+            string,
+            unknown
+        >;
+
+        delete rowMetadataFields.partition;
+
+        try {
+            const response = await postJson(
+                baseUrl,
+                '/v1/plans/dry-run',
+                token,
+                createDryRunPayload('plan-derived-partition', {
+                    rows: [row],
+                    watermarks: [
+                        {
+                            ...createWatermark({
+                                freshness: 'unknown',
+                                executability: 'blocked',
+                                reasonCode: 'blocked_freshness_unknown',
+                            }),
+                            partition: 0,
+                        },
+                    ],
+                }),
+            );
+
+            assert.equal(response.status, 201);
+            const gate = response.body.gate as Record<string, unknown>;
+            const watermarks = response.body.watermarks as Array<
+                Record<string, unknown>
+            >;
+
+            assert.equal(gate.executability, 'executable');
+            assert.equal(gate.reason_code, 'none');
+            assert.equal(watermarks.length, 1);
+            assert.equal(watermarks[0].partition, 7);
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
+
+test(
+    'dry-run remains fail-closed when row partition metadata is absent '
+    + 'and authoritative source watermarks are missing',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const server = createService(signingKey, {
+            authoritativeWatermarks: [],
+        });
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+        const row = createDryRunRow(
+            'row-missing-authoritative',
+            'rec-missing-authoritative',
+        );
+        const rowMetadata = row.metadata as Record<string, unknown>;
+        const rowMetadataFields = rowMetadata.metadata as Record<
+            string,
+            unknown
+        >;
+
+        delete rowMetadataFields.partition;
+
+        try {
+            const response = await postJson(
+                baseUrl,
+                '/v1/plans/dry-run',
+                token,
+                createDryRunPayload('plan-missing-authoritative', {
+                    rows: [row],
+                    watermarks: [
+                        {
+                            ...createWatermark({
+                                freshness: 'fresh',
+                                executability: 'executable',
+                                reasonCode: 'none',
+                            }),
+                            partition: 0,
+                        },
+                    ],
+                }),
+            );
+
+            assert.equal(response.status, 201);
+            const gate = response.body.gate as Record<string, unknown>;
+
+            assert.equal(gate.executability, 'blocked');
+            assert.equal(gate.reason_code, 'blocked_freshness_unknown');
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
+
 test('dry-run freshness matrix enforces authoritative stale and unknown states', async () => {
     const signingKey = 'test-signing-key';
     const staleAuthoritative = {
