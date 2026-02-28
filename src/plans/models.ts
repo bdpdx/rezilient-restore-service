@@ -6,6 +6,7 @@ import {
     RESTORE_METADATA_ALLOWLIST_VERSION,
     RestoreApprovalMetadata as RestoreApprovalMetadataSchema,
     RestoreConflict as RestoreConflictSchema,
+    RestoreDryRunWatermarkHint as RestoreDryRunWatermarkHintSchema,
     RestoreExecutionOptions as RestoreExecutionOptionsSchema,
     RestoreMediaCandidate as RestoreMediaCandidateSchema,
     RestorePitContract as RestorePitContractSchema,
@@ -27,6 +28,7 @@ import type {
     RestorePlanHashRowInput,
     RestoreReasonCode,
     RestoreScope,
+    RestoreDryRunWatermarkHint,
     RestoreWatermark,
 } from '@rezilient/types';
 
@@ -71,6 +73,15 @@ const RestorePitCandidateSchema = z
     })
     .strict();
 
+const RestoreDryRunRequestWatermarkSchema = z.union([
+    RestoreWatermarkSchema,
+    RestoreDryRunWatermarkHintSchema,
+]);
+
+type RestoreDryRunRequestWatermark =
+    | RestoreWatermark
+    | RestoreDryRunWatermarkHint;
+
 export interface RestoreDeleteCandidate {
     candidate_id: string;
     row_id: string;
@@ -99,7 +110,7 @@ export interface CreateDryRunPlanRequest {
     conflicts: RestoreConflict[];
     delete_candidates: RestoreDeleteCandidate[];
     media_candidates: RestoreMediaCandidate[];
-    watermarks: RestoreWatermark[];
+    watermarks: RestoreDryRunWatermarkHint[];
     pit_candidates: RestorePitCandidate[];
     approval?: RestoreApprovalMetadata;
 }
@@ -128,9 +139,16 @@ export interface RestorePitResolutionRecord {
     winning_event_time: string;
 }
 
+export type FreshnessUnknownDetail =
+    | 'no_indexed_coverage'
+    | 'partition_not_indexed'
+    | 'restore_index_unavailable'
+    | 'invalid_authoritative_timestamp';
+
 export interface RestoreDryRunGate {
     executability: DryRunExecutability;
     reason_code: RestoreReasonCode;
+    freshness_unknown_detail?: FreshnessUnknownDetail;
     unresolved_delete_candidates: number;
     unresolved_media_candidates: number;
     unresolved_hard_block_conflicts: number;
@@ -162,6 +180,7 @@ export interface CreateDryRunPlanFailure {
     statusCode: number;
     error: string;
     reasonCode?: RestoreReasonCode;
+    freshnessUnknownDetail?: FreshnessUnknownDetail;
     message: string;
 }
 
@@ -369,8 +388,10 @@ export function parseCreateDryRunPlanRequest(
         };
     }
 
-    const watermarksParsed = parseArrayWithSchema<RestoreWatermark>(
-        RestoreWatermarkSchema,
+    const watermarksParsed = parseArrayWithSchema<
+        RestoreDryRunRequestWatermark
+    >(
+        RestoreDryRunRequestWatermarkSchema,
         base.watermarks,
         'watermarks',
     );
@@ -380,6 +401,23 @@ export function parseCreateDryRunPlanRequest(
             success: false,
             message: watermarksParsed.message as string,
         };
+    }
+
+    const parsedWatermarks =
+        watermarksParsed.data as RestoreDryRunRequestWatermark[];
+    const normalizedWatermarks: RestoreDryRunWatermarkHint[] = [];
+
+    for (let index = 0; index < parsedWatermarks.length; index += 1) {
+        const watermark = parsedWatermarks[index];
+        const normalizedWatermark: RestoreDryRunWatermarkHint = {
+            topic: watermark.topic,
+        };
+
+        if (typeof watermark.partition === 'number') {
+            normalizedWatermark.partition = watermark.partition;
+        }
+
+        normalizedWatermarks.push(normalizedWatermark);
     }
 
     const pitCandidates: RestorePitCandidate[] = [];
@@ -453,7 +491,7 @@ export function parseCreateDryRunPlanRequest(
             delete_candidates: deleteCandidates,
             media_candidates:
                 mediaCandidatesParsed.data as RestoreMediaCandidate[],
-            watermarks: watermarksParsed.data as RestoreWatermark[],
+            watermarks: normalizedWatermarks,
             pit_candidates: pitCandidates,
             approval,
         },

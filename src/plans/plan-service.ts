@@ -24,6 +24,7 @@ import {
     buildPlanHashInput,
     CreateDryRunPlanRequest,
     CreateDryRunPlanResult,
+    FreshnessUnknownDetail,
     parseCreateDryRunPlanRequest,
     RestoreActionCountsRecord,
     RestoreDryRunGate,
@@ -135,6 +136,13 @@ function summarizeFreshness(watermarks: RestoreWatermark[]): {
     stale: number;
     unknown: number;
 } {
+    if (watermarks.length === 0) {
+        return {
+            stale: 0,
+            unknown: 1,
+        };
+    }
+
     let stale = 0;
     let unknown = 0;
 
@@ -162,6 +170,78 @@ function summarizeFreshness(watermarks: RestoreWatermark[]): {
     };
 }
 
+function isUnknownFreshnessWatermark(
+    watermark: RestoreWatermark,
+): boolean {
+    return (
+        watermark.freshness === 'unknown' ||
+        watermark.reason_code === 'blocked_freshness_unknown'
+    );
+}
+
+function hasInvalidAuthoritativeTimestamp(
+    watermark: RestoreWatermark,
+): boolean {
+    return (
+        !Number.isFinite(Date.parse(watermark.indexed_through_time)) ||
+        !Number.isFinite(Date.parse(watermark.measured_at))
+    );
+}
+
+function deriveFreshnessUnknownDetail(input: {
+    request: CreateDryRunPlanRequest;
+    watermarks: RestoreWatermark[];
+}): FreshnessUnknownDetail {
+    if (input.watermarks.length === 0) {
+        return 'no_indexed_coverage';
+    }
+
+    const unknownWatermarks = input.watermarks.filter(
+        isUnknownFreshnessWatermark,
+    );
+
+    if (unknownWatermarks.length === 0) {
+        return 'no_indexed_coverage';
+    }
+
+    if (unknownWatermarks.some(hasInvalidAuthoritativeTimestamp)) {
+        return 'invalid_authoritative_timestamp';
+    }
+
+    const requestedPartitions = [
+        ...extractRequestedPartitionsFromRows(input.request),
+        ...extractRequestedPartitionsFromWatermarks(input.request),
+    ];
+
+    if (requestedPartitions.length > 0) {
+        const requestedKeys = new Set(
+            requestedPartitions.map((partition) => {
+                return `${partition.topic}|${partition.partition}`;
+            }),
+        );
+
+        for (const watermark of unknownWatermarks) {
+            const topic = watermark.topic.trim();
+
+            if (!topic) {
+                continue;
+            }
+
+            if (!Number.isInteger(watermark.partition) || watermark.partition < 0) {
+                continue;
+            }
+
+            const key = `${topic}|${watermark.partition}`;
+
+            if (requestedKeys.has(key)) {
+                return 'partition_not_indexed';
+            }
+        }
+    }
+
+    return 'no_indexed_coverage';
+}
+
 function evaluateGate(
     input: {
         request: CreateDryRunPlanRequest;
@@ -181,6 +261,7 @@ function evaluateGate(
 
     let executability: RestoreDryRunGate['executability'] = 'executable';
     let reasonCode: RestoreReasonCode = 'none';
+    let freshnessUnknownDetail: FreshnessUnknownDetail | undefined;
 
     if (unresolvedDeleteCandidates > 0) {
         executability = 'blocked';
@@ -194,6 +275,7 @@ function evaluateGate(
     } else if (freshness.unknown > 0) {
         executability = 'blocked';
         reasonCode = 'blocked_freshness_unknown';
+        freshnessUnknownDetail = deriveFreshnessUnknownDetail(input);
     } else if (freshness.stale > 0) {
         executability = 'preview_only';
         reasonCode = 'blocked_freshness_stale';
@@ -202,6 +284,7 @@ function evaluateGate(
     return {
         executability,
         reason_code: reasonCode,
+        freshness_unknown_detail: freshnessUnknownDetail,
         unresolved_delete_candidates: unresolvedDeleteCandidates,
         unresolved_media_candidates: unresolvedMediaCandidates,
         unresolved_hard_block_conflicts: unresolvedHardBlockConflicts,
@@ -286,12 +369,22 @@ function extractRequestedPartitionsFromWatermarks(
     }>();
 
     for (const watermark of request.watermarks) {
-        const key = `${watermark.topic}|${watermark.partition}`;
+        if (typeof watermark.partition !== 'number') {
+            continue;
+        }
+
+        const normalizedTopic = watermark.topic.trim();
+
+        if (!normalizedTopic) {
+            continue;
+        }
+
+        const key = `${normalizedTopic}|${watermark.partition}`;
 
         if (!partitions.has(key)) {
             partitions.set(key, {
                 partition: watermark.partition,
-                topic: watermark.topic,
+                topic: normalizedTopic,
             });
         }
     }
@@ -423,11 +516,28 @@ export class RestorePlanService {
         const measuredAt = normalizeIsoWithMillis(this.now());
         const requestedRowPartitions =
             extractRequestedPartitionsFromRows(request);
-        const fallbackPartitions =
+        const fallbackHintPartitions =
             extractRequestedPartitionsFromWatermarks(request);
         let authoritativeWatermarks: RestoreWatermark[];
 
         try {
+            const readFallbackHintPartitions = async (): Promise<
+                RestoreWatermark[]
+            > => {
+                if (fallbackHintPartitions.length === 0) {
+                    return [];
+                }
+
+                return this.restoreIndexStateReader
+                    .readWatermarksForPartitions({
+                        instanceId: request.instance_id,
+                        measuredAt,
+                        partitions: fallbackHintPartitions,
+                        source: request.source,
+                        tenantId: request.tenant_id,
+                    });
+            };
+
             if (requestedRowPartitions.length > 0) {
                 authoritativeWatermarks =
                     await this.restoreIndexStateReader
@@ -456,14 +566,7 @@ export class RestorePlanService {
 
                 if (sourceWatermarks.length === 0) {
                     authoritativeWatermarks =
-                        await this.restoreIndexStateReader
-                            .readWatermarksForPartitions({
-                                instanceId: request.instance_id,
-                                measuredAt,
-                                partitions: fallbackPartitions,
-                                source: request.source,
-                                tenantId: request.tenant_id,
-                            });
+                        await readFallbackHintPartitions();
                 } else if (requestedTopics.size === 0) {
                     authoritativeWatermarks = sourceWatermarks;
                 } else {
@@ -473,14 +576,7 @@ export class RestorePlanService {
 
                     if (authoritativeWatermarks.length === 0) {
                         authoritativeWatermarks =
-                            await this.restoreIndexStateReader
-                                .readWatermarksForPartitions({
-                                    instanceId: request.instance_id,
-                                    measuredAt,
-                                    partitions: fallbackPartitions,
-                                    source: request.source,
-                                    tenantId: request.tenant_id,
-                                });
+                            await readFallbackHintPartitions();
                     }
                 }
             }
@@ -490,6 +586,7 @@ export class RestorePlanService {
                 statusCode: 503,
                 error: 'restore_index_unavailable',
                 reasonCode: 'blocked_freshness_unknown',
+                freshnessUnknownDetail: 'restore_index_unavailable',
                 message: `authoritative restore index read failed: ${
                     String((error as Error)?.message || error)
                 }`,

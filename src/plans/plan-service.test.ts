@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import { RestoreWatermark as RestoreWatermarkSchema } from '@rezilient/types';
+import type { RestoreWatermark } from '@rezilient/types';
 import { AuthTokenClaims } from '../auth/claims';
 import {
     AcpResolveSourceMappingResult,
@@ -10,7 +11,10 @@ import {
     SourceMappingResolver,
 } from '../registry/source-mapping-resolver';
 import { SourceRegistry } from '../registry/source-registry';
-import { InMemoryRestoreIndexStateReader } from '../restore-index/state-reader';
+import {
+    InMemoryRestoreIndexStateReader,
+    RestoreIndexStateReader,
+} from '../restore-index/state-reader';
 import { InMemoryRestorePlanStateStore } from './plan-state-store';
 import { RestorePlanService } from './plan-service';
 
@@ -56,6 +60,15 @@ function buildWatermark(
         executability: 'executable',
         reason_code: 'none',
         measured_at: '2026-02-18T15:30:00.000Z',
+        ...overrides,
+    };
+}
+
+function buildWatermarkHint(
+    overrides: Record<string, unknown> = {},
+) {
+    return {
+        topic: 'rez.cdc',
         ...overrides,
     };
 }
@@ -328,12 +341,7 @@ describe('RestorePlanService', () => {
             );
             const result = await service.createDryRunPlan(
                 buildDryRunRequest('plan-derived-non-zero', {
-                    watermarks: [buildWatermark({
-                        partition: 0,
-                        freshness: 'unknown',
-                        executability: 'blocked',
-                        reason_code: 'blocked_freshness_unknown',
-                    })],
+                    watermarks: [buildWatermarkHint()],
                 }),
                 claims(),
             );
@@ -353,45 +361,53 @@ describe('RestorePlanService', () => {
         },
     );
 
-    test('createDryRunPlan returns blocked gate for unknown freshness', async () => {
-        const registry = new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]);
-        const indexReader =
-            new InMemoryRestoreIndexStateReader();
-        const service = new RestorePlanService(
-            registry,
-            fixedNow,
-            new InMemoryRestorePlanStateStore(),
-            indexReader,
-        );
-        const result = await service.createDryRunPlan(
-            buildDryRunRequest('plan-unknown', {
-                watermarks: [buildWatermark({
-                    partition: 99,
-                    freshness: 'unknown',
-                    executability: 'blocked',
-                    reason_code: 'blocked_freshness_unknown',
-                })],
-            }),
-            claims(),
-        );
-        assert.equal(result.success, true);
-        if (result.success) {
-            assert.equal(
-                result.record.gate.executability,
-                'blocked',
+    test(
+        'createDryRunPlan uses explicit partition hint fallback when source '
+        + 'watermarks are absent',
+        async () => {
+            const registry = new SourceRegistry([
+                {
+                    tenantId: 'tenant-acme',
+                    instanceId: 'sn-dev-01',
+                    source: 'sn://acme-dev.service-now.com',
+                },
+            ]);
+            const indexReader =
+                new InMemoryRestoreIndexStateReader();
+            const service = new RestorePlanService(
+                registry,
+                fixedNow,
+                new InMemoryRestorePlanStateStore(),
+                indexReader,
             );
-            assert.equal(
-                result.record.gate.reason_code,
-                'blocked_freshness_unknown',
+            const result = await service.createDryRunPlan(
+                buildDryRunRequest('plan-unknown', {
+                    watermarks: [buildWatermarkHint({
+                        partition: 99,
+                    })],
+                }),
+                claims(),
             );
-        }
-    });
+            assert.equal(result.success, true);
+            if (result.success) {
+                assert.equal(
+                    result.record.gate.executability,
+                    'blocked',
+                );
+                assert.equal(
+                    result.record.gate.reason_code,
+                    'blocked_freshness_unknown',
+                );
+                assert.equal(
+                    result.record.gate.freshness_unknown_detail,
+                    'partition_not_indexed',
+                );
+                assert.equal(result.record.watermarks.length, 1);
+                assert.equal(result.record.watermarks[0].topic, 'rez.cdc');
+                assert.equal(result.record.watermarks[0].partition, 99);
+            }
+        },
+    );
 
     test(
         'createDryRunPlan remains fail-closed when authoritative source '
@@ -414,12 +430,7 @@ describe('RestorePlanService', () => {
             );
             const result = await service.createDryRunPlan(
                 buildDryRunRequest('plan-derived-missing-authoritative', {
-                    watermarks: [buildWatermark({
-                        partition: 0,
-                        freshness: 'fresh',
-                        executability: 'executable',
-                        reason_code: 'none',
-                    })],
+                    watermarks: [buildWatermarkHint()],
                 }),
                 claims(),
             );
@@ -432,6 +443,110 @@ describe('RestorePlanService', () => {
                 assert.equal(
                     result.record.gate.reason_code,
                     'blocked_freshness_unknown',
+                );
+                assert.equal(
+                    result.record.gate.freshness_unknown_detail,
+                    'no_indexed_coverage',
+                );
+                assert.equal(result.record.watermarks.length, 0);
+            }
+        },
+    );
+
+    test(
+        'createDryRunPlan surfaces invalid_authoritative_timestamp detail '
+        + 'for unknown freshness from malformed authoritative timestamps',
+        async () => {
+            const registry = new SourceRegistry([
+                {
+                    tenantId: 'tenant-acme',
+                    instanceId: 'sn-dev-01',
+                    source: 'sn://acme-dev.service-now.com',
+                },
+            ]);
+            const malformedTimestampReader: RestoreIndexStateReader = {
+                async listWatermarksForSource() {
+                    return [
+                        buildWatermark({
+                            indexed_through_time: 'not-a-timestamp',
+                            freshness: 'unknown',
+                            executability: 'blocked',
+                            reason_code: 'blocked_freshness_unknown',
+                        }) as RestoreWatermark,
+                    ];
+                },
+                async readWatermarksForPartitions() {
+                    return [];
+                },
+            };
+            const service = new RestorePlanService(
+                registry,
+                fixedNow,
+                new InMemoryRestorePlanStateStore(),
+                malformedTimestampReader,
+            );
+            const result = await service.createDryRunPlan(
+                buildDryRunRequest('plan-invalid-authoritative-timestamp', {
+                    watermarks: [buildWatermarkHint()],
+                }),
+                claims(),
+            );
+
+            assert.equal(result.success, true);
+            if (result.success) {
+                assert.equal(result.record.gate.executability, 'blocked');
+                assert.equal(
+                    result.record.gate.reason_code,
+                    'blocked_freshness_unknown',
+                );
+                assert.equal(
+                    result.record.gate.freshness_unknown_detail,
+                    'invalid_authoritative_timestamp',
+                );
+            }
+        },
+    );
+
+    test(
+        'createDryRunPlan returns restore_index_unavailable detail '
+        + 'when authoritative reads fail',
+        async () => {
+            const registry = new SourceRegistry([
+                {
+                    tenantId: 'tenant-acme',
+                    instanceId: 'sn-dev-01',
+                    source: 'sn://acme-dev.service-now.com',
+                },
+            ]);
+            const failingReader: RestoreIndexStateReader = {
+                async listWatermarksForSource() {
+                    throw new Error('reader unavailable');
+                },
+                async readWatermarksForPartitions() {
+                    throw new Error('reader unavailable');
+                },
+            };
+            const service = new RestorePlanService(
+                registry,
+                fixedNow,
+                new InMemoryRestorePlanStateStore(),
+                failingReader,
+            );
+            const result = await service.createDryRunPlan(
+                buildDryRunRequest('plan-index-unavailable', {
+                    watermarks: [buildWatermarkHint()],
+                }),
+                claims(),
+            );
+
+            assert.equal(result.success, false);
+            if (!result.success) {
+                assert.equal(result.statusCode, 503);
+                assert.equal(result.error, 'restore_index_unavailable');
+                assert.equal(result.reasonCode, 'blocked_freshness_unknown');
+                assert.equal(
+                    result.freshnessUnknownDetail,
+                    'restore_index_unavailable',
                 );
             }
         },

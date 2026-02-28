@@ -546,6 +546,8 @@ export function createRestoreServiceServer(
                     sendJson(response, result.statusCode, {
                         error: result.error,
                         reason_code: result.reasonCode,
+                        freshness_unknown_detail:
+                            result.freshnessUnknownDetail,
                         message: result.message,
                     });
 

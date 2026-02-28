@@ -3,6 +3,7 @@ import { once } from 'node:events';
 import { Server } from 'node:http';
 import { test } from 'node:test';
 import { RestoreWatermark as RestoreWatermarkSchema } from '@rezilient/types';
+import type { RestoreWatermark } from '@rezilient/types';
 import {
     RestoreOpsAdminService,
     SourceMappingListProvider,
@@ -23,7 +24,10 @@ import {
 } from './registry/source-mapping-resolver';
 import { CachedAcpSourceMappingProvider } from './registry/acp-source-mapping-provider';
 import { SourceRegistry } from './registry/source-registry';
-import { InMemoryRestoreIndexStateReader } from './restore-index/state-reader';
+import {
+    InMemoryRestoreIndexStateReader,
+    RestoreIndexStateReader,
+} from './restore-index/state-reader';
 import { createRestoreServiceServer } from './server';
 import {
     buildScopedToken,
@@ -35,6 +39,10 @@ interface ResponseData {
     status: number;
     body: Record<string, unknown>;
 }
+
+type SeedableRestoreIndexStateReader = RestoreIndexStateReader & {
+    upsertWatermark: (watermark: RestoreWatermark) => void;
+};
 
 const FIXED_NOW = new Date('2026-02-16T12:00:00.000Z');
 
@@ -179,7 +187,7 @@ function createService(
         adminToken?: string;
         bodyMaxBytes?: number;
         authoritativeWatermarks?: Record<string, unknown>[];
-        restoreIndexReader?: InMemoryRestoreIndexStateReader;
+        restoreIndexReader?: RestoreIndexStateReader;
         sourceMappingResolver?: SourceMappingResolver;
         sourceMappingListProvider?: SourceMappingListProvider;
     },
@@ -206,20 +214,28 @@ function createService(
     );
     const restoreIndexReader = options?.restoreIndexReader
         || new InMemoryRestoreIndexStateReader();
-    const seedWatermarks = options?.authoritativeWatermarks === undefined
-        ? [createWatermark()]
-        : options.authoritativeWatermarks;
 
-    for (let index = 0; index < seedWatermarks.length; index += 1) {
-        const parsed = RestoreWatermarkSchema.safeParse(seedWatermarks[index]);
+    if (
+        typeof (restoreIndexReader as Partial<SeedableRestoreIndexStateReader>)
+            .upsertWatermark === 'function'
+    ) {
+        const seedWatermarks = options?.authoritativeWatermarks === undefined
+            ? [createWatermark()]
+            : options.authoritativeWatermarks;
 
-        if (!parsed.success) {
-            throw new Error(
-                `invalid authoritativeWatermarks[${index}] fixture`,
-            );
+        for (let index = 0; index < seedWatermarks.length; index += 1) {
+            const parsed = RestoreWatermarkSchema.safeParse(seedWatermarks[index]);
+
+            if (!parsed.success) {
+                throw new Error(
+                    `invalid authoritativeWatermarks[${index}] fixture`,
+                );
+            }
+
+            (
+                restoreIndexReader as SeedableRestoreIndexStateReader
+            ).upsertWatermark(parsed.data);
         }
-
-        restoreIndexReader.upsertWatermark(parsed.data);
     }
 
     const plans = new RestorePlanService(
@@ -1486,16 +1502,9 @@ test(
                 token,
                 createDryRunPayload('plan-missing-authoritative', {
                     rows: [row],
-                    watermarks: [
-                        {
-                            ...createWatermark({
-                                freshness: 'fresh',
-                                executability: 'executable',
-                                reasonCode: 'none',
-                            }),
-                            partition: 0,
-                        },
-                    ],
+                    watermarks: [{
+                        topic: 'rez.cdc',
+                    }],
                 }),
             );
 
@@ -1504,6 +1513,10 @@ test(
 
             assert.equal(gate.executability, 'blocked');
             assert.equal(gate.reason_code, 'blocked_freshness_unknown');
+            assert.equal(
+                gate.freshness_unknown_detail,
+                'no_indexed_coverage',
+            );
         } finally {
             await closeServer(server);
         }
@@ -1558,10 +1571,107 @@ test('dry-run freshness matrix enforces authoritative stale and unknown states',
 
         assert.equal(unknownGate.executability, 'blocked');
         assert.equal(unknownGate.reason_code, 'blocked_freshness_unknown');
+        assert.equal(
+            unknownGate.freshness_unknown_detail,
+            'partition_not_indexed',
+        );
     } finally {
         await closeServer(server);
     }
 });
+
+test(
+    'dry-run reports invalid_authoritative_timestamp detail when '
+    + 'authoritative freshness data is malformed',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const malformedTimestampReader: RestoreIndexStateReader = {
+            async listWatermarksForSource() {
+                return [];
+            },
+            async readWatermarksForPartitions() {
+                return [
+                    {
+                        ...createWatermark({
+                            freshness: 'unknown',
+                            executability: 'blocked',
+                            reasonCode: 'blocked_freshness_unknown',
+                        }),
+                        indexed_through_time: 'not-a-timestamp',
+                    } as RestoreWatermark,
+                ];
+            },
+        };
+        const server = createService(signingKey, {
+            restoreIndexReader: malformedTimestampReader,
+        });
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+
+        try {
+            const response = await postJson(
+                baseUrl,
+                '/v1/plans/dry-run',
+                token,
+                createDryRunPayload('plan-invalid-authoritative-timestamp'),
+            );
+            const gate = response.body.gate as Record<string, unknown>;
+
+            assert.equal(response.status, 201);
+            assert.equal(gate.executability, 'blocked');
+            assert.equal(gate.reason_code, 'blocked_freshness_unknown');
+            assert.equal(
+                gate.freshness_unknown_detail,
+                'invalid_authoritative_timestamp',
+            );
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
+
+test(
+    'dry-run returns restore_index_unavailable detail when '
+    + 'authoritative reads fail',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const failingReader: RestoreIndexStateReader = {
+            async listWatermarksForSource() {
+                throw new Error('reader unavailable');
+            },
+            async readWatermarksForPartitions() {
+                throw new Error('reader unavailable');
+            },
+        };
+        const server = createService(signingKey, {
+            restoreIndexReader: failingReader,
+        });
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+
+        try {
+            const response = await postJson(
+                baseUrl,
+                '/v1/plans/dry-run',
+                token,
+                createDryRunPayload('plan-index-unavailable'),
+            );
+
+            assert.equal(response.status, 503);
+            assert.equal(response.body.error, 'restore_index_unavailable');
+            assert.equal(
+                response.body.reason_code,
+                'blocked_freshness_unknown',
+            );
+            assert.equal(
+                response.body.freshness_unknown_detail,
+                'restore_index_unavailable',
+            );
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
 
 test('dry-run blocks unresolved delete and hard-block conflicts', async () => {
     const signingKey = 'test-signing-key';

@@ -51,6 +51,15 @@ function buildValidWatermark(
     };
 }
 
+function buildValidWatermarkHint(
+    overrides: Record<string, unknown> = {},
+) {
+    return {
+        topic: 'rez.cdc',
+        ...overrides,
+    };
+}
+
 function buildValidDryRunRequest(
     overrides: Record<string, unknown> = {},
 ) {
@@ -101,6 +110,21 @@ describe('parseCreateDryRunPlanRequest', () => {
         if (result.success) {
             assert.equal(result.data.plan_id, 'plan-01');
         }
+    });
+
+    test('accepts legacy full watermarks and normalizes to hints', () => {
+        const result = parseCreateDryRunPlanRequest(
+            buildValidDryRunRequest(),
+        );
+        assert.equal(result.success, true);
+        if (!result.success) {
+            return;
+        }
+
+        assert.deepEqual(result.data.watermarks, [{
+            topic: 'rez.cdc',
+            partition: 0,
+        }]);
     });
 
     test('accepts full request with all optional fields', () => {
@@ -232,13 +256,87 @@ describe('parseCreateDryRunPlanRequest', () => {
         assert.equal(result.success, false);
     });
 
-    test('validates watermark structure', () => {
+    test('accepts topic-only watermark hint structure', () => {
         const result = parseCreateDryRunPlanRequest(
             buildValidDryRunRequest({
-                watermarks: [{ topic: 'rez.cdc' }],
+                watermarks: [buildValidWatermarkHint()],
             }),
         );
-        assert.equal(result.success, false);
+        assert.equal(result.success, true);
+        if (!result.success) {
+            return;
+        }
+
+        assert.deepEqual(result.data.watermarks, [{
+            topic: 'rez.cdc',
+        }]);
+    });
+
+    test('accepts explicit-partition watermark hint structure', () => {
+        const result = parseCreateDryRunPlanRequest(
+            buildValidDryRunRequest({
+                watermarks: [buildValidWatermarkHint({
+                    partition: 7,
+                })],
+            }),
+        );
+        assert.equal(result.success, true);
+        if (!result.success) {
+            return;
+        }
+
+        assert.deepEqual(result.data.watermarks, [{
+            topic: 'rez.cdc',
+            partition: 7,
+        }]);
+    });
+
+    test('accepts mixed legacy and hint watermark entries', () => {
+        const result = parseCreateDryRunPlanRequest(
+            buildValidDryRunRequest({
+                watermarks: [
+                    buildValidWatermark({
+                        topic: 'rez.cdc',
+                        partition: 2,
+                    }),
+                    buildValidWatermarkHint({
+                        topic: 'rez.schema',
+                    }),
+                ],
+            }),
+        );
+        assert.equal(result.success, true);
+        if (!result.success) {
+            return;
+        }
+
+        assert.deepEqual(result.data.watermarks, [
+            {
+                topic: 'rez.cdc',
+                partition: 2,
+            },
+            {
+                topic: 'rez.schema',
+            },
+        ]);
+    });
+
+    test('rejects malformed watermark hint structure', () => {
+        const malformedWatermarks = [
+            [{}],
+            [{ topic: '' }],
+            [{ topic: 'rez.cdc', partition: -1 }],
+            [{ topic: 'rez.cdc', unexpected: true }],
+        ];
+
+        for (const watermarks of malformedWatermarks) {
+            const result = parseCreateDryRunPlanRequest(
+                buildValidDryRunRequest({
+                    watermarks,
+                }),
+            );
+            assert.equal(result.success, false);
+        }
     });
 
     test('validates pit candidate structure', () => {
