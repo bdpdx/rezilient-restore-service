@@ -5,7 +5,11 @@ import {
     RestoreOpsAdminService,
     SourceMappingListProvider,
 } from './ops-admin-service';
-import { RestoreJobService } from '../jobs/job-service';
+import {
+    QueueReconcileRequest,
+    QueueReconcileResult,
+    RestoreJobService,
+} from '../jobs/job-service';
 import { RestorePlanService } from '../plans/plan-service';
 import { RestoreEvidenceService } from '../evidence/evidence-service';
 import { RestoreExecutionService } from '../execute/execute-service';
@@ -26,13 +30,51 @@ function fixedNow(): Date {
 
 function buildMockJobService(
     jobs: Record<string, unknown>[] = [],
+    options?: {
+        reconcileResult?: QueueReconcileResult;
+        onReconcileRequest?: (request: QueueReconcileRequest) => void;
+    },
 ): RestoreJobService {
+    const defaultReconcile: QueueReconcileResult = {
+        dry_run: true,
+        applied: false,
+        scope: {},
+        stale_cutoff_at: null,
+        anomalies: [],
+        forced_transitions: [],
+        promoted_jobs: [],
+        promoted_job_ids: [],
+        lock_state_before: {
+            running_jobs: 0,
+            queued_jobs: 0,
+        },
+        lock_state_after: {
+            running_jobs: 0,
+            queued_jobs: 0,
+        },
+        totals: {
+            jobs_scanned: jobs.length,
+            jobs_in_scope: jobs.length,
+            non_terminal_in_scope: jobs.length,
+            stale_jobs_in_scope: 0,
+        },
+    };
+
     return {
         listJobs: async () => jobs,
         getLockSnapshot: async () => ({
             running: [],
             queued: [],
         }),
+        reconcileQueueLocks: async (
+            request: QueueReconcileRequest = {},
+        ) => {
+            if (options?.onReconcileRequest) {
+                options.onReconcileRequest(request);
+            }
+
+            return options?.reconcileResult || defaultReconcile;
+        },
     } as unknown as RestoreJobService;
 }
 
@@ -113,6 +155,87 @@ function buildWatermark(
 }
 
 describe('RestoreOpsAdminService', () => {
+    test('reconcileQueue passes dry-run request through to job service', async () => {
+        const capture: {
+            request?: QueueReconcileRequest;
+        } = {};
+        const service = new RestoreOpsAdminService(
+            buildMockJobService([], {
+                onReconcileRequest: (request) => {
+                    capture.request = request;
+                },
+            }),
+            buildMockPlanService(),
+            buildMockEvidenceService(),
+            buildMockExecutionService(),
+            buildSourceMappingListProvider(),
+            new InMemoryRestoreIndexStateReader(),
+            { now: fixedNow },
+        );
+
+        await service.reconcileQueue({
+            dry_run: true,
+            stale_after_ms: 5000,
+            scope: {
+                tenant_id: 'tenant-acme',
+                instance_id: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+                lock_scope_tables: ['incident'],
+            },
+        });
+
+        const capturedRequest = capture.request;
+
+        assert.ok(capturedRequest);
+        assert.equal(capturedRequest.dry_run, true);
+        assert.equal(capturedRequest.stale_after_ms, 5000);
+        assert.equal(capturedRequest.scope?.tenant_id, 'tenant-acme');
+        assert.deepEqual(
+            capturedRequest.scope?.lock_scope_tables,
+            ['incident'],
+        );
+    });
+
+    test('resetQueue applies force-stale defaults and apply mode', async () => {
+        const capture: {
+            request?: QueueReconcileRequest;
+        } = {};
+        const service = new RestoreOpsAdminService(
+            buildMockJobService([], {
+                onReconcileRequest: (request) => {
+                    capture.request = request;
+                },
+            }),
+            buildMockPlanService(),
+            buildMockEvidenceService(),
+            buildMockExecutionService(),
+            buildSourceMappingListProvider(),
+            new InMemoryRestoreIndexStateReader(),
+            { now: fixedNow },
+        );
+
+        await service.resetQueue({
+            dry_run: false,
+            stale_after_ms: 60000,
+            scope: {
+                tenant_id: 'tenant-acme',
+                instance_id: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+            },
+        });
+
+        const capturedRequest = capture.request;
+
+        assert.ok(capturedRequest);
+        assert.equal(capturedRequest.dry_run, false);
+        assert.equal(capturedRequest.stale_after_ms, 60000);
+        assert.equal(capturedRequest.force_stale_status, 'failed');
+        assert.equal(
+            capturedRequest.force_reason_code,
+            'failed_internal_error',
+        );
+    });
+
     test('getQueueDashboard returns running and queued jobs', async () => {
         const jobs = [
             {

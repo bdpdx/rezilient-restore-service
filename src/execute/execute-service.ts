@@ -15,7 +15,6 @@ import { RestoreDryRunPlanRecord } from '../plans/models';
 import { RestorePlanService } from '../plans/plan-service';
 import {
     InMemoryRestoreExecutionStateStore,
-    RestoreExecutionState,
     RestoreExecutionStateStore,
 } from './execute-state-store';
 import {
@@ -410,18 +409,32 @@ function summarizeExecution(
     };
 }
 
+function cloneExecutionRecord(
+    record: RestoreExecutionRecord,
+): RestoreExecutionRecord {
+    return JSON.parse(
+        JSON.stringify(record),
+    ) as RestoreExecutionRecord;
+}
+
+function cloneJournalEntries(
+    entries: RestoreJournalEntry[],
+): RestoreJournalEntry[] {
+    return JSON.parse(
+        JSON.stringify(entries),
+    ) as RestoreJournalEntry[];
+}
+
+function cloneMirrorEntries(
+    entries: RestoreJournalMirrorRecord[],
+): RestoreJournalMirrorRecord[] {
+    return JSON.parse(
+        JSON.stringify(entries),
+    ) as RestoreJournalMirrorRecord[];
+}
+
 export class RestoreExecutionService {
-    private readonly records = new Map<string, RestoreExecutionRecord>();
-
-    private readonly rollbackJournal = new Map<string, RestoreJournalEntry[]>();
-
-    private readonly snMirrors = new Map<string, RestoreJournalMirrorRecord[]>();
-
     private readonly config: ExecuteServiceConfig;
-
-    private initialized = false;
-
-    private initializationPromise: Promise<void> | null = null;
 
     constructor(
         private readonly jobs: RestoreJobService,
@@ -442,9 +455,7 @@ export class RestoreExecutionService {
         requestBody: unknown,
         claims: AuthTokenClaims,
     ): Promise<ExecuteRestoreJobResult> {
-        await this.ensureInitialized();
-
-        const existing = this.records.get(jobId);
+        const existing = await this.getExecutionRecord(jobId);
 
         if (existing) {
             if (existing.status === 'paused') {
@@ -459,7 +470,7 @@ export class RestoreExecutionService {
             return {
                 success: true,
                 statusCode: 200,
-                record: existing,
+                record: cloneExecutionRecord(existing),
                 promoted_job_ids: [],
             };
         }
@@ -620,9 +631,7 @@ export class RestoreExecutionService {
         requestBody: unknown,
         claims: AuthTokenClaims,
     ): Promise<ExecuteRestoreJobResult> {
-        await this.ensureInitialized();
-
-        const existing = this.records.get(jobId);
+        const existing = await this.getExecutionRecord(jobId);
 
         if (!existing) {
             return buildFailure(
@@ -638,7 +647,7 @@ export class RestoreExecutionService {
                 return {
                     success: true,
                     statusCode: 200,
-                    record: existing,
+                    record: cloneExecutionRecord(existing),
                     promoted_job_ids: [],
                 };
             }
@@ -797,33 +806,21 @@ export class RestoreExecutionService {
     }
 
     async getExecution(jobId: string): Promise<RestoreExecutionRecord | null> {
-        await this.ensureInitialized();
-
-        const record = this.records.get(jobId);
-
-        if (!record) {
-            return null;
-        }
-
-        return JSON.parse(JSON.stringify(record)) as RestoreExecutionRecord;
+        return this.getExecutionRecord(jobId);
     }
 
     async listExecutions(): Promise<RestoreExecutionRecord[]> {
-        await this.ensureInitialized();
+        const state = await this.stateStore.read();
 
-        return Array.from(this.records.values())
-            .map((record) =>
-                JSON.parse(JSON.stringify(record)) as RestoreExecutionRecord
-            )
+        return Object.values(state.records_by_job_id)
+            .map((record) => cloneExecutionRecord(record))
             .sort((left, right) => {
                 return left.started_at.localeCompare(right.started_at);
             });
     }
 
     async getCheckpoint(jobId: string): Promise<ExecutionResumeCheckpoint | null> {
-        await this.ensureInitialized();
-
-        const record = this.records.get(jobId);
+        const record = await this.getExecutionRecord(jobId);
 
         if (!record) {
             return null;
@@ -840,72 +837,74 @@ export class RestoreExecutionService {
     async getRollbackJournal(
         jobId: string,
     ): Promise<RestoreRollbackJournalBundle | null> {
-        await this.ensureInitialized();
-
-        const journalEntries = this.rollbackJournal.get(jobId);
-        const mirrorEntries = this.snMirrors.get(jobId);
+        const state = await this.stateStore.read();
+        const journalEntries = state.rollback_journal_by_job_id[jobId];
+        const mirrorEntries = state.sn_mirror_by_job_id[jobId];
 
         if (!journalEntries && !mirrorEntries) {
             return null;
         }
 
         return {
-            journal_entries: [...(journalEntries || [])],
-            sn_mirror_entries: [...(mirrorEntries || [])],
+            journal_entries: cloneJournalEntries(journalEntries || []),
+            sn_mirror_entries: cloneMirrorEntries(mirrorEntries || []),
         };
     }
 
-    private async setExecutionRecord(
+    private async getExecutionRecord(
+        jobId: string,
+    ): Promise<RestoreExecutionRecord | null> {
+        const state = await this.stateStore.read();
+        const record = state.records_by_job_id[jobId];
+
+        if (!record) {
+            return null;
+        }
+
+        return cloneExecutionRecord(record);
+    }
+
+    private async loadRollbackJournalState(
+        jobId: string,
+    ): Promise<{
+        journalEntries: RestoreJournalEntry[];
+        mirrorEntries: RestoreJournalMirrorRecord[];
+    }> {
+        const state = await this.stateStore.read();
+
+        return {
+            journalEntries: cloneJournalEntries(
+                state.rollback_journal_by_job_id[jobId] || [],
+            ),
+            mirrorEntries: cloneMirrorEntries(
+                state.sn_mirror_by_job_id[jobId] || [],
+            ),
+        };
+    }
+
+    private async persistExecutionDelta(
         jobId: string,
         record: RestoreExecutionRecord,
+        journalEntries: RestoreJournalEntry[],
+        mirrorEntries: RestoreJournalMirrorRecord[],
     ): Promise<void> {
-        await this.persistStateWithPending(jobId, record);
-        this.records.set(jobId, record);
-    }
-
-    private async persistStateWithPending(
-        jobId: string,
-        pending: RestoreExecutionRecord,
-    ): Promise<void> {
-        const snapshot = this.snapshotState();
-        snapshot.records_by_job_id[jobId] = JSON.parse(
-            JSON.stringify(pending),
-        ) as RestoreExecutionRecord;
-
         await this.stateStore.mutate((state) => {
-            state.records_by_job_id = snapshot.records_by_job_id;
-            state.rollback_journal_by_job_id =
-                snapshot.rollback_journal_by_job_id;
-            state.sn_mirror_by_job_id = snapshot.sn_mirror_by_job_id;
+            state.records_by_job_id[jobId] = cloneExecutionRecord(record);
+
+            if (journalEntries.length > 0) {
+                state.rollback_journal_by_job_id[jobId] =
+                    cloneJournalEntries(journalEntries);
+            } else {
+                delete state.rollback_journal_by_job_id[jobId];
+            }
+
+            if (mirrorEntries.length > 0) {
+                state.sn_mirror_by_job_id[jobId] =
+                    cloneMirrorEntries(mirrorEntries);
+            } else {
+                delete state.sn_mirror_by_job_id[jobId];
+            }
         });
-    }
-
-    private snapshotState(): RestoreExecutionState {
-        const recordsByJobId: Record<string, RestoreExecutionRecord> = {};
-
-        for (const [jobId, record] of this.records.entries()) {
-            recordsByJobId[jobId] = record;
-        }
-
-        const rollbackJournalByJobId: Record<string, RestoreJournalEntry[]> = {};
-
-        for (const [jobId, entries] of this.rollbackJournal.entries()) {
-            rollbackJournalByJobId[jobId] = entries;
-        }
-
-        const snMirrorByJobId: Record<string, RestoreJournalMirrorRecord[]> = {};
-
-        for (const [jobId, entries] of this.snMirrors.entries()) {
-            snMirrorByJobId[jobId] = entries;
-        }
-
-        return JSON.parse(
-            JSON.stringify({
-                records_by_job_id: recordsByJobId,
-                rollback_journal_by_job_id: rollbackJournalByJobId,
-                sn_mirror_by_job_id: snMirrorByJobId,
-            }),
-        ) as RestoreExecutionState;
     }
 
     private async processAttempt(
@@ -915,6 +914,9 @@ export class RestoreExecutionService {
         runtimeConflictByRow: Map<string, ExecuteRuntimeConflictInput>,
     ): Promise<ExecuteRestoreJobResult> {
         const chunks = chunkRows(plan.plan_hash_input.rows, record.chunk_size);
+        const rollbackState = await this.loadRollbackJournalState(job.job_id);
+        const journalEntries = rollbackState.journalEntries;
+        const mirrorEntries = rollbackState.mirrorEntries;
 
         if (record.checkpoint.total_chunks !== chunks.length) {
             return buildFailure(
@@ -950,7 +952,12 @@ export class RestoreExecutionService {
                 record.media_outcomes,
             );
 
-            await this.setExecutionRecord(job.job_id, record);
+            await this.persistExecutionDelta(
+                job.job_id,
+                record,
+                journalEntries,
+                mirrorEntries,
+            );
 
             return {
                 success: true,
@@ -1045,7 +1052,14 @@ export class RestoreExecutionService {
                     chunk_id: chunkId,
                     used_row_fallback: useFallback,
                 });
-                this.appendRollbackJournal(record, row, chunkId, attempt);
+                this.appendRollbackJournal(
+                    record,
+                    row,
+                    chunkId,
+                    attempt,
+                    journalEntries,
+                    mirrorEntries,
+                );
                 appliedCount += 1;
             }
 
@@ -1071,7 +1085,12 @@ export class RestoreExecutionService {
                 record.checkpoint.next_chunk_index,
             );
 
-            await this.setExecutionRecord(job.job_id, record);
+            await this.persistExecutionDelta(
+                job.job_id,
+                record,
+                journalEntries,
+                mirrorEntries,
+            );
         }
 
         record.summary = summarizeExecution(
@@ -1101,7 +1120,12 @@ export class RestoreExecutionService {
             record.reason_code = 'paused_token_refresh_grace_exhausted';
             record.completed_at = null;
 
-            await this.setExecutionRecord(job.job_id, record);
+            await this.persistExecutionDelta(
+                job.job_id,
+                record,
+                journalEntries,
+                mirrorEntries,
+            );
 
             return {
                 success: true,
@@ -1148,7 +1172,12 @@ export class RestoreExecutionService {
         record.reason_code = terminalReason;
         record.completed_at = normalizeIsoWithMillis(this.now());
 
-        await this.setExecutionRecord(job.job_id, record);
+        await this.persistExecutionDelta(
+            job.job_id,
+            record,
+            journalEntries,
+            mirrorEntries,
+        );
 
         return {
             success: true,
@@ -1163,8 +1192,9 @@ export class RestoreExecutionService {
         row: RestorePlanHashRowInput,
         chunkId: string,
         rowAttempt: number,
+        journalEntries: RestoreJournalEntry[],
+        mirrorEntries: RestoreJournalMirrorRecord[],
     ): void {
-        const journalEntries = this.rollbackJournal.get(record.job_id) || [];
         const journalId = buildJournalId(
             record.job_id,
             record.plan_hash,
@@ -1206,10 +1236,7 @@ export class RestoreExecutionService {
         };
 
         journalEntries.push(entry);
-        this.rollbackJournal.set(record.job_id, journalEntries);
-
-        const mirrors = this.snMirrors.get(record.job_id) || [];
-        mirrors.push({
+        mirrorEntries.push({
             mirror_id: buildMirrorId(journalId),
             journal_id: journalId,
             job_id: record.job_id,
@@ -1224,7 +1251,6 @@ export class RestoreExecutionService {
             row_attempt: rowAttempt,
             linked_at: nowIso,
         });
-        this.snMirrors.set(record.job_id, mirrors);
     }
 
     private processMediaCandidates(
@@ -1489,40 +1515,6 @@ export class RestoreExecutionService {
             ok: true,
             plan,
         };
-    }
-
-    private async ensureInitialized(): Promise<void> {
-        if (this.initialized) {
-            return;
-        }
-
-        if (!this.initializationPromise) {
-            this.initializationPromise = this.initialize();
-        }
-
-        await this.initializationPromise;
-    }
-
-    private async initialize(): Promise<void> {
-        const state = await this.stateStore.read();
-
-        for (const [jobId, record] of Object.entries(state.records_by_job_id)) {
-            this.records.set(jobId, record);
-        }
-
-        for (
-            const [jobId, entries] of Object.entries(
-                state.rollback_journal_by_job_id,
-            )
-        ) {
-            this.rollbackJournal.set(jobId, entries);
-        }
-
-        for (const [jobId, entries] of Object.entries(state.sn_mirror_by_job_id)) {
-            this.snMirrors.set(jobId, entries);
-        }
-
-        this.initialized = true;
     }
 
     private validateRuntimeConflictRows(

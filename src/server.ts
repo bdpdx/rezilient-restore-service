@@ -13,8 +13,14 @@ import {
 } from './admin/ops-admin-service';
 import { RestoreEvidenceService } from './evidence/evidence-service';
 import { RestoreExecutionService } from './execute/execute-service';
-import { RestoreJobRecord } from './jobs/models';
-import { RestoreJobService } from './jobs/job-service';
+import {
+    RestoreJobRecord,
+    RestoreReasonCode,
+} from './jobs/models';
+import {
+    QueueReconcileScope,
+    RestoreJobService,
+} from './jobs/job-service';
 import { RestoreDryRunPlanRecord } from './plans/models';
 import { RestorePlanService } from './plans/plan-service';
 
@@ -256,6 +262,133 @@ function sendScopedNotFound(response: ServerResponse): void {
     sendJson(response, 404, SCOPED_NOT_FOUND_RESPONSE);
 }
 
+function parseQueueScope(
+    value: unknown,
+): {
+    success: true;
+    scope: QueueReconcileScope | undefined;
+} | {
+    success: false;
+    message: string;
+} {
+    if (value === undefined) {
+        return {
+            success: true,
+            scope: undefined,
+        };
+    }
+
+    if (
+        !value ||
+        typeof value !== 'object' ||
+        Array.isArray(value)
+    ) {
+        return {
+            success: false,
+            message: 'scope must be an object when provided',
+        };
+    }
+
+    const raw = value as Record<string, unknown>;
+    const scope: QueueReconcileScope = {};
+    const tenantId = raw.tenant_id;
+
+    if (tenantId !== undefined) {
+        if (typeof tenantId !== 'string' || tenantId.trim() === '') {
+            return {
+                success: false,
+                message: 'scope.tenant_id must be a non-empty string',
+            };
+        }
+
+        scope.tenant_id = tenantId.trim();
+    }
+
+    const instanceId = raw.instance_id;
+
+    if (instanceId !== undefined) {
+        if (typeof instanceId !== 'string' || instanceId.trim() === '') {
+            return {
+                success: false,
+                message: 'scope.instance_id must be a non-empty string',
+            };
+        }
+
+        scope.instance_id = instanceId.trim();
+    }
+
+    const source = raw.source;
+
+    if (source !== undefined) {
+        if (typeof source !== 'string' || source.trim() === '') {
+            return {
+                success: false,
+                message: 'scope.source must be a non-empty string',
+            };
+        }
+
+        scope.source = source.trim();
+    }
+
+    const lockScopeTables = raw.lock_scope_tables;
+
+    if (lockScopeTables !== undefined) {
+        if (!Array.isArray(lockScopeTables)) {
+            return {
+                success: false,
+                message: 'scope.lock_scope_tables must be an array of strings',
+            };
+        }
+
+        const tableSet = new Set<string>();
+
+        for (const value of lockScopeTables) {
+            if (typeof value !== 'string' || value.trim() === '') {
+                return {
+                    success: false,
+                    message:
+                        'scope.lock_scope_tables must contain non-empty strings',
+                };
+            }
+
+            tableSet.add(value.trim());
+        }
+
+        if (tableSet.size === 0) {
+            return {
+                success: false,
+                message: 'scope.lock_scope_tables must contain at least one table',
+            };
+        }
+
+        scope.lock_scope_tables = Array.from(tableSet)
+            .sort((left, right) => left.localeCompare(right));
+    }
+
+    return {
+        success: true,
+        scope,
+    };
+}
+
+function hasRequiredQueueScopeFilters(
+    scope: QueueReconcileScope | undefined,
+): scope is QueueReconcileScope & {
+    tenant_id: string;
+    instance_id: string;
+    source: string;
+} {
+    if (!scope) {
+        return false;
+    }
+
+    return Boolean(
+        scope.tenant_id &&
+        scope.instance_id &&
+        scope.source,
+    );
+}
+
 export function createRestoreServiceServer(
     deps: RestoreServiceDependencies,
     options?: RestoreServiceServerOptions,
@@ -448,6 +581,205 @@ export function createRestoreServiceServer(
 
                     sendJson(response, 200, {
                         drill: result.record,
+                    });
+
+                    return;
+                }
+
+                if (
+                    method === 'POST' &&
+                    pathname === '/v1/admin/ops/queue/reconcile'
+                ) {
+                    const body = await readJsonBody(request, maxJsonBodyBytes);
+                    const dryRun = body.dry_run;
+                    const staleAfterMs = body.stale_after_ms;
+
+                    if (dryRun !== undefined && typeof dryRun !== 'boolean') {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message: 'dry_run must be a boolean when provided',
+                        });
+
+                        return;
+                    }
+
+                    if (
+                        staleAfterMs !== undefined &&
+                        (
+                            typeof staleAfterMs !== 'number' ||
+                            Number.isNaN(staleAfterMs) ||
+                            !Number.isFinite(staleAfterMs) ||
+                            staleAfterMs < 0
+                        )
+                    ) {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message:
+                                'stale_after_ms must be a non-negative number',
+                        });
+
+                        return;
+                    }
+
+                    if (body.force_stale_status !== undefined) {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message: 'force_stale_status is only supported on queue/reset',
+                        });
+
+                        return;
+                    }
+
+                    if (body.force_reason_code !== undefined) {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message: 'force_reason_code is only supported on queue/reset',
+                        });
+
+                        return;
+                    }
+
+                    const parsedScope = parseQueueScope(body.scope);
+
+                    if (!parsedScope.success) {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message: parsedScope.message,
+                        });
+
+                        return;
+                    }
+
+                    if (
+                        dryRun === false &&
+                        !hasRequiredQueueScopeFilters(parsedScope.scope)
+                    ) {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message:
+                                'scope.tenant_id, scope.instance_id, and scope.source are required when dry_run is false',
+                        });
+
+                        return;
+                    }
+
+                    const reconcile = await deps.admin.reconcileQueue({
+                        dry_run: dryRun as boolean | undefined,
+                        scope: parsedScope.scope,
+                        stale_after_ms: staleAfterMs as number | undefined,
+                    });
+
+                    sendJson(response, 200, {
+                        ...reconcile,
+                    });
+
+                    return;
+                }
+
+                if (
+                    method === 'POST' &&
+                    pathname === '/v1/admin/ops/queue/reset'
+                ) {
+                    const body = await readJsonBody(request, maxJsonBodyBytes);
+                    const dryRun = body.dry_run;
+                    const staleAfterMs = body.stale_after_ms;
+                    const forceStatus = body.force_status;
+                    const forceReasonCode = body.force_reason_code;
+
+                    if (dryRun !== undefined && typeof dryRun !== 'boolean') {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message: 'dry_run must be a boolean when provided',
+                        });
+
+                        return;
+                    }
+
+                    if (
+                        typeof staleAfterMs !== 'number' ||
+                        Number.isNaN(staleAfterMs) ||
+                        !Number.isFinite(staleAfterMs) ||
+                        staleAfterMs < 0
+                    ) {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message:
+                                'stale_after_ms must be a non-negative number',
+                        });
+
+                        return;
+                    }
+
+                    const parsedScope = parseQueueScope(body.scope);
+
+                    if (!parsedScope.success) {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message: parsedScope.message,
+                        });
+
+                        return;
+                    }
+
+                    if (!hasRequiredQueueScopeFilters(parsedScope.scope)) {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message:
+                                'scope.tenant_id, scope.instance_id, and scope.source are required',
+                        });
+
+                        return;
+                    }
+
+                    if (
+                        forceStatus !== undefined &&
+                        forceStatus !== 'completed' &&
+                        forceStatus !== 'failed' &&
+                        forceStatus !== 'cancelled'
+                    ) {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message:
+                                'force_status must be completed, failed, or cancelled when provided',
+                        });
+
+                        return;
+                    }
+
+                    if (
+                        forceReasonCode !== undefined &&
+                        (
+                            typeof forceReasonCode !== 'string' ||
+                            forceReasonCode.trim() === ''
+                        )
+                    ) {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message:
+                                'force_reason_code must be a non-empty string when provided',
+                        });
+
+                        return;
+                    }
+
+                    const reset = await deps.admin.resetQueue({
+                        dry_run: dryRun as boolean | undefined,
+                        scope: parsedScope.scope,
+                        stale_after_ms: staleAfterMs,
+                        force_status:
+                            forceStatus as
+                                | 'completed'
+                                | 'failed'
+                                | 'cancelled'
+                                | undefined,
+                        force_reason_code:
+                            typeof forceReasonCode === 'string'
+                                ? forceReasonCode.trim() as RestoreReasonCode
+                                : undefined,
+                    });
+
+                    sendJson(response, 200, {
+                        ...reset,
                     });
 
                     return;

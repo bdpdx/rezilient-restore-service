@@ -421,6 +421,185 @@ test('paused execution resumes from persisted checkpoint after restart', async (
     }
 });
 
+test(
+    'execute state remains consistent across concurrent service fixtures',
+    async () => {
+        const db = newDb();
+        db.public.none('CREATE SCHEMA IF NOT EXISTS rez_restore_index');
+        const first = createFixture(db, 1);
+        const second = createFixture(db, 1);
+
+        try {
+            const plan = await createPlanAndJob(
+                first,
+                'plan-stage11-multi-instance',
+                [
+                    'row-aa',
+                    'row-bb',
+                ],
+            );
+
+            const secondInitial = await second.execute.listExecutions();
+
+            assert.equal(secondInitial.length, 0);
+
+            const firstAttempt = await first.execute.executeJob(
+                plan.jobId,
+                {
+                    operator_id: 'operator@example.com',
+                    operator_capabilities: ['restore_execute'],
+                    chunk_size: 1,
+                },
+                claims(),
+            );
+
+            assert.equal(firstAttempt.success, true);
+            if (!firstAttempt.success) {
+                return;
+            }
+
+            assert.equal(firstAttempt.statusCode, 202);
+            assert.equal(firstAttempt.record.status, 'paused');
+            assert.equal(firstAttempt.record.checkpoint.next_chunk_index, 1);
+
+            const checkpointOnSecond = await second.execute.getCheckpoint(
+                plan.jobId,
+            );
+
+            assert.notEqual(checkpointOnSecond, null);
+            assert.equal(checkpointOnSecond?.next_chunk_index, 1);
+
+            const resumedOnSecond = await second.execute.resumeJob(
+                plan.jobId,
+                {
+                    operator_id: 'operator@example.com',
+                    operator_capabilities: ['restore_execute'],
+                    expected_plan_checksum: firstAttempt.record.plan_checksum,
+                    expected_precondition_checksum:
+                        firstAttempt.record.precondition_checksum,
+                },
+                claims(),
+            );
+
+            assert.equal(resumedOnSecond.success, true);
+            if (!resumedOnSecond.success) {
+                return;
+            }
+
+            assert.equal(resumedOnSecond.statusCode, 200);
+            assert.equal(resumedOnSecond.record.status, 'completed');
+            assert.equal(resumedOnSecond.record.checkpoint.next_chunk_index, 2);
+
+            const executionOnFirst = await first.execute.getExecution(plan.jobId);
+
+            assert.notEqual(executionOnFirst, null);
+            assert.equal(executionOnFirst?.status, 'completed');
+            assert.equal(executionOnFirst?.summary.applied_rows, 2);
+
+            const journalOnFirst = await first.execute.getRollbackJournal(
+                plan.jobId,
+            );
+
+            assert.notEqual(journalOnFirst, null);
+            assert.equal(journalOnFirst?.journal_entries.length, 2);
+            assert.equal(journalOnFirst?.sn_mirror_entries.length, 2);
+        } finally {
+            await first.close();
+            await second.close();
+        }
+    },
+);
+
+test(
+    'evidence state stays visible across concurrent service fixtures',
+    async () => {
+        const db = newDb();
+        db.public.none('CREATE SCHEMA IF NOT EXISTS rez_restore_index');
+        const first = createFixture(db, 0);
+        const second = createFixture(db, 0);
+
+        try {
+            const plan = await createPlanAndJob(
+                first,
+                'plan-stage11-evidence-multi-instance',
+                [
+                    'row-x',
+                    'row-y',
+                ],
+            );
+            const executed = await first.execute.executeJob(
+                plan.jobId,
+                {
+                    operator_id: 'operator@example.com',
+                    operator_capabilities: ['restore_execute'],
+                },
+                claims(),
+            );
+
+            assert.equal(executed.success, true);
+            if (!executed.success) {
+                return;
+            }
+
+            assert.equal(executed.record.status, 'completed');
+            const preWarmOnSecond = await second.evidence.getEvidence(
+                plan.jobId,
+            );
+            const preWarmListOnSecond = await second.evidence.listEvidence();
+
+            assert.equal(preWarmOnSecond, null);
+            assert.equal(preWarmListOnSecond.length, 0);
+
+            const exportedOnFirst = await first.evidence.exportEvidence(
+                plan.jobId,
+            );
+
+            assert.equal(exportedOnFirst.success, true);
+            if (!exportedOnFirst.success) {
+                return;
+            }
+
+            assert.equal(exportedOnFirst.statusCode, 201);
+            assert.equal(exportedOnFirst.reused, false);
+            const evidenceId = exportedOnFirst.record.evidence.evidence_id;
+
+            const visibleOnSecond = await second.evidence.getEvidence(
+                plan.jobId,
+            );
+            const visibleByIdOnSecond = await second.evidence.getEvidenceById(
+                evidenceId,
+            );
+            const listedOnSecond = await second.evidence.listEvidence();
+
+            assert.notEqual(visibleOnSecond, null);
+            assert.equal(visibleOnSecond?.evidence.evidence_id, evidenceId);
+            assert.notEqual(visibleByIdOnSecond, null);
+            assert.equal(visibleByIdOnSecond?.evidence.job_id, plan.jobId);
+            assert.equal(listedOnSecond.length, 1);
+            assert.equal(listedOnSecond[0]?.evidence.evidence_id, evidenceId);
+
+            const reusedOnSecond = await second.evidence.exportEvidence(
+                plan.jobId,
+            );
+
+            assert.equal(reusedOnSecond.success, true);
+            if (!reusedOnSecond.success) {
+                return;
+            }
+
+            assert.equal(reusedOnSecond.statusCode, 200);
+            assert.equal(reusedOnSecond.reused, true);
+            assert.equal(
+                reusedOnSecond.record.evidence.evidence_id,
+                evidenceId,
+            );
+        } finally {
+            await first.close();
+            await second.close();
+        }
+    },
+);
+
 test('evidence export and verification remain consistent after restart', async () => {
     const db = newDb();
     db.public.none('CREATE SCHEMA IF NOT EXISTS rez_restore_index');

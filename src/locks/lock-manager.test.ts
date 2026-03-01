@@ -196,3 +196,40 @@ test('release promotes multiple queued jobs when scopes free', () => {
     assert.equal(snapshot.queued.length, 0);
     assert.equal(snapshot.running.length, 2);
 });
+
+test('release removes queued job without forcing unrelated promotion', () => {
+    const locks = new RestoreLockManager();
+
+    locks.acquire({
+        jobId: 'job-running',
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        tables: ['incident'],
+    });
+    locks.acquire({
+        jobId: 'job-stale-queued',
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        tables: ['incident'],
+    });
+    locks.acquire({
+        jobId: 'job-waiting',
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        tables: ['incident'],
+    });
+
+    const removedQueued = locks.release('job-stale-queued');
+
+    assert.equal(removedQueued.released, false);
+    assert.deepEqual(removedQueued.promoted, []);
+    assert.equal(locks.getQueuePosition('job-waiting'), 1);
+
+    const releasedRunning = locks.release('job-running');
+
+    assert.equal(releasedRunning.released, true);
+    assert.deepEqual(
+        releasedRunning.promoted.map((entry) => entry.jobId),
+        ['job-waiting'],
+    );
+});

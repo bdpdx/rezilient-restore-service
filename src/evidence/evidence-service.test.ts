@@ -12,6 +12,7 @@ import {
     TEST_EVIDENCE_SIGNING_PUBLIC_KEY_PEM,
 } from '../test-helpers';
 import { RestoreEvidenceService } from './evidence-service';
+import { InMemoryRestoreEvidenceStateStore } from './evidence-state-store';
 
 const FIXED_NOW = new Date('2026-02-17T01:02:03.000Z');
 
@@ -95,7 +96,24 @@ function createAuthoritativeWatermark(): Record<string, unknown> {
     };
 }
 
+function createEvidenceServiceConfig() {
+    return {
+        signer: {
+            signer_key_id: 'rrs-test-signer',
+            private_key_pem: TEST_EVIDENCE_SIGNING_PRIVATE_KEY_PEM,
+            public_key_pem: TEST_EVIDENCE_SIGNING_PUBLIC_KEY_PEM,
+        },
+        immutable_storage: {
+            worm_enabled: true,
+            retention_class: 'compliance-7y',
+        },
+    };
+}
+
 async function createFixture(): Promise<{
+    jobs: RestoreJobService;
+    plans: RestorePlanService;
+    execute: RestoreExecutionService;
     evidence: RestoreEvidenceService;
     jobId: string;
 }> {
@@ -133,17 +151,7 @@ async function createFixture(): Promise<{
         jobs,
         plans,
         execute,
-        {
-            signer: {
-                signer_key_id: 'rrs-test-signer',
-                private_key_pem: TEST_EVIDENCE_SIGNING_PRIVATE_KEY_PEM,
-                public_key_pem: TEST_EVIDENCE_SIGNING_PUBLIC_KEY_PEM,
-            },
-            immutable_storage: {
-                worm_enabled: true,
-                retention_class: 'compliance-7y',
-            },
-        },
+        createEvidenceServiceConfig(),
         now,
     );
     const dryRun = await plans.createDryRunPlan(
@@ -250,6 +258,9 @@ async function createFixture(): Promise<{
     assert.equal(executed.record.status, 'completed');
 
     return {
+        jobs,
+        plans,
+        execute,
         evidence,
         jobId: job.job.job_id,
     };
@@ -388,6 +399,85 @@ test('ensureEvidence is idempotent', async () => {
     }
 });
 
+test(
+    'evidence reads stay fresh across service instances sharing state',
+    async () => {
+        const fixture = await createFixture();
+        const sharedStateStore = new InMemoryRestoreEvidenceStateStore();
+        const primary = new RestoreEvidenceService(
+            fixture.jobs,
+            fixture.plans,
+            fixture.execute,
+            createEvidenceServiceConfig(),
+            now,
+            sharedStateStore,
+        );
+        const secondary = new RestoreEvidenceService(
+            fixture.jobs,
+            fixture.plans,
+            fixture.execute,
+            createEvidenceServiceConfig(),
+            now,
+            sharedStateStore,
+        );
+        const preWarmRead = await secondary.getEvidence(fixture.jobId);
+
+        assert.equal(preWarmRead, null);
+
+        const exported = await primary.exportEvidence(fixture.jobId);
+
+        assert.equal(exported.success, true);
+        if (!exported.success) {
+            return;
+        }
+
+        assert.equal(exported.statusCode, 201);
+        assert.equal(exported.reused, false);
+
+        const visibleOnSecondary = await secondary.getEvidence(fixture.jobId);
+
+        assert.notEqual(visibleOnSecondary, null);
+        assert.equal(
+            visibleOnSecondary?.evidence.evidence_id,
+            exported.record.evidence.evidence_id,
+        );
+
+        const visibleByIdOnSecondary = await secondary.getEvidenceById(
+            exported.record.evidence.evidence_id,
+        );
+
+        assert.notEqual(visibleByIdOnSecondary, null);
+        assert.equal(
+            visibleByIdOnSecondary?.evidence.job_id,
+            fixture.jobId,
+        );
+
+        const listedOnSecondary = await secondary.listEvidence();
+
+        assert.equal(listedOnSecondary.length, 1);
+        assert.equal(
+            listedOnSecondary[0]?.evidence.evidence_id,
+            exported.record.evidence.evidence_id,
+        );
+
+        const reusedOnSecondary = await secondary.exportEvidence(
+            fixture.jobId,
+        );
+
+        assert.equal(reusedOnSecondary.success, true);
+        if (!reusedOnSecondary.success) {
+            return;
+        }
+
+        assert.equal(reusedOnSecondary.statusCode, 200);
+        assert.equal(reusedOnSecondary.reused, true);
+        assert.equal(
+            reusedOnSecondary.record.evidence.evidence_id,
+            exported.record.evidence.evidence_id,
+        );
+    },
+);
+
 test('getEvidence returns null for unknown job', async () => {
     const fixture = await createFixture();
     const result = await fixture.evidence.getEvidence(
@@ -433,19 +523,7 @@ test('exportEvidence returns failure when job not found', async () => {
         jobs,
         plans,
         execute,
-        {
-            signer: {
-                signer_key_id: 'rrs-test-signer',
-                private_key_pem:
-                    TEST_EVIDENCE_SIGNING_PRIVATE_KEY_PEM,
-                public_key_pem:
-                    TEST_EVIDENCE_SIGNING_PUBLIC_KEY_PEM,
-            },
-            immutable_storage: {
-                worm_enabled: true,
-                retention_class: 'compliance-7y',
-            },
-        },
+        createEvidenceServiceConfig(),
         now,
     );
 
@@ -567,19 +645,7 @@ test('exportEvidence returns failure when plan not found', async () => {
         jobs,
         emptyPlanService,
         execute,
-        {
-            signer: {
-                signer_key_id: 'rrs-test-signer',
-                private_key_pem:
-                    TEST_EVIDENCE_SIGNING_PRIVATE_KEY_PEM,
-                public_key_pem:
-                    TEST_EVIDENCE_SIGNING_PUBLIC_KEY_PEM,
-            },
-            immutable_storage: {
-                worm_enabled: true,
-                retention_class: 'compliance-7y',
-            },
-        },
+        createEvidenceServiceConfig(),
         now,
     );
 

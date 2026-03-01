@@ -10,6 +10,7 @@ import {
 } from '../registry/source-mapping-resolver';
 import { SourceRegistry } from '../registry/source-registry';
 import { RestoreLockManager } from '../locks/lock-manager';
+import { InMemoryRestoreJobStateStore } from './job-state-store';
 
 const FIXED_NOW = new Date('2026-02-16T12:00:00.000Z');
 
@@ -482,6 +483,272 @@ test('completeJob rejects completion for already-terminal job', async () => {
     );
 
     assert.equal(result.success, false);
+});
+
+test('reconcileQueueLocks dry-run detects stale non-terminal jobs', async () => {
+    const service = new RestoreJobService(
+        new RestoreLockManager(),
+        new SourceRegistry([
+            {
+                tenantId: 'tenant-acme',
+                instanceId: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+            },
+        ]),
+        now,
+    );
+
+    const running = await service.createJob(
+        baseRequest('plan-1', 'incident'),
+        claims(),
+    );
+    const queued = await service.createJob(
+        baseRequest('plan-2', 'incident'),
+        claims(),
+    );
+
+    assert.equal(running.success, true);
+    assert.equal(queued.success, true);
+
+    if (!running.success || !queued.success) {
+        return;
+    }
+
+    const beforeRunning = await service.getJob(running.job.job_id);
+    const beforeQueued = await service.getJob(queued.job.job_id);
+    const preview = await service.reconcileQueueLocks({
+        dry_run: true,
+        stale_after_ms: 0,
+        scope: {
+            tenant_id: 'tenant-acme',
+            instance_id: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+            lock_scope_tables: ['incident'],
+        },
+    });
+
+    assert.equal(preview.dry_run, true);
+    assert.equal(preview.applied, false);
+    assert.equal(preview.totals.stale_jobs_in_scope, 2);
+    assert.equal(preview.forced_transitions.length, 0);
+
+    const staleAnomalyCount = preview.anomalies.filter((anomaly) =>
+        anomaly.code === 'stale_non_terminal_job'
+    ).length;
+
+    assert.equal(staleAnomalyCount, 2);
+
+    const afterRunning = await service.getJob(running.job.job_id);
+    const afterQueued = await service.getJob(queued.job.job_id);
+
+    assert.equal(beforeRunning?.status, 'running');
+    assert.equal(beforeQueued?.status, 'queued');
+    assert.equal(afterRunning?.status, 'running');
+    assert.equal(afterQueued?.status, 'queued');
+});
+
+test(
+    'reconcileQueueLocks apply force-stale marks terminal and promotes queue',
+    async () => {
+        let nowMillis = Date.parse('2026-02-16T12:00:00.000Z');
+        const dynamicNow = (): Date => new Date(nowMillis);
+        const service = new RestoreJobService(
+            new RestoreLockManager(),
+            new SourceRegistry([
+                {
+                    tenantId: 'tenant-acme',
+                    instanceId: 'sn-dev-01',
+                    source: 'sn://acme-dev.service-now.com',
+                },
+            ]),
+            dynamicNow,
+        );
+
+        const running = await service.createJob(
+            baseRequest('plan-1', 'incident'),
+            claims(),
+        );
+
+        assert.equal(running.success, true);
+
+        if (!running.success) {
+            return;
+        }
+
+        nowMillis += 8 * 60 * 1000;
+
+        const queued = await service.createJob(
+            baseRequest('plan-2', 'incident'),
+            claims(),
+        );
+
+        assert.equal(queued.success, true);
+
+        if (!queued.success) {
+            return;
+        }
+
+        nowMillis += 2 * 60 * 1000;
+
+        const applied = await service.reconcileQueueLocks({
+            dry_run: false,
+            stale_after_ms: 5 * 60 * 1000,
+            force_stale_status: 'failed',
+            force_reason_code: 'failed_internal_error',
+            scope: {
+                tenant_id: 'tenant-acme',
+                instance_id: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+                lock_scope_tables: ['incident'],
+            },
+        });
+
+        assert.equal(applied.applied, true);
+        assert.equal(applied.forced_transitions.length, 1);
+        assert.equal(
+            applied.forced_transitions[0].job_id,
+            running.job.job_id,
+        );
+        assert.equal(
+            applied.forced_transitions[0].to_status,
+            'failed',
+        );
+        assert.deepEqual(applied.promoted_job_ids, [queued.job.job_id]);
+
+        const failed = await service.getJob(running.job.job_id);
+        const promoted = await service.getJob(queued.job.job_id);
+
+        assert.notEqual(failed, null);
+        assert.notEqual(promoted, null);
+        assert.equal(failed?.status, 'failed');
+        assert.equal(failed?.status_reason_code, 'failed_internal_error');
+        assert.equal(failed?.completed_at, '2026-02-16T12:10:00.000Z');
+        assert.equal(promoted?.status, 'running');
+        assert.equal(promoted?.queue_position, null);
+        assert.equal(promoted?.wait_reason_code, null);
+
+        const failedEvents = await service.listJobEvents(running.job.job_id);
+        const hasForcedFailedEvent = failedEvents.some((event) => {
+            if (event.event_type !== 'job_failed') {
+                return false;
+            }
+
+            const details = event.details as {
+                reconcile_forced_terminal?: boolean;
+            };
+
+            return details.reconcile_forced_terminal === true;
+        });
+
+        assert.equal(hasForcedFailedEvent, true);
+    },
+);
+
+test('reconcileQueueLocks scope limits forced stale transitions', async () => {
+    const service = new RestoreJobService(
+        new RestoreLockManager(),
+        new SourceRegistry([
+            {
+                tenantId: 'tenant-acme',
+                instanceId: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+            },
+        ]),
+        now,
+    );
+    const incidentJob = await service.createJob(
+        baseRequest('plan-1', 'incident'),
+        claims(),
+    );
+    const cmdbJob = await service.createJob(
+        baseRequest('plan-2', 'cmdb_ci'),
+        claims(),
+    );
+
+    assert.equal(incidentJob.success, true);
+    assert.equal(cmdbJob.success, true);
+
+    if (!incidentJob.success || !cmdbJob.success) {
+        return;
+    }
+
+    const applied = await service.reconcileQueueLocks({
+        dry_run: false,
+        stale_after_ms: 0,
+        force_stale_status: 'failed',
+        force_reason_code: 'failed_internal_error',
+        scope: {
+            tenant_id: 'tenant-acme',
+            instance_id: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+            lock_scope_tables: ['incident'],
+        },
+    });
+
+    assert.equal(applied.forced_transitions.length, 1);
+    assert.equal(
+        applied.forced_transitions[0].job_id,
+        incidentJob.job.job_id,
+    );
+
+    const incidentAfter = await service.getJob(incidentJob.job.job_id);
+    const cmdbAfter = await service.getJob(cmdbJob.job.job_id);
+
+    assert.equal(incidentAfter?.status, 'failed');
+    assert.equal(cmdbAfter?.status, 'running');
+});
+
+test('reconcileQueueLocks reports lock membership mismatch anomalies', async () => {
+    const stateStore = new InMemoryRestoreJobStateStore();
+    const service = new RestoreJobService(
+        new RestoreLockManager(),
+        new SourceRegistry([
+            {
+                tenantId: 'tenant-acme',
+                instanceId: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+            },
+        ]),
+        now,
+        stateStore,
+    );
+
+    const running = await service.createJob(
+        baseRequest('plan-1', 'incident'),
+        claims(),
+    );
+    const queued = await service.createJob(
+        baseRequest('plan-2', 'incident'),
+        claims(),
+    );
+
+    assert.equal(running.success, true);
+    assert.equal(queued.success, true);
+
+    if (!running.success || !queued.success) {
+        return;
+    }
+
+    await stateStore.mutate((state) => {
+        state.lock_state.queued_jobs = [];
+    });
+
+    const preview = await service.reconcileQueueLocks({
+        dry_run: true,
+        scope: {
+            tenant_id: 'tenant-acme',
+            instance_id: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+            lock_scope_tables: ['incident'],
+        },
+    });
+
+    const mismatch = preview.anomalies.find((anomaly) =>
+        anomaly.code === 'lock_membership_mismatch'
+        && anomaly.job_id === queued.job.job_id
+    );
+
+    assert.notEqual(mismatch, undefined);
 });
 
 test('listJobEvents returns empty for unknown job', async () => {

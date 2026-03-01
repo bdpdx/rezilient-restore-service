@@ -2,45 +2,72 @@
 
 ## Queue Triage
 
-1. List queued jobs with `GET /v1/jobs/{job_id}` and inspect:
-   - `status`
-   - `status_reason_code`
-   - `wait_reason_code`
-   - `wait_tables`
-2. Confirm whether the blocking scope overlaps active running jobs on the same
-   `(tenant_id, instance_id, table)` tuple.
-3. Check `GET /v1/jobs/{job_id}/events` for transition history:
-   - `job_queued`
-   - `job_started`
-   - terminal events
-4. If queue depth is rising and no jobs are promoting, identify lock-holder
-   jobs and verify they are still progressing.
+1. Run a dry-run queue reconcile first:
+   - `POST /v1/admin/ops/queue/reconcile`
+   - header: `x-rezilient-admin-token`
+   - body (recommended scoped triage):
+     `{"dry_run":true,"scope":{"tenant_id":"<tenant>","instance_id":"<instance>","source":"<source>","lock_scope_tables":["incident"]}}`
+2. Inspect response fields:
+   - `dry_run` and `applied`
+   - `anomalies[*].code`
+   - `lock_state_before` / `lock_state_after`
+   - `totals.non_terminal_in_scope`
+3. Review queued/running job details as needed:
+   - `GET /v1/admin/ops/queue`
+   - `GET /v1/jobs/{job_id}`
+   - `GET /v1/jobs/{job_id}/events`
+4. If stale or lock-membership anomalies are confirmed, proceed to Queue Reset
+   Apply below.
 
-## Lock Timeout Recovery
+## Queue Reconcile (Dry Run or Apply)
 
-1. Identify running jobs that exceed expected execution window.
-2. Validate worker status and downstream dependencies before intervention.
-3. If a job is stuck, mark it terminal via `POST /v1/jobs/{job_id}/complete`
-   with:
-   - `status = failed`
-   - `reason_code = failed_internal_error`
-4. Confirm lock release and queued-job promotion in response payload
-   (`promoted_job_ids`) and subsequent job events.
-5. If queued jobs do not promote after lock release, treat as lock-manager
-   defect and restart service with incident escalation.
+1. Use endpoint:
+   - `POST /v1/admin/ops/queue/reconcile`
+2. Apply mode is optional and non-terminal:
+   - set `{"dry_run":false}` to rebuild queue/lock state and promote
+     promotable queued jobs.
+3. For apply mode, provide scoped filters to avoid broad lock rebuilds:
+   - `scope.tenant_id`
+   - `scope.instance_id`
+   - `scope.source`
+   - optional `scope.lock_scope_tables`
+4. Expected response fields:
+   - `promoted_job_ids`
+   - `anomalies`
+   - `lock_state_before`
+   - `lock_state_after`
+   - `totals`
+5. If stale jobs must be force-closed, use Queue Reset (not reconcile).
 
-## Stuck Job Cleanup
+## Queue Reset (Forced Stale Terminal Cleanup)
 
-1. For queued jobs that should not execute (cancelled by operator intent), call
-   `POST /v1/jobs/{job_id}/complete` with `status = cancelled`.
-2. Verify the job moved to terminal state with cleared queue metadata:
-   - `queue_position = null`
-   - `wait_reason_code = null`
-3. Confirm audit continuity by checking terminal event in
-   `GET /v1/jobs/{job_id}/events`.
-4. If duplicate `plan_id` requests repeatedly fail with
-   `blocked_plan_hash_mismatch`, require explicit replan and new `plan_id`
-   instead of forced overwrite.
+1. Use endpoint:
+   - `POST /v1/admin/ops/queue/reset`
+2. Required request controls:
+   - `stale_after_ms` (non-negative number)
+   - scoped filters:
+     `scope.tenant_id`, `scope.instance_id`, `scope.source`
+   - optional: `scope.lock_scope_tables`
+   - optional: `force_status` (`failed|cancelled|completed`)
+   - optional: `force_reason_code`
+3. Start with dry-run:
+   - `{"dry_run":true,"stale_after_ms":300000,"scope":{...}}`
+4. Apply forced transitions:
+   - `{"dry_run":false,"stale_after_ms":300000,"scope":{...},"force_status":"failed","force_reason_code":"failed_internal_error"}`
+5. Validate response and follow-up state:
+   - `forced_transitions[*].job_id`
+   - `forced_transitions[*].to_status`
+   - `promoted_job_ids`
+   - `GET /v1/jobs/{job_id}` for each transitioned/promoted job
+   - `GET /v1/jobs/{job_id}/events` to confirm reconcile audit trail.
+
+## Single-Job Completion Fallback
+
+1. If only one known job requires intervention, `POST /v1/jobs/{job_id}/complete`
+   remains available for targeted recovery.
+2. Prefer admin reconcile/reset endpoints for queue-wide lock anomalies and
+   stale-state cleanup.
+3. After manual completion, verify `promoted_job_ids` and event continuity.
 
 ## Dry-Run Preview-Only Plans
 

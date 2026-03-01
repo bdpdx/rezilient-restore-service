@@ -1,7 +1,14 @@
-import { normalizeIsoWithMillis } from '../jobs/models';
+import {
+    normalizeIsoWithMillis,
+    RestoreReasonCode,
+} from '../jobs/models';
 import { RestoreEvidenceService } from '../evidence/evidence-service';
 import { RestoreExecutionService } from '../execute/execute-service';
-import { RestoreJobService } from '../jobs/job-service';
+import {
+    QueueReconcileResult,
+    QueueReconcileScope,
+    RestoreJobService,
+} from '../jobs/job-service';
 import { RestorePlanService } from '../plans/plan-service';
 import {
     AcpListSourceMappingsResult,
@@ -56,6 +63,22 @@ export interface RestoreOpsAdminConfig {
     runbooksSignedOff?: boolean;
     requiredFailureDrills?: string[];
     now?: () => Date;
+}
+
+type QueueResetStatus = 'completed' | 'failed' | 'cancelled';
+
+export interface AdminQueueReconcileRequest {
+    dry_run?: boolean;
+    scope?: QueueReconcileScope;
+    stale_after_ms?: number;
+}
+
+export interface AdminQueueResetRequest {
+    dry_run?: boolean;
+    scope: QueueReconcileScope;
+    stale_after_ms: number;
+    force_status?: QueueResetStatus;
+    force_reason_code?: RestoreReasonCode;
 }
 
 interface FailureDrillRecord {
@@ -393,6 +416,33 @@ export class RestoreOpsAdminService {
             success: true,
             record,
         };
+    }
+
+    async reconcileQueue(
+        request: AdminQueueReconcileRequest = {},
+    ): Promise<QueueReconcileResult> {
+        return this.jobs.reconcileQueueLocks({
+            dry_run: request.dry_run,
+            scope: request.scope,
+            stale_after_ms: request.stale_after_ms,
+        });
+    }
+
+    async resetQueue(
+        request: AdminQueueResetRequest,
+    ): Promise<QueueReconcileResult> {
+        const forceStatus = request.force_status || 'failed';
+        const forceReason = request.force_reason_code || (
+            forceStatus === 'failed' ? 'failed_internal_error' : 'none'
+        );
+
+        return this.jobs.reconcileQueueLocks({
+            dry_run: request.dry_run,
+            scope: request.scope,
+            stale_after_ms: request.stale_after_ms,
+            force_stale_status: forceStatus,
+            force_reason_code: forceReason,
+        });
     }
 
     async getQueueDashboard(): Promise<Record<string, unknown>> {

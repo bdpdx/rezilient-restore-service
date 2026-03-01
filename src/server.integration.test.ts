@@ -4,16 +4,33 @@ import { Server } from 'node:http';
 import { test } from 'node:test';
 import { RestoreWatermark as RestoreWatermarkSchema } from '@rezilient/types';
 import type { RestoreWatermark } from '@rezilient/types';
+import { newDb } from 'pg-mem';
 import {
     RestoreOpsAdminService,
     SourceMappingListProvider,
 } from './admin/ops-admin-service';
 import { RequestAuthenticator } from './auth/authenticator';
 import { RestoreEvidenceService } from './evidence/evidence-service';
+import {
+    PostgresRestoreEvidenceStateStore,
+    RestoreEvidenceStateStore,
+} from './evidence/evidence-state-store';
 import { RestoreExecutionService } from './execute/execute-service';
+import {
+    PostgresRestoreExecutionStateStore,
+    RestoreExecutionStateStore,
+} from './execute/execute-state-store';
+import {
+    PostgresRestoreJobStateStore,
+    RestoreJobStateStore,
+} from './jobs/job-state-store';
 import { RestoreJobService } from './jobs/job-service';
 import { RestoreLockManager } from './locks/lock-manager';
 import { RestorePlanService } from './plans/plan-service';
+import {
+    PostgresRestorePlanStateStore,
+    RestorePlanStateStore,
+} from './plans/plan-state-store';
 import {
     AcpListSourceMappingsResult,
     AcpResolveSourceMappingResult,
@@ -42,6 +59,13 @@ interface ResponseData {
 
 type SeedableRestoreIndexStateReader = RestoreIndexStateReader & {
     upsertWatermark: (watermark: RestoreWatermark) => void;
+};
+
+type ServiceStateStores = {
+    jobs?: RestoreJobStateStore;
+    plans?: RestorePlanStateStore;
+    execute?: RestoreExecutionStateStore;
+    evidence?: RestoreEvidenceStateStore;
 };
 
 const FIXED_NOW = new Date('2026-02-16T12:00:00.000Z');
@@ -190,6 +214,7 @@ function createService(
         restoreIndexReader?: RestoreIndexStateReader;
         sourceMappingResolver?: SourceMappingResolver;
         sourceMappingListProvider?: SourceMappingListProvider;
+        stateStores?: ServiceStateStores;
     },
 ): Server {
     const sourceRegistry = new SourceRegistry([
@@ -209,7 +234,7 @@ function createService(
         new RestoreLockManager(),
         sourceRegistry,
         now,
-        undefined,
+        options?.stateStores?.jobs,
         options?.sourceMappingResolver,
     );
     const restoreIndexReader = options?.restoreIndexReader
@@ -241,7 +266,7 @@ function createService(
     const plans = new RestorePlanService(
         sourceRegistry,
         now,
-        undefined,
+        options?.stateStores?.plans,
         restoreIndexReader,
         options?.sourceMappingResolver,
     );
@@ -250,6 +275,7 @@ function createService(
         plans,
         options?.executeConfig,
         now,
+        options?.stateStores?.execute,
     );
     const evidence = new RestoreEvidenceService(
         jobs,
@@ -267,6 +293,7 @@ function createService(
             },
         },
         now,
+        options?.stateStores?.evidence,
     );
     const admin = new RestoreOpsAdminService(
         jobs,
@@ -291,6 +318,42 @@ function createService(
         adminToken: options?.adminToken,
         maxJsonBodyBytes: options?.bodyMaxBytes,
     });
+}
+
+function createPostgresBackedStateStores(
+    db: ReturnType<typeof newDb>,
+): {
+    pool: {
+        end: () => Promise<void>;
+    };
+    stores: ServiceStateStores;
+} {
+    const pgAdapter = db.adapters.createPg();
+    const pool = new pgAdapter.Pool();
+
+    return {
+        pool,
+        stores: {
+            plans: new PostgresRestorePlanStateStore('postgres://unused', {
+                pool: pool as any,
+            }),
+            jobs: new PostgresRestoreJobStateStore('postgres://unused', {
+                pool: pool as any,
+            }),
+            execute: new PostgresRestoreExecutionStateStore(
+                'postgres://unused',
+                {
+                    pool: pool as any,
+                },
+            ),
+            evidence: new PostgresRestoreEvidenceStateStore(
+                'postgres://unused',
+                {
+                    pool: pool as any,
+                },
+            ),
+        },
+    };
 }
 
 function createToken(
@@ -381,6 +444,21 @@ function assertScopedNotFound(response: ResponseData): void {
     assert.equal(
         response.body.reason_code,
         'blocked_unknown_source_mapping',
+    );
+}
+
+function assertNotScopedNotFound(
+    response: ResponseData,
+    context: string,
+): void {
+    const isScopedNotFound = response.status === 404 &&
+        response.body.error === 'not_found' &&
+        response.body.reason_code === 'blocked_unknown_source_mapping';
+
+    assert.equal(
+        isScopedNotFound,
+        false,
+        `${context} returned scoped not_found for a valid in-scope job`,
     );
 }
 
@@ -2447,6 +2525,256 @@ test('evidence endpoints return signed verified export payload after terminal ex
     }
 });
 
+test(
+    'cross-instance terminal execute/evidence flow stays consistent',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const token = createToken(signingKey);
+        const db = newDb();
+
+        db.public.none('CREATE SCHEMA IF NOT EXISTS rez_restore_index');
+
+        const instanceAState = createPostgresBackedStateStores(db);
+        const instanceBState = createPostgresBackedStateStores(db);
+        const serverA = createService(signingKey, {
+            executeConfig: {
+                maxChunksPerAttempt: 1,
+                elevatedSkipRatioPercent: 100,
+            },
+            stateStores: instanceAState.stores,
+        });
+        const serverB = createService(signingKey, {
+            executeConfig: {
+                maxChunksPerAttempt: 1,
+                elevatedSkipRatioPercent: 100,
+            },
+            stateStores: instanceBState.stores,
+        });
+        const baseUrlA = await listen(serverA);
+        const baseUrlB = await listen(serverB);
+
+        try {
+            const fixture = await createPlanAndJob(
+                baseUrlA,
+                token,
+                'plan-cross-instance-terminal-evidence',
+            );
+            const jobPath = `/v1/jobs/${encodeURIComponent(fixture.jobId)}`;
+
+            const jobFromA = await getJson(
+                baseUrlA,
+                jobPath,
+                token,
+            );
+            const jobFromB = await getJson(
+                baseUrlB,
+                jobPath,
+                token,
+            );
+
+            assertNotScopedNotFound(jobFromA, 'instance A job read');
+            assertNotScopedNotFound(jobFromB, 'instance B job read');
+            assert.equal(jobFromA.status, 200);
+            assert.equal(jobFromB.status, 200);
+
+            const executeFromB = await postJson(
+                baseUrlB,
+                `${jobPath}/execution`,
+                token,
+                createExecutePayload({
+                    capabilities: ['restore_execute'],
+                    chunkSize: 1,
+                }),
+            );
+
+            assert.equal(executeFromB.status, 202);
+            const pausedExecutionFromB = executeFromB.body.execution as Record<
+                string,
+                unknown
+            >;
+
+            assert.equal(pausedExecutionFromB.status, 'paused');
+            const pausedPlanChecksum =
+                pausedExecutionFromB.plan_checksum as string;
+            const pausedPreconditionChecksum =
+                pausedExecutionFromB.precondition_checksum as string;
+
+            assert.equal(typeof pausedPlanChecksum, 'string');
+            assert.equal(pausedPlanChecksum.length, 64);
+            assert.equal(typeof pausedPreconditionChecksum, 'string');
+            assert.equal(pausedPreconditionChecksum.length, 64);
+
+            const executionFromA = await getJson(
+                baseUrlA,
+                `${jobPath}/execution`,
+                token,
+            );
+            const executionFromB = await getJson(
+                baseUrlB,
+                `${jobPath}/execution`,
+                token,
+            );
+
+            assertNotScopedNotFound(executionFromA, 'instance A execution read');
+            assertNotScopedNotFound(executionFromB, 'instance B execution read');
+            assert.equal(executionFromA.status, 200);
+            assert.equal(executionFromB.status, 200);
+            assert.equal(
+                (executionFromA.body.execution as Record<string, unknown>).status,
+                'paused',
+            );
+            assert.equal(
+                (executionFromB.body.execution as Record<string, unknown>).status,
+                'paused',
+            );
+
+            const resumeFromA = await postJson(
+                baseUrlA,
+                `${jobPath}/resume`,
+                token,
+                {
+                    operator_id: 'operator@example.com',
+                    operator_capabilities: ['restore_execute'],
+                    expected_plan_checksum: pausedPlanChecksum,
+                    expected_precondition_checksum: pausedPreconditionChecksum,
+                },
+            );
+
+            assert.equal(resumeFromA.status, 200);
+            const resumedExecution = resumeFromA.body.execution as Record<
+                string,
+                unknown
+            >;
+            const resumedSummary = resumedExecution.summary as Record<
+                string,
+                unknown
+            >;
+
+            assert.equal(resumedExecution.status, 'completed');
+            assert.equal(resumedSummary.applied_rows, 2);
+
+            const executionFromAFinal = await getJson(
+                baseUrlA,
+                `${jobPath}/execution`,
+                token,
+            );
+            const executionFromBFinal = await getJson(
+                baseUrlB,
+                `${jobPath}/execution`,
+                token,
+            );
+
+            assertNotScopedNotFound(
+                executionFromAFinal,
+                'instance A final execution read',
+            );
+            assertNotScopedNotFound(
+                executionFromBFinal,
+                'instance B final execution read',
+            );
+            assert.equal(executionFromAFinal.status, 200);
+            assert.equal(executionFromBFinal.status, 200);
+            assert.equal(
+                (
+                    executionFromAFinal.body.execution as Record<string, unknown>
+                ).status,
+                'completed',
+            );
+            assert.equal(
+                (
+                    executionFromBFinal.body.execution as Record<string, unknown>
+                ).status,
+                'completed',
+            );
+
+            const evidenceExportFromB = await postJson(
+                baseUrlB,
+                `${jobPath}/evidence/export`,
+                token,
+                {},
+            );
+
+            assert.equal(evidenceExportFromB.status, 200);
+            const exportedEvidence = evidenceExportFromB.body.evidence as Record<
+                string,
+                unknown
+            >;
+            const exportVerification =
+                evidenceExportFromB.body.verification as Record<
+                    string,
+                    unknown
+                >;
+
+            assert.equal(typeof exportedEvidence.evidence_id, 'string');
+            assert.equal(typeof exportedEvidence.plan_hash, 'string');
+            assert.equal(typeof exportedEvidence.report_hash, 'string');
+            assert.equal((exportedEvidence.plan_hash as string).length, 64);
+            assert.equal((exportedEvidence.report_hash as string).length, 64);
+            assert.equal(exportVerification.signature_verification, 'verified');
+            assert.equal(exportVerification.reason_code, 'none');
+
+            const evidenceFromA = await getJson(
+                baseUrlA,
+                `${jobPath}/evidence`,
+                token,
+            );
+            const evidenceFromB = await getJson(
+                baseUrlB,
+                `${jobPath}/evidence`,
+                token,
+            );
+
+            assertNotScopedNotFound(evidenceFromA, 'instance A evidence read');
+            assertNotScopedNotFound(evidenceFromB, 'instance B evidence read');
+            assert.equal(evidenceFromA.status, 200);
+            assert.equal(evidenceFromB.status, 200);
+
+            const evidenceRecordA = evidenceFromA.body.evidence as Record<
+                string,
+                unknown
+            >;
+            const evidenceRecordB = evidenceFromB.body.evidence as Record<
+                string,
+                unknown
+            >;
+            const verificationFromA = evidenceFromA.body.verification as Record<
+                string,
+                unknown
+            >;
+            const verificationFromB = evidenceFromB.body.verification as Record<
+                string,
+                unknown
+            >;
+
+            assert.equal(
+                evidenceRecordA.evidence_id,
+                evidenceRecordB.evidence_id,
+            );
+            assert.equal(
+                evidenceRecordA.evidence_id,
+                exportedEvidence.evidence_id,
+            );
+            assert.equal(typeof evidenceRecordA.plan_hash, 'string');
+            assert.equal(typeof evidenceRecordA.report_hash, 'string');
+            assert.equal(typeof evidenceRecordB.plan_hash, 'string');
+            assert.equal(typeof evidenceRecordB.report_hash, 'string');
+            assert.equal((evidenceRecordA.plan_hash as string).length, 64);
+            assert.equal((evidenceRecordA.report_hash as string).length, 64);
+            assert.equal((evidenceRecordB.plan_hash as string).length, 64);
+            assert.equal((evidenceRecordB.report_hash as string).length, 64);
+            assert.equal(verificationFromA.signature_verification, 'verified');
+            assert.equal(verificationFromB.signature_verification, 'verified');
+            assert.equal(verificationFromA.reason_code, 'none');
+            assert.equal(verificationFromB.reason_code, 'none');
+        } finally {
+            await closeServer(serverA);
+            await closeServer(serverB);
+            await instanceAState.pool.end();
+            await instanceBState.pool.end();
+        }
+    },
+);
+
 test('admin ops endpoints require admin token when configured', async () => {
     const signingKey = 'test-signing-key';
     const server = createService(signingKey, {
@@ -2472,6 +2800,29 @@ test('admin ops endpoints require admin token when configured', async () => {
         assert.equal(wrongToken.status, 403);
         assert.equal(wrongToken.body.reason_code, 'admin_auth_required');
 
+        const reconcileUnauthorized = await postAdminJson(
+            baseUrl,
+            '/v1/admin/ops/queue/reconcile',
+            {},
+        );
+        assert.equal(reconcileUnauthorized.status, 403);
+        assert.equal(
+            reconcileUnauthorized.body.reason_code,
+            'admin_auth_required',
+        );
+
+        const reconcileWrongToken = await postAdminJson(
+            baseUrl,
+            '/v1/admin/ops/queue/reconcile',
+            {},
+            'wrong-admin-token',
+        );
+        assert.equal(reconcileWrongToken.status, 403);
+        assert.equal(
+            reconcileWrongToken.body.reason_code,
+            'admin_auth_required',
+        );
+
         const authorized = await getAdminJson(
             baseUrl,
             '/v1/admin/ops/overview',
@@ -2488,6 +2839,101 @@ test('admin ops endpoints require admin token when configured', async () => {
         await closeServer(server);
     }
 });
+
+test(
+    'admin queue reconcile/reset endpoints validate scope and apply reset',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const adminToken = 'admin-secret';
+        const server = createService(signingKey, {
+            adminToken,
+        });
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+
+        try {
+            const firstPlan = await createPlanAndJob(
+                baseUrl,
+                token,
+                'admin-plan-reset-01',
+            );
+            const secondPlan = await createPlanAndJob(
+                baseUrl,
+                token,
+                'admin-plan-reset-02',
+            );
+
+            const reconcileInvalid = await postAdminJson(
+                baseUrl,
+                '/v1/admin/ops/queue/reconcile',
+                {
+                    force_stale_status: 'failed',
+                },
+                adminToken,
+            );
+            assert.equal(reconcileInvalid.status, 400);
+            assert.equal(reconcileInvalid.body.error, 'invalid_request');
+
+            const resetMissingScope = await postAdminJson(
+                baseUrl,
+                '/v1/admin/ops/queue/reset',
+                {
+                    stale_after_ms: 0,
+                    dry_run: false,
+                },
+                adminToken,
+            );
+            assert.equal(resetMissingScope.status, 400);
+            assert.equal(resetMissingScope.body.error, 'invalid_request');
+
+            const reset = await postAdminJson(
+                baseUrl,
+                '/v1/admin/ops/queue/reset',
+                {
+                    stale_after_ms: 0,
+                    dry_run: false,
+                    scope: {
+                        tenant_id: 'tenant-acme',
+                        instance_id: 'sn-dev-01',
+                        source: 'sn://acme-dev.service-now.com',
+                        lock_scope_tables: ['incident'],
+                    },
+                },
+                adminToken,
+            );
+            assert.equal(reset.status, 200);
+            assert.equal(reset.body.applied, true);
+            const forcedTransitions = reset.body.forced_transitions as Array<
+                Record<string, unknown>
+            >;
+            assert.ok(forcedTransitions.length >= 1);
+            for (const transition of forcedTransitions) {
+                assert.equal(transition.to_status, 'failed');
+                assert.equal(
+                    transition.reason_code,
+                    'failed_internal_error',
+                );
+                const forcedJobId = transition.job_id as string;
+                const forcedJob = await getJson(
+                    baseUrl,
+                    `/v1/jobs/${forcedJobId}`,
+                    token,
+                );
+                assert.equal(forcedJob.status, 200);
+                const jobRecord = forcedJob.body.job as Record<string, unknown>;
+                assert.equal(jobRecord.status, 'failed');
+                assert.equal(
+                    jobRecord.status_reason_code,
+                    'failed_internal_error',
+                );
+            }
+            assert.equal(typeof firstPlan.jobId, 'string');
+            assert.equal(typeof secondPlan.jobId, 'string');
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
 
 test('admin ops freshness returns explicit ACP dependency outage details', async () => {
     const signingKey = 'test-signing-key';

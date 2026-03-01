@@ -129,6 +129,14 @@ export class PostgresSnapshotStore<T> {
     async read(): Promise<T> {
         await this.ready;
 
+        const row = await this.selectSnapshot();
+
+        if (!row) {
+            throw new Error('failed to load persisted restore snapshot state');
+        }
+
+        this.state = this.parseState(row.state_json);
+
         return cloneValue(this.state);
     }
 

@@ -17,7 +17,6 @@ import { RestoreDryRunPlanRecord } from '../plans/models';
 import { RestorePlanService } from '../plans/plan-service';
 import {
     InMemoryRestoreEvidenceStateStore,
-    RestoreEvidenceState,
     RestoreEvidenceStateStore,
 } from './evidence-state-store';
 import {
@@ -211,15 +210,7 @@ function buildEvidenceId(
 }
 
 export class RestoreEvidenceService {
-    private readonly byJobId = new Map<string, EvidenceExportRecord>();
-
-    private readonly byEvidenceId = new Map<string, EvidenceExportRecord>();
-
     private readonly signer: EvidenceSigner;
-
-    private initialized = false;
-
-    private initializationPromise: Promise<void> | null = null;
 
     constructor(
         private readonly jobs: RestoreJobService,
@@ -234,9 +225,7 @@ export class RestoreEvidenceService {
     }
 
     async exportEvidence(jobId: string): Promise<ExportEvidenceResult> {
-        await this.ensureInitialized();
-
-        const existing = this.byJobId.get(jobId);
+        const existing = await this.getEvidenceRecordByJobId(jobId);
 
         if (existing) {
             return {
@@ -457,35 +446,19 @@ export class RestoreEvidenceService {
     }
 
     async getEvidence(jobId: string): Promise<EvidenceExportRecord | null> {
-        await this.ensureInitialized();
-
-        const existing = this.byJobId.get(jobId);
-
-        if (!existing) {
-            return null;
-        }
-
-        return cloneRecord(existing);
+        return this.getEvidenceRecordByJobId(jobId);
     }
 
     async getEvidenceById(
         evidenceId: string,
     ): Promise<EvidenceExportRecord | null> {
-        await this.ensureInitialized();
-
-        const existing = this.byEvidenceId.get(evidenceId);
-
-        if (!existing) {
-            return null;
-        }
-
-        return cloneRecord(existing);
+        return this.getEvidenceRecordByEvidenceId(evidenceId);
     }
 
     async listEvidence(): Promise<EvidenceExportRecord[]> {
-        await this.ensureInitialized();
+        const state = await this.stateStore.read();
 
-        return Array.from(this.byJobId.values())
+        return Object.values(state.by_job_id)
             .map((record) => cloneRecord(record))
             .sort((left, right) => {
                 return left.generated_at.localeCompare(right.generated_at);
@@ -496,50 +469,23 @@ export class RestoreEvidenceService {
         jobId: string,
         record: EvidenceExportRecord,
     ): Promise<void> {
-        const clonedForMemory = cloneRecord(record);
-        const clonedForIndex = cloneRecord(record);
-        await this.persistStateWithPending(jobId, record);
-        this.byJobId.set(jobId, clonedForMemory);
-        this.byEvidenceId.set(
-            record.evidence.evidence_id,
-            clonedForIndex,
-        );
-    }
-
-    private async persistStateWithPending(
-        jobId: string,
-        pending: EvidenceExportRecord,
-    ): Promise<void> {
-        const snapshot = this.snapshotState();
-        snapshot.by_job_id[jobId] = cloneRecord(pending);
-        snapshot.by_evidence_id[pending.evidence.evidence_id] =
-            cloneRecord(pending);
-
         await this.stateStore.mutate((state) => {
-            state.by_job_id = snapshot.by_job_id;
-            state.by_evidence_id = snapshot.by_evidence_id;
+            const existing = state.by_job_id[jobId];
+            const nextEvidenceId = record.evidence.evidence_id;
+
+            if (
+                existing &&
+                existing.evidence.evidence_id !== nextEvidenceId
+            ) {
+                delete state.by_evidence_id[
+                    existing.evidence.evidence_id
+                ];
+            }
+
+            state.by_job_id[jobId] = cloneRecord(record);
+            state.by_evidence_id[nextEvidenceId] =
+                cloneRecord(record);
         });
-    }
-
-    private snapshotState(): RestoreEvidenceState {
-        const byJobId: Record<string, EvidenceExportRecord> = {};
-
-        for (const [jobId, record] of this.byJobId.entries()) {
-            byJobId[jobId] = record;
-        }
-
-        const byEvidenceId: Record<string, EvidenceExportRecord> = {};
-
-        for (const [evidenceId, record] of this.byEvidenceId.entries()) {
-            byEvidenceId[evidenceId] = record;
-        }
-
-        return JSON.parse(
-            JSON.stringify({
-                by_job_id: byJobId,
-                by_evidence_id: byEvidenceId,
-            }),
-        ) as RestoreEvidenceState;
     }
 
     validateEvidenceRecord(
@@ -618,29 +564,29 @@ export class RestoreEvidenceService {
         };
     }
 
-    private async ensureInitialized(): Promise<void> {
-        if (this.initialized) {
-            return;
+    private async getEvidenceRecordByJobId(
+        jobId: string,
+    ): Promise<EvidenceExportRecord | null> {
+        const state = await this.stateStore.read();
+        const existing = state.by_job_id[jobId];
+
+        if (!existing) {
+            return null;
         }
 
-        if (!this.initializationPromise) {
-            this.initializationPromise = this.initialize();
-        }
-
-        await this.initializationPromise;
+        return cloneRecord(existing);
     }
 
-    private async initialize(): Promise<void> {
+    private async getEvidenceRecordByEvidenceId(
+        evidenceId: string,
+    ): Promise<EvidenceExportRecord | null> {
         const state = await this.stateStore.read();
+        const existing = state.by_evidence_id[evidenceId];
 
-        for (const [jobId, record] of Object.entries(state.by_job_id)) {
-            this.byJobId.set(jobId, record);
+        if (!existing) {
+            return null;
         }
 
-        for (const [evidenceId, record] of Object.entries(state.by_evidence_id)) {
-            this.byEvidenceId.set(evidenceId, record);
-        }
-
-        this.initialized = true;
+        return cloneRecord(existing);
     }
 }
