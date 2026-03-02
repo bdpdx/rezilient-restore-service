@@ -145,6 +145,8 @@ async function main(): Promise<void> {
     }, {
         adminToken: env.adminToken,
         maxJsonBodyBytes: env.maxJsonBodyBytes,
+        executePreflightReconcileStaleAfterMs:
+            env.executePreflightReconcileStaleAfterMs,
     });
 
     await new Promise<void>((resolve) => {
@@ -158,6 +160,8 @@ async function main(): Promise<void> {
         execute_max_rows: env.executeMaxRows,
         execute_skip_ratio_percent: env.executeElevatedSkipRatioPercent,
         execute_max_chunks_per_attempt: env.executeMaxChunksPerAttempt,
+        execute_preflight_reconcile_stale_after_ms:
+            env.executePreflightReconcileStaleAfterMs,
         media_chunk_size: env.executeMediaChunkSize,
         media_max_items: env.executeMediaMaxItems,
         media_max_bytes: env.executeMediaMaxBytes,

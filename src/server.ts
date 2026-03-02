@@ -36,9 +36,15 @@ export interface RestoreServiceDependencies {
 export interface RestoreServiceServerOptions {
     adminToken?: string;
     maxJsonBodyBytes?: number;
+    executePreflightReconcileStaleAfterMs?: number;
 }
 
 const DEFAULT_MAX_JSON_BODY_BYTES = 1_048_576;
+const DEFAULT_EXECUTE_PREFLIGHT_RECONCILE_STALE_AFTER_MS =
+    900_000;
+const EXECUTE_PREFLIGHT_FORCE_STALE_STATUS: 'failed' = 'failed';
+const EXECUTE_PREFLIGHT_FORCE_REASON_CODE: RestoreReasonCode =
+    'failed_stale_lock_recovered';
 
 class RequestBodyTooLargeError extends Error {
     constructor(public readonly maxBytes: number) {
@@ -404,6 +410,9 @@ export function createRestoreServiceServer(
 ): Server {
     const maxJsonBodyBytes = options?.maxJsonBodyBytes ||
         DEFAULT_MAX_JSON_BODY_BYTES;
+    const executePreflightReconcileStaleAfterMs =
+        options?.executePreflightReconcileStaleAfterMs
+        ?? DEFAULT_EXECUTE_PREFLIGHT_RECONCILE_STALE_AFTER_MS;
 
     return createServer(async (request, response) => {
         try {
@@ -1222,6 +1231,11 @@ export function createRestoreServiceServer(
                     await deps.jobs.reconcileQueueLocks({
                         dry_run: false,
                         scope: queueScopeFromJob(job),
+                        stale_after_ms: executePreflightReconcileStaleAfterMs,
+                        force_stale_status:
+                            EXECUTE_PREFLIGHT_FORCE_STALE_STATUS,
+                        force_reason_code:
+                            EXECUTE_PREFLIGHT_FORCE_REASON_CODE,
                     });
 
                     const body = await readJsonBody(request, maxJsonBodyBytes);

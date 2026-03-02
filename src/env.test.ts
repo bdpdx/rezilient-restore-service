@@ -56,6 +56,10 @@ describe('parseRestoreServiceEnv', () => {
             20,
         );
         assert.equal(result.executeMaxChunksPerAttempt, 0);
+        assert.equal(
+            result.executePreflightReconcileStaleAfterMs,
+            900000,
+        );
         assert.equal(result.executeMediaChunkSize, 25);
         assert.equal(result.executeMediaMaxItems, 1000);
         assert.equal(result.executeMediaMaxBytes, 104857600);
@@ -197,6 +201,15 @@ describe('parseStrictPositiveInteger (indirect)', () => {
             /RRS_ACP_REQUEST_TIMEOUT_MS must be greater than zero/,
         );
     });
+
+    test('rejects zero execute preflight reconcile stale cutoff', () => {
+        const env = buildValidEnv();
+        env.RRS_EXECUTE_PREFLIGHT_RECONCILE_STALE_AFTER_MS = '0';
+        assert.throws(
+            () => parseRestoreServiceEnv(env),
+            /RRS_EXECUTE_PREFLIGHT_RECONCILE_STALE_AFTER_MS/,
+        );
+    });
 });
 
 describe('parsePercentage (indirect)', () => {
@@ -277,6 +290,10 @@ describe('all numeric defaults are correct', () => {
             20,
         );
         assert.equal(result.executeMaxChunksPerAttempt, 0);
+        assert.equal(
+            result.executePreflightReconcileStaleAfterMs,
+            900000,
+        );
         assert.equal(result.authClockSkewSeconds, 30);
         assert.equal(result.maxJsonBodyBytes, 1048576);
         assert.equal(result.restoreIndexStaleAfterSeconds, 120);

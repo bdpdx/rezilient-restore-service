@@ -97,6 +97,15 @@ describe('ExecuteRuntimeConflictInputSchema', () => {
             });
         assert.equal(result.success, false);
     });
+
+    test('accepts failed_stale_lock_recovered reason code', () => {
+        const result =
+            ExecuteRuntimeConflictInputSchema.safeParse({
+                ...buildValidConflict(),
+                reason_code: 'failed_stale_lock_recovered',
+            });
+        assert.equal(result.success, true);
+    });
 });
 
 describe('ExecuteWorkflowInputSchema', () => {

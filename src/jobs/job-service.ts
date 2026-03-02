@@ -120,6 +120,10 @@ function jobStaleTimestamp(job: RestoreJobRecord): number | null {
     return asEpochMillis(job.requested_at);
 }
 
+function isLockHoldingStatus(status: RestoreJobStatus): boolean {
+    return status === 'running' || status === 'paused';
+}
+
 function compareByRequestedAt(left: RestoreJobRecord, right: RestoreJobRecord): number {
     const byRequestedAt = left.requested_at.localeCompare(right.requested_at);
 
@@ -820,14 +824,13 @@ export class RestoreJobService {
         );
         const activeBlockingJobIds = new Set(
             allJobs
-                .filter((job) => {
-                    return job.status === 'running' || job.status === 'paused';
-                })
+                .filter((job) => isLockHoldingStatus(job.status))
                 .map((job) => job.job_id),
         );
         const persistedLockManager = new RestoreLockManager(state.lock_state);
         const anomalies: QueueReconcileAnomaly[] = [];
         const staleJobIds = new Set<string>();
+        const staleForceCandidateJobIds = new Set<string>();
 
         for (const job of nonTerminalInScope) {
             const inRunning = persistedRunning.has(job.job_id);
@@ -906,6 +909,11 @@ export class RestoreJobService {
             }
 
             staleJobIds.add(job.job_id);
+
+            if (isLockHoldingStatus(job.status)) {
+                staleForceCandidateJobIds.add(job.job_id);
+            }
+
             anomalies.push({
                 code: 'stale_non_terminal_job',
                 job_id: job.job_id,
@@ -921,11 +929,12 @@ export class RestoreJobService {
 
         const forcedTransitions: QueueReconcileForcedTransition[] = [];
         const forceStatus = request.force_stale_status;
-        const forceReason = request.force_reason_code || 'failed_internal_error';
+        const forceReason = request.force_reason_code
+            || 'failed_stale_lock_recovered';
 
         if (forceStatus) {
             for (const job of nonTerminalInScope) {
-                if (!staleJobIds.has(job.job_id)) {
+                if (!staleForceCandidateJobIds.has(job.job_id)) {
                     continue;
                 }
 

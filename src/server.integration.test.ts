@@ -215,6 +215,7 @@ function createService(
         sourceMappingResolver?: SourceMappingResolver;
         sourceMappingListProvider?: SourceMappingListProvider;
         stateStores?: ServiceStateStores;
+        executePreflightReconcileStaleAfterMs?: number;
     },
 ): Server {
     const sourceRegistry = new SourceRegistry([
@@ -317,6 +318,8 @@ function createService(
     }, {
         adminToken: options?.adminToken,
         maxJsonBodyBytes: options?.bodyMaxBytes,
+        executePreflightReconcileStaleAfterMs:
+            options?.executePreflightReconcileStaleAfterMs,
     });
 }
 
@@ -748,14 +751,7 @@ async function hasReconcilePromotionEvent(
     token: string,
     jobId: string,
 ): Promise<boolean> {
-    const eventsResponse = await getJson(
-        baseUrl,
-        `/v1/jobs/${encodeURIComponent(jobId)}/events`,
-        token,
-    );
-
-    assert.equal(eventsResponse.status, 200);
-    const events = eventsResponse.body.events as Array<Record<string, unknown>>;
+    const events = await listJobEvents(baseUrl, token, jobId);
 
     for (const event of events) {
         if (event.event_type !== 'job_started') {
@@ -770,6 +766,22 @@ async function hasReconcilePromotionEvent(
     }
 
     return false;
+}
+
+async function listJobEvents(
+    baseUrl: string,
+    token: string,
+    jobId: string,
+): Promise<Array<Record<string, unknown>>> {
+    const eventsResponse = await getJson(
+        baseUrl,
+        `/v1/jobs/${encodeURIComponent(jobId)}/events`,
+        token,
+    );
+
+    assert.equal(eventsResponse.status, 200);
+
+    return eventsResponse.body.events as Array<Record<string, unknown>>;
 }
 
 test('valid scoped token and ACP mapping can create restore job', async () => {
@@ -2965,34 +2977,25 @@ test(
 );
 
 test(
-    'execute route reconcile promotes queued job when stale blocker lock is orphaned',
+    'execute route reconcile force-terminals stale blocker and promotes queued job',
     async () => {
         const signingKey = 'test-signing-key';
-        const db = newDb();
-
-        db.public.none('CREATE SCHEMA IF NOT EXISTS rez_restore_index');
-
-        const state = createPostgresBackedStateStores(db);
         const server = createService(signingKey, {
-            stateStores: state.stores,
+            executePreflightReconcileStaleAfterMs: 0,
         });
         const baseUrl = await listen(server);
         const token = createToken(signingKey);
 
         try {
-            if (!state.stores.jobs) {
-                throw new Error('job state store fixture was not created');
-            }
-
             const running = await createPlanAndJob(
                 baseUrl,
                 token,
-                'exec-reconcile-orphan-running',
+                'exec-reconcile-stale-running',
             );
             const queued = await createPlanAndJob(
                 baseUrl,
                 token,
-                'exec-reconcile-orphan-queued',
+                'exec-reconcile-stale-queued',
             );
 
             const queuedBefore = await getJson(
@@ -3006,25 +3009,10 @@ test(
                 unknown
             >;
             assert.equal(queuedBeforeJob.status, 'queued');
-
-            await state.stores.jobs.mutate((jobState) => {
-                const staleRunning = jobState.jobs_by_id[running.jobId];
-
-                if (!staleRunning) {
-                    throw new Error('expected running job fixture to exist');
-                }
-
-                jobState.jobs_by_id[running.jobId] = {
-                    ...staleRunning,
-                    status: 'failed',
-                    status_reason_code: 'failed_internal_error',
-                    queue_position: null,
-                    wait_reason_code: null,
-                    wait_tables: [],
-                    completed_at: FIXED_NOW.toISOString(),
-                    updated_at: FIXED_NOW.toISOString(),
-                };
-            });
+            assert.equal(
+                queuedBeforeJob.wait_reason_code,
+                'queued_scope_lock',
+            );
 
             const execute = await postJson(
                 baseUrl,
@@ -3038,9 +3026,94 @@ test(
                 await hasReconcilePromotionEvent(baseUrl, token, queued.jobId),
                 true,
             );
+
+            const staleAfter = await getJson(
+                baseUrl,
+                `/v1/jobs/${running.jobId}`,
+                token,
+            );
+
+            assert.equal(staleAfter.status, 200);
+            const staleAfterJob = staleAfter.body.job as Record<string, unknown>;
+            assert.equal(staleAfterJob.status, 'failed');
+            assert.equal(
+                staleAfterJob.status_reason_code,
+                'failed_stale_lock_recovered',
+            );
+
+            const queuedAfter = await getJson(
+                baseUrl,
+                `/v1/jobs/${queued.jobId}`,
+                token,
+            );
+            assert.equal(queuedAfter.status, 200);
+            const queuedAfterJob = queuedAfter.body.job as Record<
+                string,
+                unknown
+            >;
+            assert.notEqual(queuedAfterJob.status, 'queued');
+            assert.equal(queuedAfterJob.wait_reason_code, null);
+
+            const staleEvents = await listJobEvents(
+                baseUrl,
+                token,
+                running.jobId,
+            );
+            const staleForcedEvent = staleEvents.find((event) => {
+                if (event.event_type !== 'job_failed') {
+                    return false;
+                }
+
+                const details = event.details as Record<string, unknown> | null;
+
+                if (!details) {
+                    return false;
+                }
+
+                return details.reconcile_forced_terminal === true;
+            });
+
+            assert.notEqual(staleForcedEvent, undefined);
+
+            if (staleForcedEvent) {
+                const details = staleForcedEvent.details as Record<
+                    string,
+                    unknown
+                >;
+
+                assert.equal(
+                    staleForcedEvent.reason_code,
+                    'failed_stale_lock_recovered',
+                );
+                assert.equal(details.reconcile_forced_terminal, true);
+                assert.equal(details.stale_cutoff_at, FIXED_NOW.toISOString());
+            }
+
+            const queuedEvents = await listJobEvents(
+                baseUrl,
+                token,
+                queued.jobId,
+            );
+            const queuedReconcileStart = queuedEvents.find((event) => {
+                if (event.event_type !== 'job_started') {
+                    return false;
+                }
+
+                const details = event.details as Record<string, unknown> | null;
+
+                if (!details) {
+                    return false;
+                }
+
+                return (
+                    details.promoted_from_queue === true
+                    && details.reconcile_operation === true
+                );
+            });
+
+            assert.notEqual(queuedReconcileStart, undefined);
         } finally {
             await closeServer(server);
-            await state.pool.end();
         }
     },
 );
@@ -3178,6 +3251,43 @@ test(
                 await hasReconcilePromotionEvent(baseUrl, token, queued.jobId),
                 false,
             );
+
+            const runningAfter = await getJson(
+                baseUrl,
+                `/v1/jobs/${running.jobId}`,
+                token,
+            );
+            assert.equal(runningAfter.status, 200);
+            const runningAfterJob = runningAfter.body.job as Record<
+                string,
+                unknown
+            >;
+            assert.equal(runningAfterJob.status, 'running');
+
+            const runningEvents = await listJobEvents(
+                baseUrl,
+                token,
+                running.jobId,
+            );
+            const hasForcedTerminalEvent = runningEvents.some((event) => {
+                if (
+                    event.event_type !== 'job_failed'
+                    && event.event_type !== 'job_completed'
+                    && event.event_type !== 'job_cancelled'
+                ) {
+                    return false;
+                }
+
+                const details = event.details as Record<string, unknown> | null;
+
+                if (!details) {
+                    return false;
+                }
+
+                return details.reconcile_forced_terminal === true;
+            });
+
+            assert.equal(hasForcedTerminalEvent, false);
             assert.equal(typeof running.jobId, 'string');
         } finally {
             await closeServer(server);

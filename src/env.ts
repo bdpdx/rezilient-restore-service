@@ -11,6 +11,7 @@ export interface RestoreServiceEnv {
     executeMaxRows: number;
     executeElevatedSkipRatioPercent: number;
     executeMaxChunksPerAttempt: number;
+    executePreflightReconcileStaleAfterMs: number;
     executeMediaChunkSize: number;
     executeMediaMaxItems: number;
     executeMediaMaxBytes: number;
@@ -207,6 +208,11 @@ export function parseRestoreServiceEnv(
             env.RRS_EXECUTE_MAX_CHUNKS_PER_ATTEMPT,
             'RRS_EXECUTE_MAX_CHUNKS_PER_ATTEMPT',
             0,
+        ),
+        executePreflightReconcileStaleAfterMs: parseStrictPositiveInteger(
+            env.RRS_EXECUTE_PREFLIGHT_RECONCILE_STALE_AFTER_MS,
+            'RRS_EXECUTE_PREFLIGHT_RECONCILE_STALE_AFTER_MS',
+            900000,
         ),
         executeMediaChunkSize: parseStrictPositiveInteger(
             env.RRS_MEDIA_CHUNK_SIZE,

@@ -36,6 +36,7 @@ const RESTORE_REASON_CODES = [
     'failed_evidence_signature_verification',
     'failed_schema_conflict',
     'failed_permission_conflict',
+    'failed_stale_lock_recovered',
     'failed_internal_error',
 ] as const;
 

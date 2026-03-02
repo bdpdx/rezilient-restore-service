@@ -176,6 +176,7 @@ describe('reason codes', () => {
             'failed_evidence_signature_verification',
             'failed_schema_conflict',
             'failed_permission_conflict',
+            'failed_stale_lock_recovered',
             'failed_internal_error',
         ];
         const uniqueSet = new Set(reasonCodes);
@@ -184,6 +185,6 @@ describe('reason codes', () => {
             reasonCodes.length,
             'all reason codes must be unique',
         );
-        assert.ok(reasonCodes.length >= 27);
+        assert.ok(reasonCodes.length >= 28);
     });
 });
