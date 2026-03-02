@@ -307,6 +307,53 @@ function matchesScope(
     return false;
 }
 
+function normalizeLockEntrySource(
+    source: string | undefined,
+    fallbackSource: string | undefined,
+): string {
+    const primary = source?.trim() || '';
+
+    if (primary.length > 0) {
+        return primary;
+    }
+
+    return fallbackSource?.trim() || '';
+}
+
+function hydrateLockEntrySource(
+    entry: RestoreLockManagerState['running_jobs'][number],
+    jobsById: Record<string, RestoreJobRecord>,
+): RestoreLockManagerState['running_jobs'][number] {
+    const fallbackSource = jobsById[entry.jobId]?.source;
+    const source = normalizeLockEntrySource(entry.source, fallbackSource);
+    const hydrated = {
+        ...entry,
+        tables: [...entry.tables],
+    };
+
+    if (source.length > 0) {
+        hydrated.source = source;
+    } else {
+        delete hydrated.source;
+    }
+
+    return hydrated;
+}
+
+function hydrateLockStateSources(
+    lockState: RestoreLockManagerState,
+    jobsById: Record<string, RestoreJobRecord>,
+): RestoreLockManagerState {
+    return {
+        running_jobs: lockState.running_jobs.map((entry) =>
+            hydrateLockEntrySource(entry, jobsById)
+        ),
+        queued_jobs: lockState.queued_jobs.map((entry) =>
+            hydrateLockEntrySource(entry, jobsById)
+        ),
+    };
+}
+
 export class RestoreJobService {
     private initialized = false;
 
@@ -412,6 +459,7 @@ export class RestoreJobService {
                 jobId,
                 tenantId: request.tenant_id,
                 instanceId: request.instance_id,
+                source: request.source,
                 tables: normalizedTables,
             });
             const jobStatus: RestoreJobStatus = lockDecision.state === 'running'
@@ -803,6 +851,7 @@ export class RestoreJobService {
                     const blockers = persistedLockManager.getBlockingLocks({
                         tenantId: job.tenant_id,
                         instanceId: job.instance_id,
+                        source: job.source,
                         tables: job.lock_scope_tables,
                     });
                     const activeBlockerIds = blockers.blockerJobIds.filter(
@@ -1138,6 +1187,7 @@ export class RestoreJobService {
                 jobId: job.job_id,
                 tenantId: job.tenant_id,
                 instanceId: job.instance_id,
+                source: job.source,
                 tables: normalizeTables(job.lock_scope_tables),
             });
 
@@ -1254,7 +1304,13 @@ export class RestoreJobService {
         mutator: (state: RestoreJobState) => T | Promise<T>,
     ): Promise<T> {
         return this.stateStore.mutate(async (state) => {
-            this.lockManager.loadState(state.lock_state);
+            const hydratedLockState = hydrateLockStateSources(
+                state.lock_state,
+                state.jobs_by_id,
+            );
+
+            state.lock_state = hydratedLockState;
+            this.lockManager.loadState(hydratedLockState);
             const result = await mutator(state);
 
             state.lock_state = this.lockManager.exportState();
@@ -1277,8 +1333,12 @@ export class RestoreJobService {
 
     private async initialize(): Promise<void> {
         const state = await this.stateStore.read();
+        const hydratedLockState = hydrateLockStateSources(
+            state.lock_state,
+            state.jobs_by_id,
+        );
 
-        this.lockManager.loadState(state.lock_state);
+        this.lockManager.loadState(hydratedLockState);
         this.initialized = true;
     }
 

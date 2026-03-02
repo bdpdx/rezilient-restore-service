@@ -88,6 +88,37 @@ test('non-overlapping scopes can run in parallel', async () => {
     assert.equal(snapshot.queued.length, 0);
 });
 
+test('same table can run in parallel when restore sources differ', async () => {
+    const locks = new RestoreLockManager();
+
+    const first = locks.acquire({
+        jobId: 'job-1',
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        tables: ['incident'],
+    });
+    const second = locks.acquire({
+        jobId: 'job-2',
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-prod.service-now.com',
+        tables: ['incident'],
+    });
+
+    assert.equal(first.state, 'running');
+    assert.equal(second.state, 'running');
+    assert.equal(second.reasonCode, 'none');
+
+    const snapshot = locks.snapshot();
+
+    assert.deepEqual(
+        snapshot.running.map((entry) => entry.jobId).sort(),
+        ['job-1', 'job-2'],
+    );
+    assert.equal(snapshot.queued.length, 0);
+});
+
 test('getBlockingLocks returns blocked tables and blocker job IDs', () => {
     const locks = new RestoreLockManager();
 

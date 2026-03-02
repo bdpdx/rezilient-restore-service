@@ -183,6 +183,63 @@ test('queued job is promoted after overlapping running job completes', async () 
     assert.equal(promoted?.queue_position, null);
 });
 
+test(
+    'createJob hydrates legacy lock state entries without source from job metadata',
+    async () => {
+        const stateStore = new InMemoryRestoreJobStateStore();
+        const service = new RestoreJobService(
+            new RestoreLockManager(),
+            new SourceRegistry([
+                {
+                    tenantId: 'tenant-acme',
+                    instanceId: 'sn-dev-01',
+                    source: 'sn://acme-dev.service-now.com',
+                },
+            ]),
+            now,
+            stateStore,
+        );
+        const running = await service.createJob(
+            baseRequest('plan-1', 'incident'),
+            claims(),
+        );
+
+        assert.equal(running.success, true);
+
+        if (!running.success) {
+            return;
+        }
+
+        await stateStore.mutate((state) => {
+            state.lock_state.running_jobs = state.lock_state.running_jobs.map(
+                (entry) => {
+                    const next = {
+                        ...entry,
+                    };
+
+                    delete next.source;
+
+                    return next;
+                },
+            );
+        });
+
+        const queued = await service.createJob(
+            baseRequest('plan-2', 'incident'),
+            claims(),
+        );
+
+        assert.equal(queued.success, true);
+
+        if (!queued.success) {
+            return;
+        }
+
+        assert.equal(queued.job.status, 'queued');
+        assert.equal(queued.job.wait_reason_code, 'queued_scope_lock');
+    },
+);
+
 test('running job can pause and resume without releasing scope lock', async () => {
     const service = new RestoreJobService(
         new RestoreLockManager(),

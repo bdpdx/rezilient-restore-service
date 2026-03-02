@@ -6,6 +6,7 @@ export interface LockRequest {
     jobId: string;
     tenantId: string;
     instanceId: string;
+    source?: string;
     tables: string[];
 }
 
@@ -35,6 +36,7 @@ export interface RestoreLockQueueEntry {
     jobId: string;
     tenantId: string;
     instanceId: string;
+    source?: string;
     tables: string[];
     reasonCode: RestoreReasonCode;
 }
@@ -44,7 +46,9 @@ export interface RestoreLockManagerState {
     queued_jobs: RestoreLockQueueEntry[];
 }
 
-type QueueEntry = RestoreLockQueueEntry;
+type QueueEntry = RestoreLockQueueEntry & {
+    source: string;
+};
 
 function normalizeTables(tables: string[]): string[] {
     const normalized = new Set<string>();
@@ -67,9 +71,14 @@ function normalizeTables(tables: string[]): string[] {
 function lockKey(
     tenantId: string,
     instanceId: string,
+    source: string,
     table: string,
 ): string {
-    return `${tenantId}|${instanceId}|${table}`;
+    return `${tenantId}|${instanceId}|${source}|${table}`;
+}
+
+function normalizeSource(source: string | undefined): string {
+    return source?.trim() || '';
 }
 
 function normalizeQueueEntry(entry: RestoreLockQueueEntry): QueueEntry {
@@ -83,6 +92,7 @@ function normalizeQueueEntry(entry: RestoreLockQueueEntry): QueueEntry {
         jobId: entry.jobId,
         tenantId: entry.tenantId,
         instanceId: entry.instanceId,
+        source: normalizeSource(entry.source),
         tables,
         reasonCode: entry.reasonCode,
     };
@@ -123,6 +133,7 @@ export class RestoreLockManager {
                 const key = lockKey(
                     normalized.tenantId,
                     normalized.instanceId,
+                    normalized.source,
                     table,
                 );
 
@@ -143,25 +154,42 @@ export class RestoreLockManager {
 
     exportState(): RestoreLockManagerState {
         return {
-            running_jobs: Array.from(this.runningJobs.values()).map((entry) => ({
-                jobId: entry.jobId,
-                tenantId: entry.tenantId,
-                instanceId: entry.instanceId,
-                tables: [...entry.tables],
-                reasonCode: entry.reasonCode,
-            })),
-            queued_jobs: this.queue.map((entry) => ({
-                jobId: entry.jobId,
-                tenantId: entry.tenantId,
-                instanceId: entry.instanceId,
-                tables: [...entry.tables],
-                reasonCode: entry.reasonCode,
-            })),
+            running_jobs: Array.from(this.runningJobs.values()).map((entry) => {
+                const exported: RestoreLockQueueEntry = {
+                    jobId: entry.jobId,
+                    tenantId: entry.tenantId,
+                    instanceId: entry.instanceId,
+                    tables: [...entry.tables],
+                    reasonCode: entry.reasonCode,
+                };
+
+                if (entry.source) {
+                    exported.source = entry.source;
+                }
+
+                return exported;
+            }),
+            queued_jobs: this.queue.map((entry) => {
+                const exported: RestoreLockQueueEntry = {
+                    jobId: entry.jobId,
+                    tenantId: entry.tenantId,
+                    instanceId: entry.instanceId,
+                    tables: [...entry.tables],
+                    reasonCode: entry.reasonCode,
+                };
+
+                if (entry.source) {
+                    exported.source = entry.source;
+                }
+
+                return exported;
+            }),
         };
     }
 
     acquire(request: LockRequest): LockDecision {
         const tables = normalizeTables(request.tables);
+        const source = normalizeSource(request.source);
 
         if (tables.length === 0) {
             throw new Error('lock request must include at least one table');
@@ -174,6 +202,7 @@ export class RestoreLockManager {
         const blockers = this.findBlockingLocks(
             request.tenantId,
             request.instanceId,
+            source,
             tables,
         );
         const blockedTables = blockers.blockedTables;
@@ -183,6 +212,7 @@ export class RestoreLockManager {
                 jobId: request.jobId,
                 tenantId: request.tenantId,
                 instanceId: request.instanceId,
+                source,
                 tables,
                 reasonCode: 'queued_scope_lock',
             };
@@ -201,6 +231,7 @@ export class RestoreLockManager {
             jobId: request.jobId,
             tenantId: request.tenantId,
             instanceId: request.instanceId,
+            source,
             tables,
             reasonCode: 'none',
         };
@@ -209,7 +240,7 @@ export class RestoreLockManager {
 
         for (const table of tables) {
             this.activeLocks.set(
-                lockKey(request.tenantId, request.instanceId, table),
+                lockKey(request.tenantId, request.instanceId, source, table),
                 request.jobId,
             );
         }
@@ -224,9 +255,11 @@ export class RestoreLockManager {
     getBlockingLocks(request: {
         tenantId: string;
         instanceId: string;
+        source?: string;
         tables: string[];
     }): LockBlockers {
         const tables = normalizeTables(request.tables);
+        const source = normalizeSource(request.source);
 
         if (tables.length === 0) {
             throw new Error('lock request must include at least one table');
@@ -235,6 +268,7 @@ export class RestoreLockManager {
         return this.findBlockingLocks(
             request.tenantId,
             request.instanceId,
+            source,
             tables,
         );
     }
@@ -245,7 +279,12 @@ export class RestoreLockManager {
         if (running) {
             for (const table of running.tables) {
                 this.activeLocks.delete(
-                    lockKey(running.tenantId, running.instanceId, table),
+                    lockKey(
+                        running.tenantId,
+                        running.instanceId,
+                        running.source,
+                        table,
+                    ),
                 );
             }
 
@@ -301,13 +340,14 @@ export class RestoreLockManager {
     private findBlockingLocks(
         tenantId: string,
         instanceId: string,
+        source: string,
         tables: string[],
     ): LockBlockers {
         const blocked: string[] = [];
         const blockerJobIds = new Set<string>();
 
         for (const table of tables) {
-            const key = lockKey(tenantId, instanceId, table);
+            const key = lockKey(tenantId, instanceId, source, table);
             const blockerJobId = this.activeLocks.get(key);
 
             if (blockerJobId) {
@@ -328,6 +368,7 @@ export class RestoreLockManager {
         const blockers = this.findBlockingLocks(
             entry.tenantId,
             entry.instanceId,
+            entry.source,
             entry.tables,
         );
 
@@ -359,7 +400,7 @@ export class RestoreLockManager {
 
                 for (const table of entry.tables) {
                     this.activeLocks.set(
-                        lockKey(entry.tenantId, entry.instanceId, table),
+                        lockKey(entry.tenantId, entry.instanceId, entry.source, table),
                         entry.jobId,
                     );
                 }
