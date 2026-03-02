@@ -195,6 +195,7 @@ export interface QueueReconcileRequest {
     stale_after_ms?: number;
     force_stale_status?: 'completed' | 'failed' | 'cancelled';
     force_reason_code?: RestoreReasonCode;
+    preserve_stale_job_ids?: string[];
 }
 
 export interface QueueReconcileAnomaly {
@@ -831,6 +832,11 @@ export class RestoreJobService {
         const anomalies: QueueReconcileAnomaly[] = [];
         const staleJobIds = new Set<string>();
         const staleForceCandidateJobIds = new Set<string>();
+        const preservedStaleJobIds = new Set(
+            (request.preserve_stale_job_ids || [])
+                .map((jobId) => String(jobId || '').trim())
+                .filter((jobId) => jobId.length > 0),
+        );
 
         for (const job of nonTerminalInScope) {
             const inRunning = persistedRunning.has(job.job_id);
@@ -910,7 +916,10 @@ export class RestoreJobService {
 
             staleJobIds.add(job.job_id);
 
-            if (isLockHoldingStatus(job.status)) {
+            if (
+                request.force_stale_status
+                && !preservedStaleJobIds.has(job.job_id)
+            ) {
                 staleForceCandidateJobIds.add(job.job_id);
             }
 

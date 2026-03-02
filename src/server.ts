@@ -1236,6 +1236,7 @@ export function createRestoreServiceServer(
                             EXECUTE_PREFLIGHT_FORCE_STALE_STATUS,
                         force_reason_code:
                             EXECUTE_PREFLIGHT_FORCE_REASON_CODE,
+                        preserve_stale_job_ids: [job.job_id],
                     });
 
                     const body = await readJsonBody(request, maxJsonBodyBytes);
