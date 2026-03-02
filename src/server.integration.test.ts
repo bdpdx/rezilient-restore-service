@@ -743,6 +743,35 @@ async function createPlanAndJob(
     };
 }
 
+async function hasReconcilePromotionEvent(
+    baseUrl: string,
+    token: string,
+    jobId: string,
+): Promise<boolean> {
+    const eventsResponse = await getJson(
+        baseUrl,
+        `/v1/jobs/${encodeURIComponent(jobId)}/events`,
+        token,
+    );
+
+    assert.equal(eventsResponse.status, 200);
+    const events = eventsResponse.body.events as Array<Record<string, unknown>>;
+
+    for (const event of events) {
+        if (event.event_type !== 'job_started') {
+            continue;
+        }
+
+        const details = event.details as Record<string, unknown> | undefined;
+
+        if (details && details.reconcile_operation === true) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 test('valid scoped token and ACP mapping can create restore job', async () => {
     const signingKey = 'test-signing-key';
     const server = createService(signingKey, {
@@ -2929,6 +2958,227 @@ test(
             }
             assert.equal(typeof firstPlan.jobId, 'string');
             assert.equal(typeof secondPlan.jobId, 'string');
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
+
+test(
+    'execute route reconcile promotes queued job when stale blocker lock is orphaned',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const db = newDb();
+
+        db.public.none('CREATE SCHEMA IF NOT EXISTS rez_restore_index');
+
+        const state = createPostgresBackedStateStores(db);
+        const server = createService(signingKey, {
+            stateStores: state.stores,
+        });
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+
+        try {
+            if (!state.stores.jobs) {
+                throw new Error('job state store fixture was not created');
+            }
+
+            const running = await createPlanAndJob(
+                baseUrl,
+                token,
+                'exec-reconcile-orphan-running',
+            );
+            const queued = await createPlanAndJob(
+                baseUrl,
+                token,
+                'exec-reconcile-orphan-queued',
+            );
+
+            const queuedBefore = await getJson(
+                baseUrl,
+                `/v1/jobs/${queued.jobId}`,
+                token,
+            );
+            assert.equal(queuedBefore.status, 200);
+            const queuedBeforeJob = queuedBefore.body.job as Record<
+                string,
+                unknown
+            >;
+            assert.equal(queuedBeforeJob.status, 'queued');
+
+            await state.stores.jobs.mutate((jobState) => {
+                const staleRunning = jobState.jobs_by_id[running.jobId];
+
+                if (!staleRunning) {
+                    throw new Error('expected running job fixture to exist');
+                }
+
+                jobState.jobs_by_id[running.jobId] = {
+                    ...staleRunning,
+                    status: 'failed',
+                    status_reason_code: 'failed_internal_error',
+                    queue_position: null,
+                    wait_reason_code: null,
+                    wait_tables: [],
+                    completed_at: FIXED_NOW.toISOString(),
+                    updated_at: FIXED_NOW.toISOString(),
+                };
+            });
+
+            const execute = await postJson(
+                baseUrl,
+                `/v1/jobs/${queued.jobId}/execution`,
+                token,
+                createExecutePayload(),
+            );
+
+            assert.equal(execute.status, 200);
+            assert.equal(
+                await hasReconcilePromotionEvent(baseUrl, token, queued.jobId),
+                true,
+            );
+        } finally {
+            await closeServer(server);
+            await state.pool.end();
+        }
+    },
+);
+
+test(
+    'execute route reconcile promotes queued job after blocker completion when queue state drifts',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const db = newDb();
+
+        db.public.none('CREATE SCHEMA IF NOT EXISTS rez_restore_index');
+
+        const state = createPostgresBackedStateStores(db);
+        const server = createService(signingKey, {
+            stateStores: state.stores,
+        });
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+
+        try {
+            if (!state.stores.jobs) {
+                throw new Error('job state store fixture was not created');
+            }
+
+            const running = await createPlanAndJob(
+                baseUrl,
+                token,
+                'exec-reconcile-complete-running',
+            );
+            const queued = await createPlanAndJob(
+                baseUrl,
+                token,
+                'exec-reconcile-complete-queued',
+            );
+
+            await state.stores.jobs.mutate((jobState) => {
+                jobState.lock_state.queued_jobs =
+                    jobState.lock_state.queued_jobs.filter((entry) => {
+                        return entry.jobId !== queued.jobId;
+                    });
+            });
+
+            const complete = await postJson(
+                baseUrl,
+                `/v1/jobs/${running.jobId}/complete`,
+                token,
+                {
+                    status: 'completed',
+                    reason_code: 'none',
+                },
+            );
+
+            assert.equal(complete.status, 200);
+            const completePromoted = complete.body.promoted_job_ids as string[];
+            assert.deepEqual(completePromoted, []);
+
+            const queuedBeforeExecute = await getJson(
+                baseUrl,
+                `/v1/jobs/${queued.jobId}`,
+                token,
+            );
+            assert.equal(queuedBeforeExecute.status, 200);
+            const queuedBeforeExecuteJob = queuedBeforeExecute.body.job as Record<
+                string,
+                unknown
+            >;
+            assert.equal(queuedBeforeExecuteJob.status, 'queued');
+
+            const execute = await postJson(
+                baseUrl,
+                `/v1/jobs/${queued.jobId}/execution`,
+                token,
+                createExecutePayload(),
+            );
+
+            assert.equal(execute.status, 200);
+            assert.equal(
+                await hasReconcilePromotionEvent(baseUrl, token, queued.jobId),
+                true,
+            );
+        } finally {
+            await closeServer(server);
+            await state.pool.end();
+        }
+    },
+);
+
+test(
+    'execute route reconcile keeps queued job blocked when active blocker still holds lock',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const server = createService(signingKey);
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+
+        try {
+            const running = await createPlanAndJob(
+                baseUrl,
+                token,
+                'exec-reconcile-true-blocker-running',
+            );
+            const queued = await createPlanAndJob(
+                baseUrl,
+                token,
+                'exec-reconcile-true-blocker-queued',
+            );
+
+            const execute = await postJson(
+                baseUrl,
+                `/v1/jobs/${queued.jobId}/execution`,
+                token,
+                createExecutePayload(),
+            );
+
+            assert.equal(execute.status, 409);
+            assert.equal(execute.body.error, 'job_not_running');
+
+            const queuedAfter = await getJson(
+                baseUrl,
+                `/v1/jobs/${queued.jobId}`,
+                token,
+            );
+
+            assert.equal(queuedAfter.status, 200);
+            const queuedAfterJob = queuedAfter.body.job as Record<
+                string,
+                unknown
+            >;
+            assert.equal(queuedAfterJob.status, 'queued');
+            assert.equal(
+                queuedAfterJob.wait_reason_code,
+                'queued_scope_lock',
+            );
+            assert.equal(
+                await hasReconcilePromotionEvent(baseUrl, token, queued.jobId),
+                false,
+            );
+            assert.equal(typeof running.jobId, 'string');
         } finally {
             await closeServer(server);
         }

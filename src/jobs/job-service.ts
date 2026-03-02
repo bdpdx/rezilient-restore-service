@@ -770,6 +770,14 @@ export class RestoreJobService {
         const persistedQueued = new Set(
             state.lock_state.queued_jobs.map((entry) => entry.jobId),
         );
+        const activeBlockingJobIds = new Set(
+            allJobs
+                .filter((job) => {
+                    return job.status === 'running' || job.status === 'paused';
+                })
+                .map((job) => job.job_id),
+        );
+        const persistedLockManager = new RestoreLockManager(state.lock_state);
         const anomalies: QueueReconcileAnomaly[] = [];
         const staleJobIds = new Set<string>();
 
@@ -789,6 +797,39 @@ export class RestoreJobService {
                             in_queued: inQueued,
                         },
                     });
+                }
+
+                if (inQueued && !inRunning) {
+                    const blockers = persistedLockManager.getBlockingLocks({
+                        tenantId: job.tenant_id,
+                        instanceId: job.instance_id,
+                        tables: job.lock_scope_tables,
+                    });
+                    const activeBlockerIds = blockers.blockerJobIds.filter(
+                        (jobId) => activeBlockingJobIds.has(jobId),
+                    );
+
+                    if (
+                        blockers.blockedTables.length === 0 ||
+                        activeBlockerIds.length === 0
+                    ) {
+                        anomalies.push({
+                            code: 'queued_missing_blocker',
+                            job_id: job.job_id,
+                            status: job.status,
+                            details: {
+                                blocked_tables: [...blockers.blockedTables],
+                                blocker_job_ids: [...blockers.blockerJobIds],
+                                orphaned_blocker_job_ids:
+                                    blockers.blockerJobIds.filter((jobId) =>
+                                        !activeBlockingJobIds.has(jobId),
+                                    ),
+                                queue_position: job.queue_position,
+                                wait_reason_code: job.wait_reason_code,
+                                wait_tables: [...job.wait_tables],
+                            },
+                        });
+                    }
                 }
             } else if (job.status === 'running' || job.status === 'paused') {
                 if (!inRunning || inQueued) {

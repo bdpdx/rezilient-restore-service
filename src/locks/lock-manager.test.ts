@@ -88,6 +88,32 @@ test('non-overlapping scopes can run in parallel', async () => {
     assert.equal(snapshot.queued.length, 0);
 });
 
+test('getBlockingLocks returns blocked tables and blocker job IDs', () => {
+    const locks = new RestoreLockManager();
+
+    locks.acquire({
+        jobId: 'job-1',
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        tables: ['incident'],
+    });
+    locks.acquire({
+        jobId: 'job-2',
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        tables: ['task'],
+    });
+
+    const blockers = locks.getBlockingLocks({
+        tenantId: 'tenant-acme',
+        instanceId: 'sn-dev-01',
+        tables: ['incident', 'task', 'cmdb_ci'],
+    });
+
+    assert.deepEqual(blockers.blockedTables, ['incident', 'task']);
+    assert.deepEqual(blockers.blockerJobIds, ['job-1', 'job-2']);
+});
+
 test('acquire with empty table array throws', () => {
     const locks = new RestoreLockManager();
 

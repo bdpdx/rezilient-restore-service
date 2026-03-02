@@ -389,6 +389,15 @@ function hasRequiredQueueScopeFilters(
     );
 }
 
+function queueScopeFromJob(job: RestoreJobRecord): QueueReconcileScope {
+    return {
+        tenant_id: job.tenant_id,
+        instance_id: job.instance_id,
+        source: job.source,
+        lock_scope_tables: [...job.lock_scope_tables],
+    };
+}
+
 export function createRestoreServiceServer(
     deps: RestoreServiceDependencies,
     options?: RestoreServiceServerOptions,
@@ -1209,6 +1218,11 @@ export function createRestoreServiceServer(
 
                         return;
                     }
+
+                    await deps.jobs.reconcileQueueLocks({
+                        dry_run: false,
+                        scope: queueScopeFromJob(job),
+                    });
 
                     const body = await readJsonBody(request, maxJsonBodyBytes);
                     const result = await deps.execute.executeJob(

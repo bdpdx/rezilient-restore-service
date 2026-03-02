@@ -16,6 +16,11 @@ export interface LockDecision {
     queuePosition?: number;
 }
 
+export interface LockBlockers {
+    blockedTables: string[];
+    blockerJobIds: string[];
+}
+
 export interface LockPromotion {
     jobId: string;
     reasonCode: RestoreReasonCode;
@@ -166,11 +171,12 @@ export class RestoreLockManager {
             throw new Error('job already holds running locks');
         }
 
-        const blockedTables = this.findBlockedTables(
+        const blockers = this.findBlockingLocks(
             request.tenantId,
             request.instanceId,
             tables,
         );
+        const blockedTables = blockers.blockedTables;
 
         if (blockedTables.length > 0) {
             const queued: QueueEntry = {
@@ -213,6 +219,24 @@ export class RestoreLockManager {
             reasonCode: 'none',
             blockedTables: [],
         };
+    }
+
+    getBlockingLocks(request: {
+        tenantId: string;
+        instanceId: string;
+        tables: string[];
+    }): LockBlockers {
+        const tables = normalizeTables(request.tables);
+
+        if (tables.length === 0) {
+            throw new Error('lock request must include at least one table');
+        }
+
+        return this.findBlockingLocks(
+            request.tenantId,
+            request.instanceId,
+            tables,
+        );
     }
 
     release(jobId: string): ReleaseResult {
@@ -274,32 +298,40 @@ export class RestoreLockManager {
         };
     }
 
-    private findBlockedTables(
+    private findBlockingLocks(
         tenantId: string,
         instanceId: string,
         tables: string[],
-    ): string[] {
+    ): LockBlockers {
         const blocked: string[] = [];
+        const blockerJobIds = new Set<string>();
 
         for (const table of tables) {
             const key = lockKey(tenantId, instanceId, table);
+            const blockerJobId = this.activeLocks.get(key);
 
-            if (this.activeLocks.has(key)) {
+            if (blockerJobId) {
                 blocked.push(table);
+                blockerJobIds.add(blockerJobId);
             }
         }
 
-        return blocked;
+        return {
+            blockedTables: blocked,
+            blockerJobIds: Array.from(blockerJobIds).sort((left, right) =>
+                left.localeCompare(right),
+            ),
+        };
     }
 
     private canRunQueued(entry: QueueEntry): boolean {
-        const blockedTables = this.findBlockedTables(
+        const blockers = this.findBlockingLocks(
             entry.tenantId,
             entry.instanceId,
             entry.tables,
         );
 
-        return blockedTables.length === 0;
+        return blockers.blockedTables.length === 0;
     }
 
     private promoteEligibleQueuedJobs(): LockPromotion[] {

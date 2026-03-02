@@ -751,6 +751,156 @@ test('reconcileQueueLocks reports lock membership mismatch anomalies', async () 
     assert.notEqual(mismatch, undefined);
 });
 
+test(
+    'reconcileQueueLocks flags queued missing blocker and cleans orphaned lock',
+    async () => {
+        const stateStore = new InMemoryRestoreJobStateStore();
+        const service = new RestoreJobService(
+            new RestoreLockManager(),
+            new SourceRegistry([
+                {
+                    tenantId: 'tenant-acme',
+                    instanceId: 'sn-dev-01',
+                    source: 'sn://acme-dev.service-now.com',
+                },
+            ]),
+            now,
+            stateStore,
+        );
+        const running = await service.createJob(
+            baseRequest('plan-1', 'incident'),
+            claims(),
+        );
+        const queued = await service.createJob(
+            baseRequest('plan-2', 'incident'),
+            claims(),
+        );
+
+        assert.equal(running.success, true);
+        assert.equal(queued.success, true);
+
+        if (!running.success || !queued.success) {
+            return;
+        }
+
+        await stateStore.mutate((state) => {
+            const staleRunning = state.jobs_by_id[running.job.job_id];
+
+            state.jobs_by_id[running.job.job_id] = {
+                ...staleRunning,
+                status: 'failed',
+                status_reason_code: 'failed_internal_error',
+                queue_position: null,
+                wait_reason_code: null,
+                wait_tables: [],
+                completed_at: '2026-02-16T12:00:00.000Z',
+                updated_at: '2026-02-16T12:00:00.000Z',
+            };
+        });
+
+        const preview = await service.reconcileQueueLocks({
+            dry_run: true,
+            scope: {
+                tenant_id: 'tenant-acme',
+                instance_id: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+                lock_scope_tables: ['incident'],
+            },
+        });
+        const missingBlocker = preview.anomalies.find((anomaly) => {
+            return (
+                anomaly.code === 'queued_missing_blocker' &&
+                anomaly.job_id === queued.job.job_id
+            );
+        });
+
+        assert.notEqual(missingBlocker, undefined);
+        assert.deepEqual(
+            (
+                missingBlocker?.details.orphaned_blocker_job_ids as
+                    string[] | undefined
+            ),
+            [running.job.job_id],
+        );
+
+        const applied = await service.reconcileQueueLocks({
+            dry_run: false,
+            scope: {
+                tenant_id: 'tenant-acme',
+                instance_id: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+                lock_scope_tables: ['incident'],
+            },
+        });
+
+        assert.deepEqual(applied.promoted_job_ids, [queued.job.job_id]);
+
+        const promoted = await service.getJob(queued.job.job_id);
+        const lockSnapshot = await service.getLockSnapshot();
+
+        assert.equal(promoted?.status, 'running');
+        assert.deepEqual(
+            lockSnapshot.running.map((entry) => entry.jobId),
+            [queued.job.job_id],
+        );
+        assert.deepEqual(lockSnapshot.queued, []);
+    },
+);
+
+test(
+    'reconcileQueueLocks keeps queued job when real blocker is still active',
+    async () => {
+        const service = new RestoreJobService(
+            new RestoreLockManager(),
+            new SourceRegistry([
+                {
+                    tenantId: 'tenant-acme',
+                    instanceId: 'sn-dev-01',
+                    source: 'sn://acme-dev.service-now.com',
+                },
+            ]),
+            now,
+        );
+        const running = await service.createJob(
+            baseRequest('plan-1', 'incident'),
+            claims(),
+        );
+        const queued = await service.createJob(
+            baseRequest('plan-2', 'incident'),
+            claims(),
+        );
+
+        assert.equal(running.success, true);
+        assert.equal(queued.success, true);
+
+        if (!running.success || !queued.success) {
+            return;
+        }
+
+        const applied = await service.reconcileQueueLocks({
+            dry_run: false,
+            scope: {
+                tenant_id: 'tenant-acme',
+                instance_id: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+                lock_scope_tables: ['incident'],
+            },
+        });
+        const missingBlocker = applied.anomalies.find((anomaly) => {
+            return (
+                anomaly.code === 'queued_missing_blocker' &&
+                anomaly.job_id === queued.job.job_id
+            );
+        });
+        const queuedAfter = await service.getJob(queued.job.job_id);
+
+        assert.deepEqual(applied.promoted_job_ids, []);
+        assert.equal(missingBlocker, undefined);
+        assert.equal(queuedAfter?.status, 'queued');
+        assert.equal(queuedAfter?.wait_reason_code, 'queued_scope_lock');
+    },
+);
+
 test('listJobEvents returns empty for unknown job', async () => {
     const service = new RestoreJobService(
         new RestoreLockManager(),
