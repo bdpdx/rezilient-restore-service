@@ -62,7 +62,8 @@
   primitive used by plan/job/execute/evidence state-store adapters.
 - `test-helpers.ts`: scoped-token fixtures used by integration tests.
 - `db-schema.test.ts`: migration contract tests for RS-06/RS-07/RS-10 schema/
-  role expectations including runtime snapshot and source-progress table grants.
+  role expectations including runtime snapshot, source-progress, and ingest-
+  scope runtime v2 table grants.
 - `restore-index/state-reader.test.ts`: authoritative watermark reader tests
   for freshness/staleness and unknown-partition fail-closed behavior.
 - `core-state.durability.test.ts`: stage-10 restart-survival and queue-fairness

@@ -23,3 +23,7 @@
   authoritative source-progress checkpoint table used by RRI polling runtime.
 - `migrations/0010_restore_index_source_progress_roles.sql`: grants indexer
   read/write and restore-service read-only access for source-progress rows.
+- `migrations/0011_restore_index_runtime_scope_v2_plane.sql`: creates
+  ingest-scope runtime tables for RRI v2 source progress and leader leases.
+- `migrations/0012_restore_index_runtime_scope_v2_roles.sql`: grants indexer
+  read/write and restore-service read-only access for v2 runtime-scope rows.

@@ -33,6 +33,12 @@ const sourceProgressSchemaSql = readMigration(
 const sourceProgressRoleSql = readMigration(
     '0010_restore_index_source_progress_roles.sql',
 );
+const runtimeScopeV2SchemaSql = readMigration(
+    '0011_restore_index_runtime_scope_v2_plane.sql',
+);
+const runtimeScopeV2RoleSql = readMigration(
+    '0012_restore_index_runtime_scope_v2_roles.sql',
+);
 
 test('RS-06 schema migration defines restore index data-plane tables', async () => {
     assert.match(
@@ -222,5 +228,42 @@ test('RS-06 role migration grants source-progress table privileges', async () =>
     assert.match(
         sourceProgressRoleSql,
         /GRANT SELECT[\s\S]+source_progress/i,
+    );
+});
+
+test('RS-06 schema migration defines ingest-scope runtime v2 tables', async () => {
+    assert.match(
+        runtimeScopeV2SchemaSql,
+        /CREATE TABLE IF NOT EXISTS\s+rez_restore_index\.source_progress_v2/i,
+    );
+    assert.match(
+        runtimeScopeV2SchemaSql,
+        /CREATE TABLE IF NOT EXISTS\s+rez_restore_index\.source_leader_leases_v2/i,
+    );
+    assert.match(
+        runtimeScopeV2SchemaSql,
+        /ingest_scope_id\s+TEXT\s+PRIMARY KEY/i,
+    );
+    assert.match(runtimeScopeV2SchemaSql, /source_uri\s+TEXT\s+NOT NULL/i);
+    assert.match(runtimeScopeV2SchemaSql, /last_indexed_offset\s+BIGINT/i);
+    assert.match(runtimeScopeV2SchemaSql, /processed_count\s+BIGINT/i);
+});
+
+test('RS-06 role migration grants ingest-scope runtime v2 table privileges', async () => {
+    assert.match(
+        runtimeScopeV2RoleSql,
+        /GRANT SELECT, INSERT, UPDATE, DELETE[\s\S]+TO rez_restore_indexer_rw/i,
+    );
+    assert.match(
+        runtimeScopeV2RoleSql,
+        /GRANT SELECT[\s\S]+TO rez_restore_service_ro/i,
+    );
+    assert.match(
+        runtimeScopeV2RoleSql,
+        /rez_restore_index\.source_progress_v2/i,
+    );
+    assert.match(
+        runtimeScopeV2RoleSql,
+        /rez_restore_index\.source_leader_leases_v2/i,
     );
 });

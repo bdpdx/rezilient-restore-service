@@ -83,10 +83,16 @@ Entrypoints:
   progress checkpoint table in `rez_restore_index`.
 - `db/migrations/0010_restore_index_source_progress_roles.sql`: RS-06 grants
   for source progress checkpoint table access.
+- `db/migrations/0011_restore_index_runtime_scope_v2_plane.sql`: RS-06 ingest
+  scope keyed v2 runtime tables (`source_progress_v2`,
+  `source_leader_leases_v2`).
+- `db/migrations/0012_restore_index_runtime_scope_v2_roles.sql`: RS-06 grants
+  for ingest-scope keyed v2 runtime table access.
 
 Tests:
 - `src/db-schema.test.ts`: migration contract checks for RS-06 + RS-07 schema,
-  approval placeholders, and role grants.
+  approval placeholders, and role grants including ingest-scope v2 runtime
+  tables.
 - `src/locks/lock-manager.test.ts`: lock overlap arbitration tests.
 - `src/jobs/job-service.test.ts`: parallel non-overlap and queued overlap tests.
 - `src/core-state.durability.test.ts`: restart-survival and queue-fairness
