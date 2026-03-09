@@ -144,6 +144,10 @@ test('RS-07 role migration grants restore service write scope', async () => {
     );
     assert.match(
         jobRoleSql,
+        /rez_restore_index\.index_events/i,
+    );
+    assert.match(
+        jobRoleSql,
         /GRANT SELECT, INSERT, UPDATE, DELETE[\s\S]+TO rez_restore_service_rw/i,
     );
     assert.match(

@@ -11,6 +11,13 @@ import { PostgresRestoreJobStateStore } from './jobs/job-state-store';
 import { RestoreJobService } from './jobs/job-service';
 import { PostgresRestorePlanStateStore } from './plans/plan-state-store';
 import { RestorePlanService } from './plans/plan-service';
+import {
+    InMemoryRestoreArtifactBodyReader,
+    RestoreRowMaterializationService,
+} from './plans/materialization-service';
+import {
+    createS3RestoreArtifactBodyReader,
+} from './plans/s3-artifact-body-reader';
 import { AcpSourceMappingClient } from './registry/acp-source-mapping-client';
 import { createCachedAcpSourceMappingProvider } from './registry/acp-source-mapping-provider';
 import { PostgresRestoreIndexStateReader } from './restore-index/state-reader';
@@ -77,12 +84,24 @@ async function main(): Promise<void> {
         jobStateStore,
         acpSourceMappingProvider,
     );
+    const artifactBodyReader = env.objectStoreBucket && env.objectStoreRegion
+        ? createS3RestoreArtifactBodyReader({
+            accessKeyId: env.objectStoreAccessKeyId,
+            bucket: env.objectStoreBucket,
+            endpoint: env.objectStoreEndpoint,
+            forcePathStyle: env.objectStoreForcePathStyle,
+            region: env.objectStoreRegion,
+            secretAccessKey: env.objectStoreSecretAccessKey,
+            sessionToken: env.objectStoreSessionToken,
+        })
+        : new InMemoryRestoreArtifactBodyReader();
     const plans = new RestorePlanService(
         undefined,
         undefined,
         planStateStore,
         restoreIndexStateReader,
         acpSourceMappingProvider,
+        new RestoreRowMaterializationService(artifactBodyReader),
     );
     const execute = new RestoreExecutionService(
         jobs,
@@ -173,6 +192,7 @@ async function main(): Promise<void> {
         staging_mode_enabled: env.stagingModeEnabled,
         ga_runbooks_signed_off: env.gaRunbooksSignedOff,
         max_json_body_bytes: env.maxJsonBodyBytes,
+        object_store_bucket_configured: Boolean(env.objectStoreBucket),
         restore_pg_url_configured: env.restorePgUrl.length > 0,
         port: env.port,
     });

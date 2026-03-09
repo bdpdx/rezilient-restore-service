@@ -79,6 +79,13 @@ describe('parseRestoreServiceEnv', () => {
         assert.equal(result.acpRequestTimeoutMs, 2000);
         assert.equal(result.acpPositiveCacheTtlSeconds, 30);
         assert.equal(result.acpNegativeCacheTtlSeconds, 5);
+        assert.equal(result.objectStoreBucket, undefined);
+        assert.equal(result.objectStoreRegion, undefined);
+        assert.equal(result.objectStoreEndpoint, undefined);
+        assert.equal(result.objectStoreForcePathStyle, false);
+        assert.equal(result.objectStoreAccessKeyId, undefined);
+        assert.equal(result.objectStoreSecretAccessKey, undefined);
+        assert.equal(result.objectStoreSessionToken, undefined);
     });
 
     test('throws for missing RRS_ADMIN_TOKEN', () => {
@@ -160,6 +167,47 @@ describe('parseRestoreServiceEnv', () => {
             'postgres://user:pass@localhost:5432/alt';
         const result = parseRestoreServiceEnv(env);
         assert.ok(result.restorePgUrl.includes('alt'));
+    });
+
+    test('parses REC object-store settings for artifact reads', () => {
+        const env = buildValidEnv();
+        env.REZ_OBJECT_STORE_BUCKET = 'rezilient-rec-artifacts';
+        env.REZ_OBJECT_STORE_REGION = 'us-west-2';
+        env.REZ_OBJECT_STORE_ENDPOINT = 'https://s3.us-west-2.amazonaws.com';
+        env.REZ_OBJECT_STORE_FORCE_PATH_STYLE = 'true';
+        env.REZ_OBJECT_STORE_ACCESS_KEY_ID = 'akid';
+        env.REZ_OBJECT_STORE_SECRET_ACCESS_KEY = 'secret';
+        env.REZ_OBJECT_STORE_SESSION_TOKEN = 'token';
+
+        const result = parseRestoreServiceEnv(env);
+        assert.equal(result.objectStoreBucket, 'rezilient-rec-artifacts');
+        assert.equal(result.objectStoreRegion, 'us-west-2');
+        assert.equal(
+            result.objectStoreEndpoint,
+            'https://s3.us-west-2.amazonaws.com',
+        );
+        assert.equal(result.objectStoreForcePathStyle, true);
+        assert.equal(result.objectStoreAccessKeyId, 'akid');
+        assert.equal(result.objectStoreSecretAccessKey, 'secret');
+        assert.equal(result.objectStoreSessionToken, 'token');
+    });
+
+    test('rejects partial REC object-store bucket/region config', () => {
+        const env = buildValidEnv();
+        env.REZ_OBJECT_STORE_BUCKET = 'rezilient-rec-artifacts';
+        assert.throws(
+            () => parseRestoreServiceEnv(env),
+            /REZ_OBJECT_STORE_BUCKET and REZ_OBJECT_STORE_REGION/,
+        );
+    });
+
+    test('rejects partial REC object-store credential config', () => {
+        const env = buildValidEnv();
+        env.REZ_OBJECT_STORE_ACCESS_KEY_ID = 'akid';
+        assert.throws(
+            () => parseRestoreServiceEnv(env),
+            /REZ_OBJECT_STORE_ACCESS_KEY_ID and REZ_OBJECT_STORE_SECRET_ACCESS_KEY/,
+        );
     });
 });
 

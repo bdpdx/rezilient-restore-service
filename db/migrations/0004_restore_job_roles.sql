@@ -18,6 +18,7 @@ GRANT USAGE, CREATE ON SCHEMA rez_restore_index TO rez_restore_service_rw;
 
 GRANT SELECT, INSERT, UPDATE, DELETE
 ON TABLE
+    rez_restore_index.index_events,
     rez_restore_index.partition_watermarks,
     rez_restore_index.source_registry,
     rez_restore_index.restore_plans,
@@ -32,6 +33,7 @@ TO rez_restore_service_rw;
 
 GRANT SELECT
 ON TABLE
+    rez_restore_index.index_events,
     rez_restore_index.partition_watermarks,
     rez_restore_index.source_registry,
     rez_restore_index.restore_plans,

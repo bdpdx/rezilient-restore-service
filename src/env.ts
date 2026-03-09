@@ -28,6 +28,13 @@ export interface RestoreServiceEnv {
     acpRequestTimeoutMs: number;
     acpPositiveCacheTtlSeconds: number;
     acpNegativeCacheTtlSeconds: number;
+    objectStoreAccessKeyId?: string;
+    objectStoreBucket?: string;
+    objectStoreEndpoint?: string;
+    objectStoreForcePathStyle: boolean;
+    objectStoreRegion?: string;
+    objectStoreSecretAccessKey?: string;
+    objectStoreSessionToken?: string;
 }
 
 function parseNonNegativeInteger(
@@ -158,6 +165,42 @@ export function parseRestoreServiceEnv(
     const authExpectedIssuer = parseOptionalString(
         env.RRS_AUTH_EXPECTED_ISSUER,
     );
+    const objectStoreBucket = parseOptionalString(
+        env.REZ_OBJECT_STORE_BUCKET,
+    );
+    const objectStoreRegion = parseOptionalString(
+        env.REZ_OBJECT_STORE_REGION,
+    );
+    const objectStoreEndpoint = parseOptionalString(
+        env.REZ_OBJECT_STORE_ENDPOINT,
+    );
+    const objectStoreAccessKeyId = parseOptionalString(
+        env.REZ_OBJECT_STORE_ACCESS_KEY_ID,
+    );
+    const objectStoreSecretAccessKey = parseOptionalString(
+        env.REZ_OBJECT_STORE_SECRET_ACCESS_KEY,
+    );
+    const objectStoreSessionToken = parseOptionalString(
+        env.REZ_OBJECT_STORE_SESSION_TOKEN,
+    );
+
+    if ((objectStoreBucket && !objectStoreRegion)
+        || (!objectStoreBucket && objectStoreRegion)) {
+        throw new Error(
+            'REZ_OBJECT_STORE_BUCKET and REZ_OBJECT_STORE_REGION must be '
+            + 'provided together',
+        );
+    }
+
+    if (
+        (objectStoreAccessKeyId && !objectStoreSecretAccessKey)
+        || (!objectStoreAccessKeyId && objectStoreSecretAccessKey)
+    ) {
+        throw new Error(
+            'REZ_OBJECT_STORE_ACCESS_KEY_ID and '
+            + 'REZ_OBJECT_STORE_SECRET_ACCESS_KEY must be provided together',
+        );
+    }
 
     return {
         port: parseNonNegativeInteger(env.PORT, 'PORT', 3100),
@@ -286,5 +329,16 @@ export function parseRestoreServiceEnv(
             'RRS_ACP_NEGATIVE_CACHE_TTL_SECONDS',
             5,
         ),
+        objectStoreAccessKeyId,
+        objectStoreBucket,
+        objectStoreEndpoint,
+        objectStoreForcePathStyle: parseBoolean(
+            env.REZ_OBJECT_STORE_FORCE_PATH_STYLE,
+            'REZ_OBJECT_STORE_FORCE_PATH_STYLE',
+            false,
+        ),
+        objectStoreRegion,
+        objectStoreSecretAccessKey,
+        objectStoreSessionToken,
     };
 }
