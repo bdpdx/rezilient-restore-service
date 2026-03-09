@@ -157,6 +157,303 @@ test('postgres reader maps authoritative rows and stale gating', async () => {
     }
 });
 
+test('in-memory reader lookupIndexedEventCandidates filters scope and PIT',
+async () => {
+    const reader = new InMemoryRestoreIndexStateReader({
+        staleAfterSeconds: 120,
+    });
+
+    reader.upsertIndexedEventCandidate({
+        artifactKey: 'rez/restore/event=evt-a1.artifact.json',
+        eventId: 'evt-a1',
+        eventTime: '2026-02-21T11:00:00.000Z',
+        instanceId: 'sn-dev-01',
+        manifestKey: 'rez/restore/event=evt-a1.manifest.json',
+        offset: '101',
+        partition: 0,
+        recordSysId: 'alpha',
+        source: 'sn://acme-dev.service-now.com',
+        sysModCount: 1,
+        sysUpdatedOn: '2026-02-21 11:00:00',
+        table: 'x_app.ticket',
+        tenantId: 'tenant-acme',
+        topic: 'rez.cdc',
+    });
+    reader.upsertIndexedEventCandidate({
+        artifactKey: 'rez/restore/event=evt-a2.artifact.json',
+        eventId: 'evt-a2',
+        eventTime: '2026-02-21T11:00:00.000Z',
+        instanceId: 'sn-dev-01',
+        manifestKey: 'rez/restore/event=evt-a2.manifest.json',
+        offset: '102',
+        partition: 0,
+        recordSysId: 'alpha',
+        source: 'sn://acme-dev.service-now.com',
+        sysModCount: 2,
+        sysUpdatedOn: '2026-02-21 11:00:00',
+        table: 'x_app.ticket',
+        tenantId: 'tenant-acme',
+        topic: 'rez.cdc',
+    });
+    reader.upsertIndexedEventCandidate({
+        artifactKey: 'rez/restore/event=evt-b1.artifact.json',
+        eventId: 'evt-b1',
+        eventTime: '2026-02-21T12:00:00.000Z',
+        instanceId: 'sn-dev-01',
+        manifestKey: 'rez/restore/event=evt-b1.manifest.json',
+        offset: '103',
+        partition: 0,
+        recordSysId: 'bravo',
+        source: 'sn://acme-dev.service-now.com',
+        sysModCount: 1,
+        sysUpdatedOn: '2026-02-21 12:00:00',
+        table: 'x_app.ticket',
+        tenantId: 'tenant-acme',
+        topic: 'rez.cdc',
+    });
+    reader.upsertIndexedEventCandidate({
+        artifactKey: 'rez/restore/event=evt-a3-after.artifact.json',
+        eventId: 'evt-a3-after',
+        eventTime: '2026-02-21T13:00:00.000Z',
+        instanceId: 'sn-dev-01',
+        manifestKey: 'rez/restore/event=evt-a3-after.manifest.json',
+        offset: '104',
+        partition: 0,
+        recordSysId: 'alpha',
+        source: 'sn://acme-dev.service-now.com',
+        sysModCount: 3,
+        sysUpdatedOn: '2026-02-21 13:00:00',
+        table: 'x_app.ticket',
+        tenantId: 'tenant-acme',
+        topic: 'rez.cdc',
+    });
+    reader.upsertIndexedEventCandidate({
+        artifactKey: 'rez/restore/event=evt-other-source.artifact.json',
+        eventId: 'evt-other-source',
+        eventTime: '2026-02-21T11:00:00.000Z',
+        instanceId: 'sn-dev-01',
+        manifestKey: 'rez/restore/event=evt-other-source.manifest.json',
+        offset: '105',
+        partition: 0,
+        recordSysId: 'alpha',
+        source: 'sn://other.service-now.com',
+        sysModCount: 1,
+        sysUpdatedOn: '2026-02-21 11:00:00',
+        table: 'x_app.ticket',
+        tenantId: 'tenant-acme',
+        topic: 'rez.cdc',
+    });
+
+    const scoped = await reader.lookupIndexedEventCandidates({
+        instanceId: 'sn-dev-01',
+        pitCutoff: '2026-02-21T12:30:00.000Z',
+        recordSysIds: ['alpha'],
+        source: 'sn://acme-dev.service-now.com',
+        tables: ['x_app.ticket'],
+        tenantId: 'tenant-acme',
+    });
+
+    assert.equal(scoped.coverage, 'covered');
+    assert.deepEqual(
+        scoped.candidates.map((candidate) => candidate.eventId),
+        [
+            'evt-a2',
+            'evt-a1',
+        ],
+    );
+
+    const tableScoped = await reader.lookupIndexedEventCandidates({
+        instanceId: 'sn-dev-01',
+        pitCutoff: '2026-02-21T12:30:00.000Z',
+        source: 'sn://acme-dev.service-now.com',
+        tables: ['x_app.ticket'],
+        tenantId: 'tenant-acme',
+    });
+
+    assert.equal(tableScoped.coverage, 'covered');
+    assert.deepEqual(
+        tableScoped.candidates.map((candidate) => candidate.eventId),
+        [
+            'evt-a2',
+            'evt-a1',
+            'evt-b1',
+        ],
+    );
+
+    const noCoverage = await reader.lookupIndexedEventCandidates({
+        instanceId: 'sn-dev-01',
+        pitCutoff: '2026-02-21T12:30:00.000Z',
+        source: 'sn://acme-dev.service-now.com',
+        tables: ['x_app.unknown'],
+        tenantId: 'tenant-acme',
+    });
+
+    assert.equal(noCoverage.coverage, 'no_indexed_coverage');
+    assert.equal(noCoverage.candidates.length, 0);
+});
+
+test('postgres reader lookupIndexedEventCandidates maps and orders rows',
+async () => {
+    const db = newDb();
+
+    db.public.none(`
+        CREATE SCHEMA IF NOT EXISTS rez_restore_index;
+
+        CREATE TABLE rez_restore_index.index_events (
+            tenant_id TEXT NOT NULL,
+            instance_id TEXT NOT NULL,
+            source TEXT NOT NULL,
+            table_name TEXT,
+            record_sys_id TEXT,
+            event_id TEXT,
+            sys_updated_on TEXT,
+            sys_mod_count INTEGER,
+            event_time TIMESTAMPTZ NOT NULL,
+            topic TEXT NOT NULL,
+            kafka_partition INTEGER NOT NULL,
+            kafka_offset TEXT NOT NULL,
+            artifact_key TEXT,
+            manifest_key TEXT
+        );
+
+        INSERT INTO rez_restore_index.index_events (
+            tenant_id,
+            instance_id,
+            source,
+            table_name,
+            record_sys_id,
+            event_id,
+            sys_updated_on,
+            sys_mod_count,
+            event_time,
+            topic,
+            kafka_partition,
+            kafka_offset,
+            artifact_key,
+            manifest_key
+        ) VALUES
+            (
+                'tenant-acme',
+                'sn-dev-01',
+                'sn://acme-dev.service-now.com',
+                'x_app.ticket',
+                'alpha',
+                'evt-pg-a1',
+                '2026-02-21 11:00:00',
+                1,
+                '2026-02-21T11:00:00.000Z',
+                'rez.cdc',
+                0,
+                '201',
+                'rez/restore/event=evt-pg-a1.artifact.json',
+                'rez/restore/event=evt-pg-a1.manifest.json'
+            ),
+            (
+                'tenant-acme',
+                'sn-dev-01',
+                'sn://acme-dev.service-now.com',
+                'x_app.ticket',
+                'alpha',
+                'evt-pg-a2',
+                '2026-02-21 11:00:00',
+                2,
+                '2026-02-21T11:00:00.000Z',
+                'rez.cdc',
+                0,
+                '202',
+                'rez/restore/event=evt-pg-a2.artifact.json',
+                'rez/restore/event=evt-pg-a2.manifest.json'
+            ),
+            (
+                'tenant-acme',
+                'sn-dev-01',
+                'sn://acme-dev.service-now.com',
+                'x_app.ticket',
+                'bravo',
+                'evt-pg-b1',
+                '2026-02-21 12:00:00',
+                1,
+                '2026-02-21T12:00:00.000Z',
+                'rez.cdc',
+                0,
+                '203',
+                'rez/restore/event=evt-pg-b1.artifact.json',
+                'rez/restore/event=evt-pg-b1.manifest.json'
+            ),
+            (
+                'tenant-acme',
+                'sn-dev-01',
+                'sn://acme-dev.service-now.com',
+                'x_app.ticket',
+                'alpha',
+                'evt-pg-after-cutoff',
+                '2026-02-21 13:00:00',
+                3,
+                '2026-02-21T13:00:00.000Z',
+                'rez.cdc',
+                0,
+                '204',
+                'rez/restore/event=evt-pg-after-cutoff.artifact.json',
+                'rez/restore/event=evt-pg-after-cutoff.manifest.json'
+            ),
+            (
+                'tenant-acme',
+                'sn-dev-01',
+                'sn://other.service-now.com',
+                'x_app.ticket',
+                'alpha',
+                'evt-pg-other-source',
+                '2026-02-21 11:00:00',
+                1,
+                '2026-02-21T11:00:00.000Z',
+                'rez.cdc',
+                0,
+                '205',
+                'rez/restore/event=evt-pg-other-source.artifact.json',
+                'rez/restore/event=evt-pg-other-source.manifest.json'
+            );
+    `);
+
+    const pgAdapter = db.adapters.createPg();
+    const pool = new pgAdapter.Pool();
+    const reader = new PostgresRestoreIndexStateReader(pool as any, {
+        staleAfterSeconds: 120,
+    });
+
+    try {
+        const result = await reader.lookupIndexedEventCandidates({
+            instanceId: 'sn-dev-01',
+            pitCutoff: '2026-02-21T12:30:00.000Z',
+            source: 'sn://acme-dev.service-now.com',
+            tables: ['x_app.ticket'],
+            tenantId: 'tenant-acme',
+        });
+
+        assert.equal(result.coverage, 'covered');
+        assert.deepEqual(
+            result.candidates.map((candidate) => candidate.eventId),
+            [
+                'evt-pg-a2',
+                'evt-pg-a1',
+                'evt-pg-b1',
+            ],
+        );
+
+        const noCoverage = await reader.lookupIndexedEventCandidates({
+            instanceId: 'sn-dev-01',
+            pitCutoff: '2026-02-21T12:30:00.000Z',
+            source: 'sn://acme-dev.service-now.com',
+            tables: ['x_app.unknown'],
+            tenantId: 'tenant-acme',
+        });
+
+        assert.equal(noCoverage.coverage, 'no_indexed_coverage');
+        assert.equal(noCoverage.candidates.length, 0);
+    } finally {
+        await pool.end();
+    }
+});
+
 test('mixed fresh/stale partitions returns correct per-partition status', async () => {
     const reader = new InMemoryRestoreIndexStateReader({
         staleAfterSeconds: 120,

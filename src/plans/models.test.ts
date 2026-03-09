@@ -60,7 +60,85 @@ function buildValidWatermarkHint(
     };
 }
 
+function buildCompatibilityAdapter(
+    overrides: Record<string, unknown> = {},
+) {
+    return {
+        rows: [buildValidRow()],
+        watermarks: [buildValidWatermark()],
+        pit_candidates: [],
+        ...overrides,
+    };
+}
+
 function buildValidDryRunRequest(
+    overrides: Record<string, unknown> = {},
+) {
+    const scopeDrivenOverrides = {
+        ...overrides,
+    };
+    const adapterOverrides: Record<string, unknown> = {};
+
+    if ('rows' in scopeDrivenOverrides) {
+        adapterOverrides.rows = scopeDrivenOverrides.rows;
+        delete scopeDrivenOverrides.rows;
+    }
+
+    if ('watermarks' in scopeDrivenOverrides) {
+        adapterOverrides.watermarks = scopeDrivenOverrides.watermarks;
+        delete scopeDrivenOverrides.watermarks;
+    }
+
+    if ('pit_candidates' in scopeDrivenOverrides) {
+        adapterOverrides.pit_candidates = scopeDrivenOverrides.pit_candidates;
+        delete scopeDrivenOverrides.pit_candidates;
+    }
+
+    if (
+        !('compatibility_adapter' in scopeDrivenOverrides)
+        && Object.keys(adapterOverrides).length > 0
+    ) {
+        scopeDrivenOverrides.compatibility_adapter =
+            buildCompatibilityAdapter(adapterOverrides);
+    }
+
+    return {
+        tenant_id: 'tenant-acme',
+        instance_id: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        plan_id: 'plan-01',
+        requested_by: 'operator-1',
+        pit: {
+            restore_time: '2026-02-16T12:00:00.123Z',
+            restore_timezone: 'UTC',
+            pit_algorithm_version: PIT_ALGORITHM_VERSION,
+            tie_breaker: [
+                'sys_updated_on',
+                'sys_mod_count',
+                '__time',
+                'event_id',
+            ],
+            tie_breaker_fallback: [
+                'sys_updated_on',
+                '__time',
+                'event_id',
+            ],
+        },
+        scope: {
+            mode: 'table',
+            tables: ['x_app.ticket'],
+        },
+        execution_options: {
+            missing_row_mode: 'existing_only',
+            conflict_policy: 'review_required',
+            schema_compatibility_mode: 'compatible_only',
+            workflow_mode: 'suppressed_default',
+        },
+        ...scopeDrivenOverrides,
+    };
+}
+
+function buildLegacyDryRunRequest(
     overrides: Record<string, unknown> = {},
 ) {
     return {
@@ -97,6 +175,7 @@ function buildValidDryRunRequest(
         },
         rows: [buildValidRow()],
         watermarks: [buildValidWatermark()],
+        pit_candidates: [],
         ...overrides,
     };
 }
@@ -109,12 +188,45 @@ describe('parseCreateDryRunPlanRequest', () => {
         assert.equal(result.success, true);
         if (result.success) {
             assert.equal(result.data.plan_id, 'plan-01');
+            assert.equal(result.data.input_mode, 'scope_driven');
+            assert.equal(result.data.rows.length, 0);
+            assert.equal(result.data.watermarks.length, 0);
         }
     });
 
-    test('accepts legacy full watermarks and normalizes to hints', () => {
+    test('accepts scope-driven request without compatibility adapter', () => {
         const result = parseCreateDryRunPlanRequest(
             buildValidDryRunRequest(),
+        );
+        assert.equal(result.success, true);
+        if (!result.success) {
+            return;
+        }
+
+        assert.equal(result.data.input_mode, 'scope_driven');
+        assert.deepEqual(result.data.rows, []);
+        assert.deepEqual(result.data.pit_candidates, []);
+        assert.deepEqual(result.data.watermarks, []);
+    });
+
+    test('accepts legacy request shape through temporary adapter path', () => {
+        const result = parseCreateDryRunPlanRequest(
+            buildLegacyDryRunRequest(),
+            { allowLegacyRowsCompat: true },
+        );
+
+        assert.equal(result.success, true);
+        if (result.success) {
+            assert.equal(result.data.input_mode, 'legacy_rows');
+            assert.equal(result.data.rows.length, 1);
+        }
+    });
+
+    test('accepts compatibility adapter watermarks and normalizes to hints', () => {
+        const result = parseCreateDryRunPlanRequest(
+            buildValidDryRunRequest({
+                watermarks: [buildValidWatermark()],
+            }),
         );
         assert.equal(result.success, true);
         if (!result.success) {
@@ -380,8 +492,11 @@ describe('buildApprovalPlaceholder', () => {
 
 describe('buildPlanHashInput', () => {
     function buildParsedRequest(): CreateDryRunPlanRequest {
-        const raw = buildValidDryRunRequest();
-        const result = parseCreateDryRunPlanRequest(raw);
+        const raw = buildLegacyDryRunRequest();
+        const result = parseCreateDryRunPlanRequest(
+            raw,
+            { allowLegacyRowsCompat: true },
+        );
         assert.equal(result.success, true);
         if (!result.success) {
             throw new Error('unreachable');
@@ -420,12 +535,15 @@ describe('buildPlanHashInput', () => {
             buildPlanHashInput(request1, counts),
         );
 
-        const raw2 = buildValidDryRunRequest({
+        const raw2 = buildLegacyDryRunRequest({
             rows: [
                 buildValidRow({ row_id: 'row-02' }),
             ],
         });
-        const result2 = parseCreateDryRunPlanRequest(raw2);
+        const result2 = parseCreateDryRunPlanRequest(
+            raw2,
+            { allowLegacyRowsCompat: true },
+        );
         assert.equal(result2.success, true);
         if (!result2.success) {
             throw new Error('unreachable');

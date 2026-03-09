@@ -41,14 +41,19 @@
 - `registry/acp-source-mapping-provider.ts`: ACP mapping provider with positive
   and negative TTL caching primitives for staged scope-enforcement migration.
 - `plans/models.ts`: RS-08 dry-run request/response and gate model contracts.
-- `plans/plan-service.ts`: RS-08 deterministic dry-run plan generation and
+- `plans/plan-service.ts`: RS-08 deterministic dry-run plan generation with
+  scope/PIT indexed-event row materialization, plus
   freshness/deletion/conflict executability gating from authoritative
   restore-index state, including ACP-backed tenant/instance/source mapping
   enforcement.
+- `plans/materialization-service.ts`: stage-03 PIT winner resolution and
+  authoritative artifact-body materialization service that derives canonical
+  restore rows (`RestorePlanHashRowInput`) and `pit_resolutions`.
 - `plans/plan-state-store.ts`: durable Postgres + in-memory state store adapters
   for dry-run plans.
 - `restore-index/state-reader.ts`: in-memory and Postgres readers for
-  authoritative restore-index watermarks with freshness policy derivation.
+  authoritative restore-index watermarks with freshness policy derivation, plus
+  scoped indexed-event PIT candidate lookup adapters.
 - `locks/lock-manager.ts`: `(tenant, instance, table)` lock acquisition,
   queueing, release, queued-job promotion, and lock-state import/export.
 - `jobs/models.ts`: request schemas and runtime record types for plans/jobs.
@@ -80,6 +85,9 @@
 - `execute/execute-service.test.ts`: RS-09 conflict matrix/capability
   enforcement plus RS-10 checkpoint/resume/journal linkage coverage and RS-11
   media restore behavior tests.
+- `plans/materialization-service.test.ts`: stage-03 unit tests for PIT winner
+  resolution, missing artifact body handling, missing/ambiguous PIT candidate
+  fail-closed behavior, and deterministic row assembly.
 - `evidence/evidence-service.test.ts`: RS-12 determinism and tamper-detection
   tests for report/artifact/signature integrity checks.
 - `server.integration.test.ts`: auth + source-mapping fail-closed integration

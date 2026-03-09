@@ -15,12 +15,19 @@ import {
     InMemoryRestoreIndexStateReader,
     RestoreIndexStateReader,
 } from '../restore-index/state-reader';
+import {
+    InMemoryRestoreArtifactBodyReader,
+    RestoreRowMaterializationService,
+} from './materialization-service';
 import { InMemoryRestorePlanStateStore } from './plan-state-store';
 import { RestorePlanService } from './plan-service';
 
 const PIT_ALGORITHM_VERSION =
     'pit.v1.sys_updated_on-sys_mod_count-__time-event_id';
 const NOW = new Date('2026-02-18T15:30:00.000Z');
+const LEGACY_ROWS_COMPAT_OPTIONS = {
+    allowLegacyRowsCompat: true,
+} as const;
 
 function fixedNow(): Date {
     return new Date(NOW);
@@ -135,9 +142,111 @@ function buildDryRunRequest(
     };
 }
 
+function buildScopeDrivenDryRunRequest(
+    planId = 'plan-scope-01',
+    overrides: Record<string, unknown> = {},
+) {
+    return {
+        tenant_id: 'tenant-acme',
+        instance_id: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        plan_id: planId,
+        requested_by: 'operator@example.com',
+        pit: {
+            restore_time: '2026-02-18T15:30:00.000Z',
+            restore_timezone: 'UTC',
+            pit_algorithm_version: PIT_ALGORITHM_VERSION,
+            tie_breaker: [
+                'sys_updated_on',
+                'sys_mod_count',
+                '__time',
+                'event_id',
+            ],
+            tie_breaker_fallback: [
+                'sys_updated_on',
+                '__time',
+                'event_id',
+            ],
+        },
+        scope: {
+            mode: 'table',
+            tables: ['x_app.ticket'],
+        },
+        execution_options: {
+            missing_row_mode: 'existing_only',
+            conflict_policy: 'review_required',
+            schema_compatibility_mode: 'compatible_only',
+            workflow_mode: 'suppressed_default',
+        },
+        ...overrides,
+    };
+}
+
+function buildArtifactBody(
+    overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+    return {
+        __op: 'U',
+        __schema_version: 3,
+        __type: 'cdc.write',
+        row_enc: {
+            alg: 'AES-256-GCM',
+            ciphertext: 'cipher-row',
+        },
+        ...overrides,
+    };
+}
+
+function seedScopeMaterializationRecord(input: {
+    artifactReader: InMemoryRestoreArtifactBodyReader;
+    eventId: string;
+    eventTime: string;
+    indexReader: InMemoryRestoreIndexStateReader;
+    offset: string;
+    partition: number;
+    recordSysId: string;
+    sysModCount: number;
+    sysUpdatedOn: string;
+    table: string;
+}): void {
+    const artifactKey = `rez/restore/event=${input.eventId}.artifact.json`;
+    const manifestKey = `rez/restore/event=${input.eventId}.manifest.json`;
+
+    input.indexReader.upsertIndexedEventCandidate({
+        artifactKey,
+        eventId: input.eventId,
+        eventTime: input.eventTime,
+        instanceId: 'sn-dev-01',
+        manifestKey,
+        offset: input.offset,
+        partition: input.partition,
+        recordSysId: input.recordSysId,
+        source: 'sn://acme-dev.service-now.com',
+        sysModCount: input.sysModCount,
+        sysUpdatedOn: input.sysUpdatedOn,
+        table: input.table,
+        tenantId: 'tenant-acme',
+        topic: 'rez.cdc',
+    });
+    input.artifactReader.setArtifactBody({
+        artifactKey,
+        body: buildArtifactBody({
+            row_enc: {
+                alg: 'AES-256-GCM',
+                ciphertext: `cipher-${input.recordSysId}`,
+            },
+        }),
+        manifestKey,
+    });
+}
+
 type Fixture = {
     service: RestorePlanService;
     indexReader: InMemoryRestoreIndexStateReader;
+};
+
+type ScopeDrivenFixture = Fixture & {
+    artifactReader: InMemoryRestoreArtifactBodyReader;
 };
 
 type FoundMapping = Extract<
@@ -206,8 +315,45 @@ function createFixture(options?: {
         new InMemoryRestorePlanStateStore(),
         indexReader,
         createResolver(options?.resolveHandler),
+        undefined,
+        LEGACY_ROWS_COMPAT_OPTIONS,
     );
     return { service, indexReader };
+}
+
+function createScopeDrivenFixture(options?: {
+    resolveHandler?: (
+        input: ResolveSourceMappingInput,
+    ) => Promise<AcpResolveSourceMappingResult>;
+}): ScopeDrivenFixture {
+    const registry = new SourceRegistry([
+        {
+            tenantId: 'tenant-acme',
+            instanceId: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+        },
+    ]);
+    const indexReader = new InMemoryRestoreIndexStateReader();
+    const artifactReader = new InMemoryRestoreArtifactBodyReader();
+
+    indexReader.upsertWatermark(
+        RestoreWatermarkSchema.parse(buildWatermark()),
+    );
+
+    const service = new RestorePlanService(
+        registry,
+        fixedNow,
+        new InMemoryRestorePlanStateStore(),
+        indexReader,
+        createResolver(options?.resolveHandler),
+        new RestoreRowMaterializationService(artifactReader),
+    );
+
+    return {
+        service,
+        indexReader,
+        artifactReader,
+    };
 }
 
 describe('RestorePlanService', () => {
@@ -228,6 +374,157 @@ describe('RestorePlanService', () => {
                 'none',
             );
         }
+    });
+
+    test('createDryRunPlan materializes rows for scope-driven request', async () => {
+        const fixture = createScopeDrivenFixture();
+
+        seedScopeMaterializationRecord({
+            artifactReader: fixture.artifactReader,
+            eventId: 'evt-scope-01',
+            eventTime: '2026-02-18T15:20:00.000Z',
+            indexReader: fixture.indexReader,
+            offset: '100',
+            partition: 0,
+            recordSysId: 'rec-01',
+            sysModCount: 2,
+            sysUpdatedOn: '2026-02-18 15:20:00',
+            table: 'x_app.ticket',
+        });
+
+        const result = await fixture.service.createDryRunPlan(
+            buildScopeDrivenDryRunRequest('plan-scope-driven', {
+                scope: {
+                    mode: 'record',
+                    tables: ['x_app.ticket'],
+                    record_sys_ids: ['rec-01'],
+                },
+            }),
+            claims(),
+        );
+
+        assert.equal(result.success, true);
+        if (!result.success) {
+            return;
+        }
+
+        assert.equal(result.record.gate.executability, 'executable');
+        assert.equal(result.record.plan_hash_input.rows.length, 1);
+        assert.equal(result.record.pit_resolutions.length, 1);
+        assert.equal(
+            result.record.pit_resolutions[0].winning_event_id,
+            'evt-scope-01',
+        );
+        assert.equal(
+            result.record.plan_hash_input.rows[0].metadata.metadata.event_id,
+            'evt-scope-01',
+        );
+    });
+
+    test(
+        'createDryRunPlan keeps deterministic plan_hash for '
+        + 'scope-driven materialization',
+        async () => {
+            const fixtureA = createScopeDrivenFixture();
+            const fixtureB = createScopeDrivenFixture();
+
+            seedScopeMaterializationRecord({
+                artifactReader: fixtureA.artifactReader,
+                eventId: 'evt-alpha',
+                eventTime: '2026-02-18T15:20:00.000Z',
+                indexReader: fixtureA.indexReader,
+                offset: '101',
+                partition: 0,
+                recordSysId: 'rec-alpha',
+                sysModCount: 2,
+                sysUpdatedOn: '2026-02-18 15:20:00',
+                table: 'x_app.ticket',
+            });
+            seedScopeMaterializationRecord({
+                artifactReader: fixtureA.artifactReader,
+                eventId: 'evt-bravo',
+                eventTime: '2026-02-18T15:21:00.000Z',
+                indexReader: fixtureA.indexReader,
+                offset: '102',
+                partition: 0,
+                recordSysId: 'rec-bravo',
+                sysModCount: 1,
+                sysUpdatedOn: '2026-02-18 15:21:00',
+                table: 'x_app.ticket',
+            });
+            seedScopeMaterializationRecord({
+                artifactReader: fixtureB.artifactReader,
+                eventId: 'evt-bravo',
+                eventTime: '2026-02-18T15:21:00.000Z',
+                indexReader: fixtureB.indexReader,
+                offset: '102',
+                partition: 0,
+                recordSysId: 'rec-bravo',
+                sysModCount: 1,
+                sysUpdatedOn: '2026-02-18 15:21:00',
+                table: 'x_app.ticket',
+            });
+            seedScopeMaterializationRecord({
+                artifactReader: fixtureB.artifactReader,
+                eventId: 'evt-alpha',
+                eventTime: '2026-02-18T15:20:00.000Z',
+                indexReader: fixtureB.indexReader,
+                offset: '101',
+                partition: 0,
+                recordSysId: 'rec-alpha',
+                sysModCount: 2,
+                sysUpdatedOn: '2026-02-18 15:20:00',
+                table: 'x_app.ticket',
+            });
+
+            const request = buildScopeDrivenDryRunRequest('plan-scope-det');
+            const resultA = await fixtureA.service.createDryRunPlan(
+                request,
+                claims(),
+            );
+            const resultB = await fixtureB.service.createDryRunPlan(
+                request,
+                claims(),
+            );
+
+            assert.equal(resultA.success, true);
+            assert.equal(resultB.success, true);
+            if (!resultA.success || !resultB.success) {
+                return;
+            }
+
+            assert.equal(
+                resultA.record.plan.plan_hash,
+                resultB.record.plan.plan_hash,
+            );
+            assert.deepEqual(
+                resultA.record.plan_hash_input.rows,
+                resultB.record.plan_hash_input.rows,
+            );
+            assert.equal(
+                resultA.record.plan_hash_input.rows[0].row_id <
+                resultA.record.plan_hash_input.rows[1].row_id,
+                true,
+            );
+        },
+    );
+
+    test('createDryRunPlan fails closed when scope lookup has no coverage', async () => {
+        const fixture = createScopeDrivenFixture();
+        const result = await fixture.service.createDryRunPlan(
+            buildScopeDrivenDryRunRequest('plan-scope-no-coverage'),
+            claims(),
+        );
+
+        assert.equal(result.success, false);
+        if (result.success) {
+            return;
+        }
+
+        assert.equal(result.statusCode, 409);
+        assert.equal(result.error, 'restore_plan_materialization_failed');
+        assert.equal(result.reasonCode, 'blocked_freshness_unknown');
+        assert.equal(result.freshnessUnknownDetail, 'no_indexed_coverage');
     });
 
     test('createDryRunPlan returns blocked gate for unresolved deletes', async () => {
@@ -338,6 +635,9 @@ describe('RestorePlanService', () => {
                 fixedNow,
                 new InMemoryRestorePlanStateStore(),
                 indexReader,
+                undefined,
+                undefined,
+                LEGACY_ROWS_COMPAT_OPTIONS,
             );
             const result = await service.createDryRunPlan(
                 buildDryRunRequest('plan-derived-non-zero', {
@@ -379,6 +679,9 @@ describe('RestorePlanService', () => {
                 fixedNow,
                 new InMemoryRestorePlanStateStore(),
                 indexReader,
+                undefined,
+                undefined,
+                LEGACY_ROWS_COMPAT_OPTIONS,
             );
             const result = await service.createDryRunPlan(
                 buildDryRunRequest('plan-unknown', {
@@ -427,6 +730,9 @@ describe('RestorePlanService', () => {
                 fixedNow,
                 new InMemoryRestorePlanStateStore(),
                 indexReader,
+                undefined,
+                undefined,
+                LEGACY_ROWS_COMPAT_OPTIONS,
             );
             const result = await service.createDryRunPlan(
                 buildDryRunRequest('plan-derived-missing-authoritative', {
@@ -484,6 +790,9 @@ describe('RestorePlanService', () => {
                 fixedNow,
                 new InMemoryRestorePlanStateStore(),
                 malformedTimestampReader,
+                undefined,
+                undefined,
+                LEGACY_ROWS_COMPAT_OPTIONS,
             );
             const result = await service.createDryRunPlan(
                 buildDryRunRequest('plan-invalid-authoritative-timestamp', {
@@ -531,6 +840,9 @@ describe('RestorePlanService', () => {
                 fixedNow,
                 new InMemoryRestorePlanStateStore(),
                 failingReader,
+                undefined,
+                undefined,
+                LEGACY_ROWS_COMPAT_OPTIONS,
             );
             const result = await service.createDryRunPlan(
                 buildDryRunRequest('plan-index-unavailable', {
@@ -578,6 +890,9 @@ describe('RestorePlanService', () => {
             fixedNow,
             new InMemoryRestorePlanStateStore(),
             indexReader,
+            undefined,
+            undefined,
+            LEGACY_ROWS_COMPAT_OPTIONS,
         );
         const result = await service.createDryRunPlan(
             buildDryRunRequest('plan-stale'),
@@ -814,6 +1129,9 @@ describe('RestorePlanService', () => {
             fixedNow,
             new InMemoryRestorePlanStateStore(),
             indexReader,
+            undefined,
+            undefined,
+            LEGACY_ROWS_COMPAT_OPTIONS,
         );
         const result = await service.createDryRunPlan(
             buildDryRunRequest('plan-mixed', {

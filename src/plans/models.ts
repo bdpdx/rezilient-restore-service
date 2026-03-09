@@ -6,11 +6,13 @@ import {
     RESTORE_METADATA_ALLOWLIST_VERSION,
     RestoreApprovalMetadata as RestoreApprovalMetadataSchema,
     RestoreConflict as RestoreConflictSchema,
+    RestoreDeleteCandidate as RestoreDeleteCandidateSchema,
+    RestoreDryRunRequest as RestoreDryRunRequestSchema,
     RestoreDryRunWatermarkHint as RestoreDryRunWatermarkHintSchema,
     RestoreExecutionOptions as RestoreExecutionOptionsSchema,
     RestoreMediaCandidate as RestoreMediaCandidateSchema,
     RestorePitContract as RestorePitContractSchema,
-    RestorePitRowTuple as RestorePitRowTupleSchema,
+    RestorePitCandidate as RestorePitCandidateSchema,
     RestorePlanHashInput as RestorePlanHashInputSchema,
     RestorePlanHashRowInput as RestorePlanHashRowInputSchema,
     RestoreScope as RestoreScopeSchema,
@@ -19,10 +21,12 @@ import {
 import type {
     RestoreApprovalMetadata,
     RestoreConflict,
+    RestoreDeleteCandidate as SharedRestoreDeleteCandidate,
+    RestoreDryRunRequest as SharedRestoreDryRunRequest,
     RestoreExecutionOptions,
     RestoreMediaCandidate,
     RestorePitContract,
-    RestorePitRowTuple,
+    RestorePitCandidate as SharedRestorePitCandidate,
     RestorePlan,
     RestorePlanHashInput,
     RestorePlanHashRowInput,
@@ -33,45 +37,7 @@ import type {
 } from '@rezilient/types';
 
 export type DryRunExecutability = 'executable' | 'preview_only' | 'blocked';
-
-const BaseDryRunRequestSchema = z
-    .object({
-        tenant_id: z.string().min(1),
-        instance_id: z.string().min(1),
-        source: z.string().min(1),
-        plan_id: z.string().min(1),
-        requested_by: z.string().min(1),
-        pit: z.unknown(),
-        scope: z.unknown(),
-        execution_options: z.unknown(),
-        rows: z.array(z.unknown()).min(1),
-        conflicts: z.array(z.unknown()).optional().default([]),
-        delete_candidates: z.array(z.unknown()).optional().default([]),
-        media_candidates: z.array(z.unknown()).optional().default([]),
-        watermarks: z.array(z.unknown()).min(1),
-        pit_candidates: z.array(z.unknown()).optional().default([]),
-        approval: z.unknown().optional(),
-    })
-    .strict();
-
-const RestoreDeleteCandidateSchema = z
-    .object({
-        candidate_id: z.string().min(1),
-        row_id: z.string().min(1),
-        table: z.string().min(1),
-        record_sys_id: z.string().min(1),
-        decision: z.enum(['allow_deletion', 'skip_deletion']).optional(),
-    })
-    .strict();
-
-const RestorePitCandidateSchema = z
-    .object({
-        row_id: z.string().min(1),
-        table: z.string().min(1),
-        record_sys_id: z.string().min(1),
-        versions: z.array(z.unknown()).min(1),
-    })
-    .strict();
+export type DryRunInputMode = 'legacy_rows' | 'scope_driven';
 
 const RestoreDryRunRequestWatermarkSchema = z.union([
     RestoreWatermarkSchema,
@@ -82,22 +48,45 @@ type RestoreDryRunRequestWatermark =
     | RestoreWatermark
     | RestoreDryRunWatermarkHint;
 
-export interface RestoreDeleteCandidate {
-    candidate_id: string;
-    row_id: string;
-    table: string;
-    record_sys_id: string;
-    decision?: 'allow_deletion' | 'skip_deletion';
-}
+// Temporary staged adapter kept only for explicit test compatibility coverage.
+const RestoreDryRunLegacyRequestSchema = z
+    .object({
+        tenant_id: z.string().min(1),
+        instance_id: z.string().min(1),
+        source: z.string().min(1),
+        plan_id: z.string().min(1),
+        requested_by: z.string().min(1),
+        pit: RestorePitContractSchema,
+        scope: RestoreScopeSchema,
+        execution_options: RestoreExecutionOptionsSchema,
+        rows: z.array(RestorePlanHashRowInputSchema).min(1),
+        conflicts: z.array(RestoreConflictSchema).optional().default([]),
+        delete_candidates: z
+            .array(RestoreDeleteCandidateSchema)
+            .optional()
+            .default([]),
+        media_candidates: z
+            .array(RestoreMediaCandidateSchema)
+            .optional()
+            .default([]),
+        watermarks: z.array(RestoreDryRunRequestWatermarkSchema).min(1),
+        pit_candidates: z
+            .array(RestorePitCandidateSchema)
+            .optional()
+            .default([]),
+        approval: RestoreApprovalMetadataSchema.optional(),
+    })
+    .strict();
 
-export interface RestorePitCandidate {
-    row_id: string;
-    table: string;
-    record_sys_id: string;
-    versions: RestorePitRowTuple[];
-}
+type RestoreDryRunLegacyRequest = z.infer<
+    typeof RestoreDryRunLegacyRequestSchema
+>;
+
+export type RestoreDeleteCandidate = SharedRestoreDeleteCandidate;
+export type RestorePitCandidate = SharedRestorePitCandidate;
 
 export interface CreateDryRunPlanRequest {
+    input_mode: DryRunInputMode;
     tenant_id: string;
     instance_id: string;
     source: string;
@@ -128,6 +117,10 @@ export interface ParseCreateDryRunPlanRequestFailure {
 export type ParseCreateDryRunPlanRequestResult =
     | ParseCreateDryRunPlanRequestSuccess
     | ParseCreateDryRunPlanRequestFailure;
+
+export interface ParseCreateDryRunPlanRequestOptions {
+    allowLegacyRowsCompat?: boolean;
+}
 
 export interface RestorePitResolutionRecord {
     row_id: string;
@@ -198,217 +191,12 @@ export interface RestoreActionCountsRecord {
     attachment_skip: number;
 }
 
-function parseNested<T>(
-    schema: {
-        safeParse: (value: unknown) => {
-            success: boolean;
-            data?: T;
-            error?: {
-                issues?: Array<{
-                    message: string;
-                }>;
-            };
-        };
-    },
-    value: unknown,
-    fieldName: string,
-): {
-    success: boolean;
-    data?: T;
-    message?: string;
-} {
-    const parsed = schema.safeParse(value);
-
-    if (!parsed.success) {
-        const issueMessage = parsed.error?.issues?.[0]?.message ||
-            'invalid value';
-
-        return {
-            success: false,
-            message: `${fieldName}: ${issueMessage}`,
-        };
-    }
-
-    return {
-        success: true,
-        data: parsed.data as T,
-    };
-}
-
-function parseArrayWithSchema<T>(
-    schema: {
-        safeParse: (value: unknown) => {
-            success: boolean;
-            data?: T;
-            error?: {
-                issues?: Array<{
-                    message: string;
-                }>;
-            };
-        };
-    },
-    values: unknown[],
-    fieldName: string,
-): {
-    success: boolean;
-    data?: T[];
-    message?: string;
-} {
-    const out: T[] = [];
-
-    for (let index = 0; index < values.length; index += 1) {
-        const parsed = parseNested<T>(
-            schema,
-            values[index],
-            `${fieldName}[${index}]`,
-        );
-
-        if (!parsed.success) {
-            return {
-                success: false,
-                message: parsed.message,
-            };
-        }
-
-        out.push(parsed.data as T);
-    }
-
-    return {
-        success: true,
-        data: out,
-    };
-}
-
-export function parseCreateDryRunPlanRequest(
-    requestBody: unknown,
-): ParseCreateDryRunPlanRequestResult {
-    const baseParsed = BaseDryRunRequestSchema.safeParse(requestBody);
-
-    if (!baseParsed.success) {
-        return {
-            success: false,
-            message: baseParsed.error.issues[0]?.message || 'Invalid request',
-        };
-    }
-
-    const base = baseParsed.data;
-
-    const pitParsed = parseNested<RestorePitContract>(
-        RestorePitContractSchema,
-        base.pit,
-        'pit',
-    );
-
-    if (!pitParsed.success) {
-        return {
-            success: false,
-            message: pitParsed.message as string,
-        };
-    }
-
-    const scopeParsed = parseNested<RestoreScope>(
-        RestoreScopeSchema,
-        base.scope,
-        'scope',
-    );
-
-    if (!scopeParsed.success) {
-        return {
-            success: false,
-            message: scopeParsed.message as string,
-        };
-    }
-
-    const executionOptionsParsed = parseNested<RestoreExecutionOptions>(
-        RestoreExecutionOptionsSchema,
-        base.execution_options,
-        'execution_options',
-    );
-
-    if (!executionOptionsParsed.success) {
-        return {
-            success: false,
-            message: executionOptionsParsed.message as string,
-        };
-    }
-
-    const rowsParsed = parseArrayWithSchema<RestorePlanHashRowInput>(
-        RestorePlanHashRowInputSchema,
-        base.rows,
-        'rows',
-    );
-
-    if (!rowsParsed.success) {
-        return {
-            success: false,
-            message: rowsParsed.message as string,
-        };
-    }
-
-    const conflictsParsed = parseArrayWithSchema<RestoreConflict>(
-        RestoreConflictSchema,
-        base.conflicts,
-        'conflicts',
-    );
-
-    if (!conflictsParsed.success) {
-        return {
-            success: false,
-            message: conflictsParsed.message as string,
-        };
-    }
-
-    const deleteCandidates: RestoreDeleteCandidate[] = [];
-    for (let index = 0; index < base.delete_candidates.length; index += 1) {
-        const parsed = RestoreDeleteCandidateSchema.safeParse(
-            base.delete_candidates[index],
-        );
-
-        if (!parsed.success) {
-            return {
-                success: false,
-                message: `delete_candidates[${index}]: ` +
-                    (parsed.error.issues[0]?.message || 'invalid value'),
-            };
-        }
-
-        deleteCandidates.push(parsed.data);
-    }
-
-    const mediaCandidatesParsed = parseArrayWithSchema<RestoreMediaCandidate>(
-        RestoreMediaCandidateSchema,
-        base.media_candidates,
-        'media_candidates',
-    );
-
-    if (!mediaCandidatesParsed.success) {
-        return {
-            success: false,
-            message: mediaCandidatesParsed.message as string,
-        };
-    }
-
-    const watermarksParsed = parseArrayWithSchema<
-        RestoreDryRunRequestWatermark
-    >(
-        RestoreDryRunRequestWatermarkSchema,
-        base.watermarks,
-        'watermarks',
-    );
-
-    if (!watermarksParsed.success) {
-        return {
-            success: false,
-            message: watermarksParsed.message as string,
-        };
-    }
-
-    const parsedWatermarks =
-        watermarksParsed.data as RestoreDryRunRequestWatermark[];
+function normalizeWatermarkHints(
+    watermarks: RestoreDryRunRequestWatermark[],
+): RestoreDryRunWatermarkHint[] {
     const normalizedWatermarks: RestoreDryRunWatermarkHint[] = [];
 
-    for (let index = 0; index < parsedWatermarks.length; index += 1) {
-        const watermark = parsedWatermarks[index];
+    for (const watermark of watermarks) {
         const normalizedWatermark: RestoreDryRunWatermarkHint = {
             topic: watermark.topic,
         };
@@ -420,81 +208,145 @@ export function parseCreateDryRunPlanRequest(
         normalizedWatermarks.push(normalizedWatermark);
     }
 
-    const pitCandidates: RestorePitCandidate[] = [];
-    for (let index = 0; index < base.pit_candidates.length; index += 1) {
-        const baseCandidateParsed = RestorePitCandidateSchema.safeParse(
-            base.pit_candidates[index],
-        );
+    return normalizedWatermarks;
+}
 
-        if (!baseCandidateParsed.success) {
-            return {
-                success: false,
-                message: `pit_candidates[${index}]: ` +
-                    (baseCandidateParsed.error.issues[0]?.message ||
-                    'invalid value'),
-            };
-        }
-
-        const versionsParsed = parseArrayWithSchema<RestorePitRowTuple>(
-            RestorePitRowTupleSchema,
-            baseCandidateParsed.data.versions,
-            `pit_candidates[${index}].versions`,
-        );
-
-        if (!versionsParsed.success) {
-            return {
-                success: false,
-                message: versionsParsed.message as string,
-            };
-        }
-
-        pitCandidates.push({
-            row_id: baseCandidateParsed.data.row_id,
-            table: baseCandidateParsed.data.table,
-            record_sys_id: baseCandidateParsed.data.record_sys_id,
-            versions: versionsParsed.data as RestorePitRowTuple[],
-        });
-    }
-
-    let approval: RestoreApprovalMetadata | undefined;
-
-    if (base.approval !== undefined) {
-        const approvalParsed = parseNested<RestoreApprovalMetadata>(
-            RestoreApprovalMetadataSchema,
-            base.approval,
-            'approval',
-        );
-
-        if (!approvalParsed.success) {
-            return {
-                success: false,
-                message: approvalParsed.message as string,
-            };
-        }
-
-        approval = approvalParsed.data;
-    }
-
+function buildParsedRequest(
+    input: {
+        input_mode: DryRunInputMode;
+        tenant_id: string;
+        instance_id: string;
+        source: string;
+        plan_id: string;
+        requested_by: string;
+        pit: RestorePitContract;
+        scope: RestoreScope;
+        execution_options: RestoreExecutionOptions;
+        rows?: RestorePlanHashRowInput[];
+        conflicts: RestoreConflict[];
+        delete_candidates: RestoreDeleteCandidate[];
+        media_candidates: RestoreMediaCandidate[];
+        watermarks?: RestoreDryRunRequestWatermark[];
+        pit_candidates?: RestorePitCandidate[];
+        approval?: RestoreApprovalMetadata;
+    },
+): ParseCreateDryRunPlanRequestResult {
     return {
         success: true,
         data: {
-            tenant_id: base.tenant_id,
-            instance_id: base.instance_id,
-            source: base.source,
-            plan_id: base.plan_id,
-            requested_by: base.requested_by,
-            pit: pitParsed.data as RestorePitContract,
-            scope: scopeParsed.data as RestoreScope,
-            execution_options: executionOptionsParsed.data as RestoreExecutionOptions,
-            rows: rowsParsed.data as RestorePlanHashRowInput[],
-            conflicts: conflictsParsed.data as RestoreConflict[],
-            delete_candidates: deleteCandidates,
-            media_candidates:
-                mediaCandidatesParsed.data as RestoreMediaCandidate[],
-            watermarks: normalizedWatermarks,
-            pit_candidates: pitCandidates,
-            approval,
+            input_mode: input.input_mode,
+            tenant_id: input.tenant_id,
+            instance_id: input.instance_id,
+            source: input.source,
+            plan_id: input.plan_id,
+            requested_by: input.requested_by,
+            pit: input.pit,
+            scope: input.scope,
+            execution_options: input.execution_options,
+            rows: input.rows || [],
+            conflicts: input.conflicts,
+            delete_candidates: input.delete_candidates,
+            media_candidates: input.media_candidates,
+            watermarks: normalizeWatermarkHints(input.watermarks || []),
+            pit_candidates: input.pit_candidates || [],
+            approval: input.approval,
         },
+    };
+}
+
+function parseScopeDrivenDryRunRequest(
+    request: SharedRestoreDryRunRequest,
+): ParseCreateDryRunPlanRequestResult {
+    const compatibilityAdapter = request.compatibility_adapter;
+
+    return buildParsedRequest({
+        input_mode: 'scope_driven',
+        tenant_id: request.tenant_id,
+        instance_id: request.instance_id,
+        source: request.source,
+        plan_id: request.plan_id,
+        requested_by: request.requested_by,
+        pit: request.pit,
+        scope: request.scope,
+        execution_options: request.execution_options,
+        conflicts: request.conflicts,
+        delete_candidates: request.delete_candidates,
+        media_candidates: request.media_candidates,
+        watermarks: compatibilityAdapter?.watermarks,
+        pit_candidates: compatibilityAdapter?.pit_candidates,
+        approval: request.approval,
+    });
+}
+
+function parseLegacyDryRunRequest(
+    request: RestoreDryRunLegacyRequest,
+): ParseCreateDryRunPlanRequestResult {
+    return buildParsedRequest({
+        input_mode: 'legacy_rows',
+        tenant_id: request.tenant_id,
+        instance_id: request.instance_id,
+        source: request.source,
+        plan_id: request.plan_id,
+        requested_by: request.requested_by,
+        pit: request.pit,
+        scope: request.scope,
+        execution_options: request.execution_options,
+        rows: request.rows,
+        conflicts: request.conflicts,
+        delete_candidates: request.delete_candidates,
+        media_candidates: request.media_candidates,
+        watermarks: request.watermarks,
+        pit_candidates: request.pit_candidates,
+        approval: request.approval,
+    });
+}
+
+export function parseCreateDryRunPlanRequest(
+    requestBody: unknown,
+    options?: ParseCreateDryRunPlanRequestOptions,
+): ParseCreateDryRunPlanRequestResult {
+    const allowLegacyRowsCompat = options?.allowLegacyRowsCompat === true;
+    const scopeDrivenParsed = RestoreDryRunRequestSchema.safeParse(requestBody);
+
+    if (scopeDrivenParsed.success) {
+        return parseScopeDrivenDryRunRequest(scopeDrivenParsed.data);
+    }
+
+    if (!allowLegacyRowsCompat) {
+        return {
+            success: false,
+            message:
+                scopeDrivenParsed.error.issues[0]?.message || 'Invalid request',
+        };
+    }
+
+    const legacyParsed = RestoreDryRunLegacyRequestSchema.safeParse(requestBody);
+
+    if (legacyParsed.success) {
+        return parseLegacyDryRunRequest(legacyParsed.data);
+    }
+
+    const scopeDrivenIssue = scopeDrivenParsed.error.issues[0]?.message;
+    const legacyIssue = legacyParsed.error.issues[0]?.message;
+    const bodyAsRecord = (
+        requestBody &&
+        typeof requestBody === 'object' &&
+        !Array.isArray(requestBody)
+    )
+        ? requestBody as Record<string, unknown>
+        : null;
+    const hasLegacyOnlyFields = bodyAsRecord !== null && (
+        Object.prototype.hasOwnProperty.call(bodyAsRecord, 'rows') ||
+        Object.prototype.hasOwnProperty.call(bodyAsRecord, 'watermarks') ||
+        Object.prototype.hasOwnProperty.call(bodyAsRecord, 'pit_candidates')
+    );
+    const preferredMessage = hasLegacyOnlyFields
+        ? legacyIssue || scopeDrivenIssue
+        : scopeDrivenIssue || legacyIssue;
+
+    return {
+        success: false,
+        message: preferredMessage || 'Invalid request',
     };
 }
 

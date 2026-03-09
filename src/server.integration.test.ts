@@ -28,6 +28,10 @@ import { RestoreJobService } from './jobs/job-service';
 import { RestoreLockManager } from './locks/lock-manager';
 import { RestorePlanService } from './plans/plan-service';
 import {
+    InMemoryRestoreArtifactBodyReader,
+    RestoreRowMaterializationService,
+} from './plans/materialization-service';
+import {
     PostgresRestorePlanStateStore,
     RestorePlanStateStore,
 } from './plans/plan-state-store';
@@ -58,6 +62,22 @@ interface ResponseData {
 }
 
 type SeedableRestoreIndexStateReader = RestoreIndexStateReader & {
+    upsertIndexedEventCandidate?: (candidate: {
+        artifactKey: string;
+        eventId: string;
+        eventTime: string;
+        instanceId: string;
+        manifestKey: string;
+        offset: string;
+        partition: number;
+        recordSysId: string;
+        source: string;
+        sysModCount?: number | null;
+        sysUpdatedOn?: string | null;
+        table: string;
+        tenantId: string;
+        topic: string;
+    }) => void;
     upsertWatermark: (watermark: RestoreWatermark) => void;
 };
 
@@ -211,6 +231,24 @@ function createService(
         adminToken?: string;
         bodyMaxBytes?: number;
         authoritativeWatermarks?: Record<string, unknown>[];
+        indexedEventCandidates?: Array<{
+            artifactKey: string;
+            eventId: string;
+            eventTime: string;
+            manifestKey: string;
+            offset: string;
+            partition: number;
+            recordSysId: string;
+            sysModCount?: number | null;
+            sysUpdatedOn?: string | null;
+            table: string;
+            topic?: string;
+        }>;
+        artifactBodies?: Array<{
+            artifactKey: string;
+            body: Record<string, unknown>;
+            manifestKey: string;
+        }>;
         restoreIndexReader?: RestoreIndexStateReader;
         sourceMappingResolver?: SourceMappingResolver;
         sourceMappingListProvider?: SourceMappingListProvider;
@@ -240,6 +278,7 @@ function createService(
     );
     const restoreIndexReader = options?.restoreIndexReader
         || new InMemoryRestoreIndexStateReader();
+    const artifactBodyReader = new InMemoryRestoreArtifactBodyReader();
 
     if (
         typeof (restoreIndexReader as Partial<SeedableRestoreIndexStateReader>)
@@ -262,6 +301,40 @@ function createService(
                 restoreIndexReader as SeedableRestoreIndexStateReader
             ).upsertWatermark(parsed.data);
         }
+
+        const indexedCandidates = options?.indexedEventCandidates || [];
+        const seedableReader = restoreIndexReader as SeedableRestoreIndexStateReader;
+
+        if (seedableReader.upsertIndexedEventCandidate) {
+            for (const candidate of indexedCandidates) {
+                seedableReader.upsertIndexedEventCandidate({
+                    artifactKey: candidate.artifactKey,
+                    eventId: candidate.eventId,
+                    eventTime: candidate.eventTime,
+                    instanceId: 'sn-dev-01',
+                    manifestKey: candidate.manifestKey,
+                    offset: candidate.offset,
+                    partition: candidate.partition,
+                    recordSysId: candidate.recordSysId,
+                    source: 'sn://acme-dev.service-now.com',
+                    sysModCount: candidate.sysModCount,
+                    sysUpdatedOn: candidate.sysUpdatedOn,
+                    table: candidate.table,
+                    tenantId: 'tenant-acme',
+                    topic: candidate.topic || 'rez.cdc',
+                });
+            }
+        }
+    }
+
+    if (options?.artifactBodies) {
+        for (const artifact of options.artifactBodies) {
+            artifactBodyReader.setArtifactBody({
+                artifactKey: artifact.artifactKey,
+                body: artifact.body,
+                manifestKey: artifact.manifestKey,
+            });
+        }
     }
 
     const plans = new RestorePlanService(
@@ -270,6 +343,10 @@ function createService(
         options?.stateStores?.plans,
         restoreIndexReader,
         options?.sourceMappingResolver,
+        new RestoreRowMaterializationService(artifactBodyReader),
+        {
+            allowLegacyRowsCompat: true,
+        },
     );
     const execute = new RestoreExecutionService(
         jobs,
@@ -656,6 +733,48 @@ function createDryRunPayload(
                 ],
             },
         ],
+    };
+}
+
+function createScopeDrivenDryRunPayload(
+    planId: string,
+    overrides?: {
+        scope?: Record<string, unknown>;
+    },
+): Record<string, unknown> {
+    return {
+        tenant_id: 'tenant-acme',
+        instance_id: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        plan_id: planId,
+        requested_by: 'operator@example.com',
+        pit: {
+            restore_time: '2026-02-16T12:00:00.000Z',
+            restore_timezone: 'UTC',
+            pit_algorithm_version: 'pit.v1.sys_updated_on-sys_mod_count-__time-event_id',
+            tie_breaker: [
+                'sys_updated_on',
+                'sys_mod_count',
+                '__time',
+                'event_id',
+            ],
+            tie_breaker_fallback: [
+                'sys_updated_on',
+                '__time',
+                'event_id',
+            ],
+        },
+        scope: overrides?.scope || {
+            mode: 'record',
+            tables: ['incident'],
+            record_sys_ids: ['rec-01'],
+        },
+        execution_options: {
+            missing_row_mode: 'existing_only',
+            conflict_policy: 'review_required',
+            schema_compatibility_mode: 'compatible_only',
+            workflow_mode: 'suppressed_default',
+        },
     };
 }
 
@@ -1284,6 +1403,76 @@ test('dry-run returns executable gate when ACP mapping exists', async () => {
     }
 });
 
+test('dry-run materializes scope-driven requests from indexed events', async () => {
+    const signingKey = 'test-signing-key';
+    const artifactKey = 'rez/restore/event=evt-scope-01.artifact.json';
+    const manifestKey = 'rez/restore/event=evt-scope-01.manifest.json';
+    const server = createService(signingKey, {
+        sourceMappingResolver: createResolver(createResolveResult()),
+        indexedEventCandidates: [{
+            artifactKey,
+            eventId: 'evt-scope-01',
+            eventTime: '2026-02-16T11:59:00.000Z',
+            manifestKey,
+            offset: '100',
+            partition: 1,
+            recordSysId: 'rec-01',
+            sysModCount: 2,
+            sysUpdatedOn: '2026-02-16 11:59:00',
+            table: 'incident',
+            topic: 'rez.cdc',
+        }],
+        artifactBodies: [{
+            artifactKey,
+            body: {
+                __op: 'U',
+                __schema_version: 3,
+                __type: 'cdc.write',
+                row_enc: {
+                    alg: 'AES-256-GCM',
+                    ciphertext: 'cipher-scope-01',
+                },
+            },
+            manifestKey,
+        }],
+    });
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+
+    try {
+        const response = await postJson(
+            baseUrl,
+            '/v1/plans/dry-run',
+            token,
+            createScopeDrivenDryRunPayload('plan-scope-http'),
+        );
+
+        assert.equal(response.status, 201);
+        const planHashInput = response.body.plan_hash_input as Record<
+            string,
+            unknown
+        >;
+        const rows = planHashInput.rows as Array<Record<string, unknown>>;
+        const firstRow = rows[0];
+        const metadata = firstRow.metadata as Record<string, unknown>;
+        const metadataFields = metadata.metadata as Record<string, unknown>;
+
+        assert.equal(rows.length, 1);
+        assert.equal(firstRow.record_sys_id, 'rec-01');
+        assert.equal(metadataFields.event_id, 'evt-scope-01');
+        assert.equal(metadataFields.topic, 'rez.cdc');
+
+        const pitResolutions = response.body.pit_resolutions as Array<
+            Record<string, unknown>
+        >;
+
+        assert.equal(pitResolutions.length, 1);
+        assert.equal(pitResolutions[0].winning_event_id, 'evt-scope-01');
+    } finally {
+        await closeServer(server);
+    }
+});
+
 test('dry-run fails closed when ACP mapping is missing', async () => {
     const signingKey = 'test-signing-key';
     const server = createService(signingKey, {
@@ -1488,9 +1677,9 @@ test('dry-run rejects invalid watermark offset strings', async () => {
 
         assert.equal(response.status, 400);
         assert.equal(response.body.error, 'invalid_request');
-        assert.equal(
-            response.body.message,
-            'watermarks[0]: must be non-negative integer offset as decimal string',
+        assert.match(
+            String(response.body.message || ''),
+            /must be non-negative integer offset as decimal string/,
         );
     } finally {
         await closeServer(server);

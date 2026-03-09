@@ -7,6 +7,7 @@ import {
     RestorePlan,
     RestoreReasonCode,
     RestoreWatermark,
+    type RestorePlanHashRowInput,
     selectLatestPitRowTuple,
 } from '@rezilient/types';
 import { AuthTokenClaims } from '../auth/claims';
@@ -22,6 +23,7 @@ import {
 import {
     buildApprovalPlaceholder,
     buildPlanHashInput,
+    CreateDryRunPlanFailure,
     CreateDryRunPlanRequest,
     CreateDryRunPlanResult,
     FreshnessUnknownDetail,
@@ -37,11 +39,19 @@ import {
 } from './plan-state-store';
 import {
     InMemoryRestoreIndexStateReader,
+    RestoreIndexAuthoritativeReader,
     RestoreIndexStateReader,
 } from '../restore-index/state-reader';
+import {
+    InMemoryRestoreArtifactBodyReader,
+    RestoreRowMaterializationError,
+    RestoreRowMaterializationService,
+} from './materialization-service';
+import type { MaterializationScopeRecord } from './materialization-service';
 
 function buildActionCounts(
-    request: CreateDryRunPlanRequest,
+    request: Pick<CreateDryRunPlanRequest, 'conflicts' | 'media_candidates'>,
+    rows: RestorePlanHashRowInput[],
 ): RestoreActionCountsRecord {
     const counts = {
         update: 0,
@@ -53,7 +63,7 @@ function buildActionCounts(
         attachment_skip: 0,
     };
 
-    for (const row of request.rows) {
+    for (const row of rows) {
         if (row.action === 'update') {
             counts.update += 1;
             continue;
@@ -456,6 +466,24 @@ function buildPitResolutions(
     return out;
 }
 
+type ResolvePlanRowsResult = {
+    pitResolutions: RestorePitResolutionRecord[];
+    rows: RestorePlanHashRowInput[];
+} | {
+    failure: CreateDryRunPlanFailure;
+};
+
+export interface RestorePlanServiceOptions {
+    allowLegacyRowsCompat?: boolean;
+}
+
+function hasIndexedEventLookup(
+    reader: RestoreIndexStateReader,
+): reader is RestoreIndexAuthoritativeReader {
+    return typeof (reader as Partial<RestoreIndexAuthoritativeReader>)
+        .lookupIndexedEventCandidates === 'function';
+}
+
 export class RestorePlanService {
     private readonly sourceMappingResolver: SourceMappingResolver;
 
@@ -467,6 +495,12 @@ export class RestorePlanService {
         private readonly restoreIndexStateReader: RestoreIndexStateReader =
             new InMemoryRestoreIndexStateReader(),
         sourceMappingResolver?: SourceMappingResolver,
+        private readonly rowMaterializationService:
+            RestoreRowMaterializationService =
+            new RestoreRowMaterializationService(
+                new InMemoryRestoreArtifactBodyReader(),
+            ),
+        private readonly options: RestorePlanServiceOptions = {},
     ) {
         if (sourceMappingResolver) {
             this.sourceMappingResolver = sourceMappingResolver;
@@ -489,7 +523,10 @@ export class RestorePlanService {
         requestBody: unknown,
         claims: AuthTokenClaims,
     ): Promise<CreateDryRunPlanResult> {
-        const parsed = parseCreateDryRunPlanRequest(requestBody);
+        const parsed = parseCreateDryRunPlanRequest(requestBody, {
+            allowLegacyRowsCompat:
+                this.options.allowLegacyRowsCompat === true,
+        });
 
         if (!parsed.success) {
             return {
@@ -513,11 +550,21 @@ export class RestorePlanService {
             };
         }
 
+        const resolvedRows = await this.resolvePlanRows(request);
+
+        if ('failure' in resolvedRows) {
+            return resolvedRows.failure;
+        }
+
+        const requestForPlanning: CreateDryRunPlanRequest = {
+            ...request,
+            rows: resolvedRows.rows,
+        };
         const measuredAt = normalizeIsoWithMillis(this.now());
         const requestedRowPartitions =
-            extractRequestedPartitionsFromRows(request);
+            extractRequestedPartitionsFromRows(requestForPlanning);
         const fallbackHintPartitions =
-            extractRequestedPartitionsFromWatermarks(request);
+            extractRequestedPartitionsFromWatermarks(requestForPlanning);
         let authoritativeWatermarks: RestoreWatermark[];
 
         try {
@@ -530,11 +577,11 @@ export class RestorePlanService {
 
                 return this.restoreIndexStateReader
                     .readWatermarksForPartitions({
-                        instanceId: request.instance_id,
+                        instanceId: requestForPlanning.instance_id,
                         measuredAt,
                         partitions: fallbackHintPartitions,
-                        source: request.source,
-                        tenantId: request.tenant_id,
+                        source: requestForPlanning.source,
+                        tenantId: requestForPlanning.tenant_id,
                     });
             };
 
@@ -542,27 +589,27 @@ export class RestorePlanService {
                 authoritativeWatermarks =
                     await this.restoreIndexStateReader
                         .readWatermarksForPartitions({
-                            instanceId: request.instance_id,
+                            instanceId: requestForPlanning.instance_id,
                             measuredAt,
                             partitions: requestedRowPartitions,
-                            source: request.source,
-                            tenantId: request.tenant_id,
+                            source: requestForPlanning.source,
+                            tenantId: requestForPlanning.tenant_id,
                         });
             } else {
                 const sourceWatermarks =
                     await this.restoreIndexStateReader
                         .listWatermarksForSource({
-                            instanceId: request.instance_id,
+                            instanceId: requestForPlanning.instance_id,
                             measuredAt,
-                            source: request.source,
-                            tenantId: request.tenant_id,
+                            source: requestForPlanning.source,
+                            tenantId: requestForPlanning.tenant_id,
                         });
                 const requestedRowTopics = extractRequestedTopicsFromRows(
-                    request,
+                    requestForPlanning,
                 );
                 const requestedTopics = requestedRowTopics.size > 0
                     ? requestedRowTopics
-                    : extractRequestedTopicsFromWatermarks(request);
+                    : extractRequestedTopicsFromWatermarks(requestForPlanning);
 
                 if (sourceWatermarks.length === 0) {
                     authoritativeWatermarks =
@@ -593,8 +640,14 @@ export class RestorePlanService {
             };
         }
 
-        const actionCounts = buildActionCounts(request);
-        const planHashInput = buildPlanHashInput(request, actionCounts);
+        const actionCounts = buildActionCounts(
+            requestForPlanning,
+            resolvedRows.rows,
+        );
+        const planHashInput = buildPlanHashInput(
+            requestForPlanning,
+            actionCounts,
+        );
         const planHashData = computeRestorePlanHash(planHashInput);
         return this.stateStore.mutate((state) => {
             const existing = state.plans_by_id[request.plan_id];
@@ -619,7 +672,7 @@ export class RestorePlanService {
 
             const nowIso = normalizeIsoWithMillis(this.now());
             const gate = evaluateGate({
-                request,
+                request: requestForPlanning,
                 watermarks: authoritativeWatermarks,
             });
             const plan = RestorePlan.parse({
@@ -646,7 +699,7 @@ export class RestorePlanService {
                 gate,
                 delete_candidates: [...request.delete_candidates],
                 media_candidates: [...request.media_candidates],
-                pit_resolutions: buildPitResolutions(request),
+                pit_resolutions: resolvedRows.pitResolutions,
                 watermarks: [...authoritativeWatermarks],
             };
 
@@ -683,6 +736,190 @@ export class RestorePlanService {
                     right.plan.generated_at,
                 );
             });
+    }
+
+    private async resolvePlanRows(
+        request: CreateDryRunPlanRequest,
+    ): Promise<ResolvePlanRowsResult> {
+        if (request.input_mode === 'legacy_rows') {
+            return {
+                pitResolutions: buildPitResolutions(request),
+                rows: [...request.rows],
+            };
+        }
+
+        if (!hasIndexedEventLookup(this.restoreIndexStateReader)) {
+            return {
+                failure: {
+                    success: false,
+                    statusCode: 503,
+                    error: 'restore_index_unavailable',
+                    reasonCode: 'blocked_freshness_unknown',
+                    freshnessUnknownDetail: 'restore_index_unavailable',
+                    message:
+                        'scope-driven dry-run requires indexed-event lookup, '
+                        + 'but restore index reader does not provide it',
+                },
+            };
+        }
+
+        let lookupResult;
+
+        try {
+            lookupResult =
+                await this.restoreIndexStateReader.lookupIndexedEventCandidates(
+                    {
+                        instanceId: request.instance_id,
+                        pitCutoff: request.pit.restore_time,
+                        recordSysIds: request.scope.record_sys_ids,
+                        source: request.source,
+                        tables: request.scope.tables,
+                        tenantId: request.tenant_id,
+                    },
+                );
+        } catch (error: unknown) {
+            return {
+                failure: {
+                    success: false,
+                    statusCode: 503,
+                    error: 'restore_index_unavailable',
+                    reasonCode: 'blocked_freshness_unknown',
+                    freshnessUnknownDetail: 'restore_index_unavailable',
+                    message:
+                        'authoritative indexed-event lookup failed: '
+                        + String((error as Error)?.message || error),
+                },
+            };
+        }
+
+        if (
+            lookupResult.coverage !== 'covered'
+            || lookupResult.candidates.length === 0
+        ) {
+            return {
+                failure: {
+                    success: false,
+                    statusCode: 409,
+                    error: 'restore_plan_materialization_failed',
+                    reasonCode: 'blocked_freshness_unknown',
+                    freshnessUnknownDetail: 'no_indexed_coverage',
+                    message:
+                        'scope/PIT request has no indexed-event coverage for '
+                        + 'row materialization',
+                },
+            };
+        }
+
+        const scopeRecords = this.buildMaterializationScopeRecords(request);
+
+        try {
+            const materialized = await this.rowMaterializationService
+                .materializeRows({
+                    candidates: lookupResult.candidates,
+                    instanceId: request.instance_id,
+                    scopeRecords,
+                    source: request.source,
+                    tenantId: request.tenant_id,
+                });
+
+            if (materialized.rows.length === 0) {
+                return {
+                    failure: {
+                        success: false,
+                        statusCode: 409,
+                        error: 'restore_plan_materialization_failed',
+                        reasonCode: 'blocked_freshness_unknown',
+                        freshnessUnknownDetail: 'no_indexed_coverage',
+                        message:
+                            'scope/PIT materialization produced zero plan rows',
+                    },
+                };
+            }
+
+            return {
+                pitResolutions: materialized.pitResolutions,
+                rows: materialized.rows,
+            };
+        } catch (error: unknown) {
+            if (error instanceof RestoreRowMaterializationError) {
+                if (error.code === 'missing_pit_candidates') {
+                    return {
+                        failure: {
+                            success: false,
+                            statusCode: 409,
+                            error: 'restore_plan_materialization_failed',
+                            reasonCode: 'blocked_freshness_unknown',
+                            freshnessUnknownDetail: 'no_indexed_coverage',
+                            message:
+                                'scope/PIT row materialization failed '
+                                + `(missing PIT candidates): ${error.message}`,
+                        },
+                    };
+                }
+
+                return {
+                    failure: {
+                        success: false,
+                        statusCode: 409,
+                        error: 'restore_plan_materialization_failed',
+                        reasonCode: 'failed_internal_error',
+                        message:
+                            'scope/PIT row materialization failed '
+                            + `(${error.code}): ${error.message}`,
+                    },
+                };
+            }
+
+            return {
+                failure: {
+                    success: false,
+                    statusCode: 503,
+                    error: 'restore_index_unavailable',
+                    reasonCode: 'blocked_freshness_unknown',
+                    freshnessUnknownDetail: 'restore_index_unavailable',
+                    message:
+                        'scope/PIT row materialization failed: '
+                        + String((error as Error)?.message || error),
+                },
+            };
+        }
+    }
+
+    private buildMaterializationScopeRecords(
+        request: CreateDryRunPlanRequest,
+    ): MaterializationScopeRecord[] {
+        const recordSysIds = request.scope.record_sys_ids;
+
+        if (!recordSysIds || recordSysIds.length === 0) {
+            return [];
+        }
+
+        const tables = [...request.scope.tables]
+            .map((table) => table.trim())
+            .filter((table) => table.length > 0)
+            .sort((left, right) => left.localeCompare(right));
+        const normalizedRecordSysIds = [...recordSysIds]
+            .map((recordSysId) => recordSysId.trim())
+            .filter((recordSysId) => recordSysId.length > 0)
+            .sort((left, right) => left.localeCompare(right));
+        const keyed = new Map<string, MaterializationScopeRecord>();
+
+        for (const table of tables) {
+            for (const recordSysId of normalizedRecordSysIds) {
+                const key = `${table}|${recordSysId}`;
+
+                if (keyed.has(key)) {
+                    continue;
+                }
+
+                keyed.set(key, {
+                    recordSysId,
+                    table,
+                });
+            }
+        }
+
+        return Array.from(keyed.values());
     }
 
     private async validateScopeRequest(

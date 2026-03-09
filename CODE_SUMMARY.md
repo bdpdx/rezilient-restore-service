@@ -32,13 +32,18 @@ Entrypoints:
   cross-service job audit read path.
 - `src/plans/models.ts`: RS-08 dry-run request/response/gate schemas.
 - `src/plans/plan-service.ts`: RS-08 dry-run orchestration, deterministic hash
-  generation, freshness/deletion/conflict gate evaluation from authoritative
-  restore-index state, and ACP-backed mapping enforcement for scoped dry-run
-  requests.
+  generation, scope/PIT indexed-event materialization integration, freshness/
+  deletion/conflict gate evaluation from authoritative restore-index state, and
+  ACP-backed mapping enforcement for scoped dry-run requests.
+- `src/plans/materialization-service.ts`: stage-03 PIT winner resolution and
+  authoritative artifact-body row materialization service for deterministic
+  `RestorePlanHashRowInput` assembly (stable row ids, precondition hashes, and
+  `pit_resolutions`).
 - `src/plans/plan-state-store.ts`: durable/in-memory state stores for
   persisted dry-run plan records.
 - `src/restore-index/state-reader.ts`: authoritative restore-index watermark
-  readers (in-memory + Postgres-backed) with freshness derivation policy.
+  readers (in-memory + Postgres-backed) with freshness derivation policy and
+  scoped indexed-event candidate lookup for PIT resolution inputs.
 - `src/execute/models.ts`: RS-09 execute request and result schemas.
 - `src/execute/execute-service.ts`: RS-09 execute engine plus RS-10 resume flow
   enforcing plan immutability, capability checks, conflict matrix rules, chunk
@@ -111,6 +116,9 @@ Tests:
   resume/checkpoint/journal API checks, RS-11 media dry-run/execute API
   coverage, RS-12 evidence export/read API coverage, and RS-14/RS-15 admin ops
   endpoint coverage.
+- `src/plans/materialization-service.test.ts`: stage-03 unit coverage for PIT
+  winner selection, missing/ambiguous candidate fail-closed behavior, missing
+  artifact body handling, and deterministic row assembly.
 - `src/registry/acp-source-mapping-client.test.ts`: ACP client request, auth,
   not-found, and timeout/outage behavior tests.
 - `src/registry/acp-source-mapping-provider.test.ts`: ACP cache TTL and

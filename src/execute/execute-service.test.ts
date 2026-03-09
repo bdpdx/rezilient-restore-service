@@ -4,11 +4,18 @@ import { RestoreWatermark as RestoreWatermarkSchema } from '@rezilient/types';
 import { RestoreJobService } from '../jobs/job-service';
 import { RestoreLockManager } from '../locks/lock-manager';
 import { RestorePlanService } from '../plans/plan-service';
+import {
+    InMemoryRestoreArtifactBodyReader,
+    RestoreRowMaterializationService,
+} from '../plans/materialization-service';
 import { SourceRegistry } from '../registry/source-registry';
 import { InMemoryRestoreIndexStateReader } from '../restore-index/state-reader';
 import { RestoreExecutionService } from './execute-service';
 
 const FIXED_NOW = new Date('2026-02-16T12:00:00.000Z');
+const LEGACY_ROWS_COMPAT_OPTIONS = {
+    allowLegacyRowsCompat: true,
+} as const;
 
 function now(): Date {
     return new Date(FIXED_NOW.getTime());
@@ -179,6 +186,95 @@ function createDryRunPayload(
     };
 }
 
+function createScopeDrivenDryRunPayload(
+    planId: string,
+    scopeOverrides?: Record<string, unknown>,
+) {
+    return {
+        tenant_id: 'tenant-acme',
+        instance_id: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        plan_id: planId,
+        requested_by: 'operator@example.com',
+        pit: {
+            restore_time: '2026-02-16T12:00:00.000Z',
+            restore_timezone: 'UTC',
+            pit_algorithm_version:
+                'pit.v1.sys_updated_on-sys_mod_count-__time-event_id',
+            tie_breaker: [
+                'sys_updated_on',
+                'sys_mod_count',
+                '__time',
+                'event_id',
+            ],
+            tie_breaker_fallback: [
+                'sys_updated_on',
+                '__time',
+                'event_id',
+            ],
+        },
+        scope: {
+            mode: 'record',
+            tables: ['incident'],
+            record_sys_ids: ['rec-scope-delete', 'rec-scope-update'],
+            ...scopeOverrides,
+        },
+        execution_options: {
+            missing_row_mode: 'existing_only',
+            conflict_policy: 'review_required',
+            schema_compatibility_mode: 'compatible_only',
+            workflow_mode: 'suppressed_default',
+        },
+        conflicts: [],
+        delete_candidates: [],
+        media_candidates: [],
+    };
+}
+
+function seedScopeMaterializationCandidate(input: {
+    artifactReader: InMemoryRestoreArtifactBodyReader;
+    eventId: string;
+    indexReader: InMemoryRestoreIndexStateReader;
+    operation: 'D' | 'U';
+    recordSysId: string;
+}): void {
+    const artifactKey = `rez/restore/event=${input.eventId}.artifact.json`;
+    const manifestKey = `rez/restore/event=${input.eventId}.manifest.json`;
+
+    input.indexReader.upsertIndexedEventCandidate({
+        artifactKey,
+        eventId: input.eventId,
+        eventTime: '2026-02-16T11:59:59.000Z',
+        instanceId: 'sn-dev-01',
+        manifestKey,
+        offset: input.operation === 'D' ? '101' : '102',
+        partition: 1,
+        recordSysId: input.recordSysId,
+        source: 'sn://acme-dev.service-now.com',
+        sysModCount: input.operation === 'D' ? 3 : 2,
+        sysUpdatedOn: '2026-02-16 11:59:59',
+        table: 'incident',
+        tenantId: 'tenant-acme',
+        topic: 'rez.cdc',
+    });
+    input.artifactReader.setArtifactBody({
+        artifactKey,
+        body: {
+            __op: input.operation,
+            __schema_version: 3,
+            __type: input.operation === 'D' ? 'cdc.delete' : 'cdc.write',
+            row_enc: {
+                alg: 'AES-256-CBC',
+                module: 'x_rezrp_rezilient.encrypter',
+                format: 'kmf',
+                compression: 'none',
+                ciphertext: `cipher-${input.recordSysId}`,
+            },
+        },
+        manifestKey,
+    });
+}
+
 function createAuthoritativeWatermark(): Record<string, unknown> {
     return {
         contract_version: 'restore.contracts.v1',
@@ -232,6 +328,9 @@ async function buildFixture(options?: {
         now,
         undefined,
         restoreIndexReader,
+        undefined,
+        undefined,
+        LEGACY_ROWS_COMPAT_OPTIONS,
     );
     const jobs = new RestoreJobService(
         new RestoreLockManager(),
@@ -289,6 +388,116 @@ async function buildFixture(options?: {
         jobId: job.job.job_id,
     };
 }
+
+async function buildScopeDrivenFixture(): Promise<{
+    execute: RestoreExecutionService;
+    jobId: string;
+}> {
+    const registry = new SourceRegistry([
+        {
+            tenantId: 'tenant-acme',
+            instanceId: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+        },
+    ]);
+    const restoreIndexReader = new InMemoryRestoreIndexStateReader();
+    const artifactReader = new InMemoryRestoreArtifactBodyReader();
+
+    restoreIndexReader.upsertWatermark(RestoreWatermarkSchema.parse(
+        createAuthoritativeWatermark(),
+    ));
+    seedScopeMaterializationCandidate({
+        artifactReader,
+        eventId: 'evt-scope-delete',
+        indexReader: restoreIndexReader,
+        operation: 'D',
+        recordSysId: 'rec-scope-delete',
+    });
+    seedScopeMaterializationCandidate({
+        artifactReader,
+        eventId: 'evt-scope-update',
+        indexReader: restoreIndexReader,
+        operation: 'U',
+        recordSysId: 'rec-scope-update',
+    });
+
+    const plans = new RestorePlanService(
+        registry,
+        now,
+        undefined,
+        restoreIndexReader,
+        undefined,
+        new RestoreRowMaterializationService(artifactReader),
+    );
+    const jobs = new RestoreJobService(
+        new RestoreLockManager(),
+        registry,
+        now,
+    );
+    const execute = new RestoreExecutionService(
+        jobs,
+        plans,
+        undefined,
+        now,
+    );
+    const plan = await plans.createDryRunPlan(
+        createScopeDrivenDryRunPayload('plan-scope-exec'),
+        claims(),
+    );
+
+    assert.equal(plan.success, true);
+    if (!plan.success) {
+        throw new Error('failed to create scope-driven dry-run plan fixture');
+    }
+
+    const job = await jobs.createJob(
+        {
+            tenant_id: 'tenant-acme',
+            instance_id: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+            plan_id: plan.record.plan.plan_id,
+            plan_hash: plan.record.plan.plan_hash,
+            lock_scope_tables: ['incident'],
+            required_capabilities: ['restore_execute'],
+            requested_by: 'operator@example.com',
+        },
+        claims(),
+    );
+
+    assert.equal(job.success, true);
+    if (!job.success) {
+        throw new Error('failed to create scope-driven job fixture');
+    }
+
+    return {
+        execute,
+        jobId: job.job.job_id,
+    };
+}
+
+test(
+    'scope-driven dry-run persists materialized rows that execute uses unchanged',
+    async () => {
+        const fixture = await buildScopeDrivenFixture();
+        const result = await fixture.execute.executeJob(
+            fixture.jobId,
+            {
+                operator_id: 'operator@example.com',
+                operator_capabilities: ['restore_execute'],
+            },
+            claims(),
+        );
+
+        assert.equal(result.success, false);
+        if (result.success) {
+            return;
+        }
+
+        assert.equal(result.statusCode, 403);
+        assert.equal(result.reasonCode, 'blocked_missing_capability');
+        assert.match(result.message, /restore_delete/);
+    },
+);
 
 test('unresolved media candidates block execution until decisions are set', async () => {
     const unresolved = createMediaCandidate('media-unresolved');
@@ -887,6 +1096,9 @@ test('executeJob rejects when job not in running state', async () => {
         now,
         undefined,
         restoreIndexReader,
+        undefined,
+        undefined,
+        LEGACY_ROWS_COMPAT_OPTIONS,
     );
     const plan = await plans.createDryRunPlan(
         createDryRunPayload('plan-paused', [
@@ -967,6 +1179,9 @@ test('executeJob rejects when plan not found', async () => {
         now,
         undefined,
         restoreIndexReader,
+        undefined,
+        undefined,
+        LEGACY_ROWS_COMPAT_OPTIONS,
     );
     const plan = await planService.createDryRunPlan(
         createDryRunPayload('plan-exec-missing', [
