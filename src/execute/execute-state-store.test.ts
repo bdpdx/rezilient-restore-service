@@ -16,6 +16,8 @@ describe('InMemoryRestoreExecutionStateStore', () => {
             {},
         );
         assert.deepEqual(state.sn_mirror_by_job_id, {});
+        assert.deepEqual(state.claims_by_id, {});
+        assert.deepEqual(state.active_claim_id_by_job_id, {});
     });
 
     test('mutate persists execution records', async () => {
@@ -98,5 +100,7 @@ describe('parseState', () => {
         const store = new InMemoryRestoreExecutionStateStore();
         const state = await store.read();
         assert.ok(state.sn_mirror_by_job_id !== undefined);
+        assert.ok(state.claims_by_id !== undefined);
+        assert.ok(state.active_claim_id_by_job_id !== undefined);
     });
 });

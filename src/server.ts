@@ -14,6 +14,10 @@ import {
 import { RestoreEvidenceService } from './evidence/evidence-service';
 import { RestoreExecutionService } from './execute/execute-service';
 import {
+    ExecuteBatchClaimRequestSchema,
+    ExecuteBatchCommitRequestSchema,
+} from './execute/models';
+import {
     RestoreJobRecord,
     RestoreReasonCode,
 } from './jobs/models';
@@ -21,7 +25,10 @@ import {
     QueueReconcileScope,
     RestoreJobService,
 } from './jobs/job-service';
-import { RestoreDryRunPlanRecord } from './plans/models';
+import {
+    FinalizeTargetReconciliationRequestSchema,
+    RestoreDryRunPlanRecord,
+} from './plans/models';
 import { RestorePlanService } from './plans/plan-service';
 
 export interface RestoreServiceDependencies {
@@ -203,6 +210,38 @@ function asJobEvidenceExportPath(pathname: string): string | null {
 
 function asPlanId(pathname: string): string | null {
     const match = pathname.match(/^\/v1\/plans\/([^/]+)$/);
+
+    if (!match) {
+        return null;
+    }
+
+    return decodeURIComponent(match[1]);
+}
+
+function asPlanTargetReconciliationFinalizePath(pathname: string): string | null {
+    const match = pathname.match(
+        /^\/v1\/plans\/([^/]+)\/target-reconciliation\/finalize$/,
+    );
+
+    if (!match) {
+        return null;
+    }
+
+    return decodeURIComponent(match[1]);
+}
+
+function asJobExecuteBatchClaimPath(pathname: string): string | null {
+    const match = pathname.match(/^\/v1\/jobs\/([^/]+)\/execute-batches\/claim$/);
+
+    if (!match) {
+        return null;
+    }
+
+    return decodeURIComponent(match[1]);
+}
+
+function asJobExecuteBatchCommitPath(pathname: string): string | null {
+    const match = pathname.match(/^\/v1\/jobs\/([^/]+)\/execute-batches\/commit$/);
 
     if (!match) {
         return null;
@@ -912,6 +951,9 @@ export function createRestoreServiceServer(
                     media_candidates: result.record.media_candidates,
                     pit_resolutions: result.record.pit_resolutions,
                     watermarks: result.record.watermarks,
+                    reconciliation_state: result.reconciliation_state,
+                    target_reconciliation_records:
+                        result.target_reconciliation_records,
                 });
 
                 return;
@@ -1121,6 +1163,61 @@ export function createRestoreServiceServer(
             }
 
             if (method === 'POST') {
+                const finalizePlanId =
+                    asPlanTargetReconciliationFinalizePath(pathname);
+
+                if (finalizePlanId) {
+                    const body = await readJsonBody(request, maxJsonBodyBytes);
+                    const parsed = FinalizeTargetReconciliationRequestSchema
+                        .safeParse(body);
+
+                    if (!parsed.success) {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message:
+                                parsed.error.issues[0]?.message ||
+                                'invalid finalize target reconciliation request',
+                        });
+
+                        return;
+                    }
+
+                    const result = await deps.plans.finalizeTargetReconciliation(
+                        finalizePlanId,
+                        parsed.data,
+                        claims,
+                    );
+
+                    if (!result.success) {
+                        sendJson(response, result.statusCode, {
+                            error: result.error,
+                            reason_code: result.reasonCode,
+                            message: result.message,
+                            requested_record_count:
+                                result.requested_record_count,
+                        });
+
+                        return;
+                    }
+
+                    sendJson(response, result.statusCode, {
+                        accepted: true,
+                        reused_existing_plan: result.reused_existing_plan,
+                        requested_record_count: result.requested_record_count,
+                        finalized_record_count: result.finalized_record_count,
+                        reconciliation_state: 'finalized',
+                        plan: result.record.plan,
+                        plan_hash_input: result.record.plan_hash_input,
+                        gate: result.record.gate,
+                        delete_candidates: result.record.delete_candidates,
+                        media_candidates: result.record.media_candidates,
+                        pit_resolutions: result.record.pit_resolutions,
+                        watermarks: result.record.watermarks,
+                    });
+
+                    return;
+                }
+
                 const evidenceExportJobId = asJobEvidenceExportPath(pathname);
 
                 if (evidenceExportJobId) {
@@ -1152,6 +1249,106 @@ export function createRestoreServiceServer(
                         manifest_sha256: result.record.manifest_sha256,
                         generated_at: result.record.generated_at,
                         reused: result.reused,
+                    });
+
+                    return;
+                }
+
+                const executeBatchClaimJobId = asJobExecuteBatchClaimPath(
+                    pathname,
+                );
+
+                if (executeBatchClaimJobId) {
+                    const job = await getScopedJob(executeBatchClaimJobId);
+
+                    if (!job) {
+                        sendScopedNotFound(response);
+
+                        return;
+                    }
+
+                    const body = await readJsonBody(request, maxJsonBodyBytes);
+                    const parsed = ExecuteBatchClaimRequestSchema.safeParse(body);
+
+                    if (!parsed.success) {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message:
+                                parsed.error.issues[0]?.message ||
+                                'invalid execute batch claim request',
+                        });
+
+                        return;
+                    }
+
+                    const result = await deps.execute.claimBatch(
+                        job.job_id,
+                        parsed.data,
+                        claims,
+                    );
+
+                    if (!result.success) {
+                        sendJson(response, result.statusCode, {
+                            error: result.error,
+                            reason_code: result.reasonCode,
+                            message: result.message,
+                        });
+
+                        return;
+                    }
+
+                    sendJson(response, result.statusCode, {
+                        ...result.response,
+                    });
+
+                    return;
+                }
+
+                const executeBatchCommitJobId = asJobExecuteBatchCommitPath(
+                    pathname,
+                );
+
+                if (executeBatchCommitJobId) {
+                    const job = await getScopedJob(executeBatchCommitJobId);
+
+                    if (!job) {
+                        sendScopedNotFound(response);
+
+                        return;
+                    }
+
+                    const body = await readJsonBody(request, maxJsonBodyBytes);
+                    const parsed = ExecuteBatchCommitRequestSchema.safeParse(body);
+
+                    if (!parsed.success) {
+                        sendJson(response, 400, {
+                            error: 'invalid_request',
+                            message:
+                                parsed.error.issues[0]?.message ||
+                                'invalid execute batch commit request',
+                        });
+
+                        return;
+                    }
+
+                    const result = await deps.execute.commitBatch(
+                        job.job_id,
+                        parsed.data,
+                        claims,
+                    );
+
+                    if (!result.success) {
+                        sendJson(response, result.statusCode, {
+                            error: result.error,
+                            reason_code: result.reasonCode,
+                            message: result.message,
+                        });
+
+                        return;
+                    }
+
+                    sendJson(response, result.statusCode, {
+                        ...result.response,
                     });
 
                     return;

@@ -1,6 +1,9 @@
 import { type Pool, type PoolConfig } from 'pg';
 import { PostgresSnapshotStore } from '../state/postgres-snapshot-store';
-import { RestoreDryRunPlanRecord } from './models';
+import {
+    RestoreDryRunPlanDraftRecord,
+    RestoreDryRunPlanRecord,
+} from './models';
 
 interface SnapshotRow {
     version: number;
@@ -8,11 +11,13 @@ interface SnapshotRow {
 }
 
 export interface RestorePlanState {
+    drafts_by_id: Record<string, RestoreDryRunPlanDraftRecord>;
     plans_by_id: Record<string, RestoreDryRunPlanRecord>;
 }
 
 export function createEmptyRestorePlanState(): RestorePlanState {
     return {
+        drafts_by_id: {},
         plans_by_id: {},
     };
 }
@@ -61,12 +66,17 @@ function parseState(stateJson: string): RestorePlanState {
     }
 
     const state = parsed as Partial<RestorePlanState>;
+    const draftsById = state.drafts_by_id;
 
     if (!state.plans_by_id || typeof state.plans_by_id !== 'object') {
         throw new Error('invalid persisted plan state plans_by_id payload');
     }
 
     return cloneRestorePlanState({
+        drafts_by_id:
+            draftsById && typeof draftsById === 'object'
+                ? draftsById as Record<string, RestoreDryRunPlanDraftRecord>
+                : {},
         plans_by_id: state.plans_by_id as Record<string, RestoreDryRunPlanRecord>,
     });
 }

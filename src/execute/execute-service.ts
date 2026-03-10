@@ -18,6 +18,13 @@ import {
     RestoreExecutionStateStore,
 } from './execute-state-store';
 import {
+    ExecuteBatchClaimRequest,
+    ExecuteBatchClaimResponse,
+    ExecuteBatchClaimResult,
+    ExecuteBatchClaimedRow,
+    ExecuteBatchCommitRequest,
+    ExecuteBatchCommitResponse,
+    ExecuteBatchCommitResult,
     ExecuteChunkOutcome,
     ExecuteRestoreJobRequest,
     ExecuteRestoreJobRequestSchema,
@@ -26,7 +33,10 @@ import {
     ExecuteRowOutcome,
     ExecuteRuntimeConflictInput,
     ExecuteServiceConfig,
+    FailClosedRestoreTargetWriter,
     ExecutionResumeCheckpoint,
+    PersistedExecuteBatchClaim,
+    PersistedExecuteBatchClaimRow,
     RestoreExecutionRecord,
     RestoreJournalMirrorRecord,
     RestoreRollbackJournalBundle,
@@ -34,7 +44,6 @@ import {
     RestoreTargetWriter,
     ResumeRestoreJobRequest,
     ResumeRestoreJobRequestSchema,
-    NoopRestoreTargetWriter,
     normalizeCapabilities,
 } from './models';
 
@@ -112,6 +121,24 @@ function buildCheckpointId(
     return `chk_${checksum.slice(0, 24)}`;
 }
 
+function buildClaimId(
+    jobId: string,
+    planHash: string,
+    nextChunkIndex: number,
+    nextRowIndex: number,
+    claimedAt: string,
+): string {
+    const checksum = createHash('sha256')
+        .update(
+            `${jobId}:${planHash}:${nextChunkIndex}:${nextRowIndex}:` +
+                `${claimedAt}`,
+            'utf8',
+        )
+        .digest('hex');
+
+    return `claim_${checksum.slice(0, 24)}`;
+}
+
 function buildJournalId(
     jobId: string,
     planHash: string,
@@ -142,6 +169,36 @@ function buildFailure(
     message: string,
     reasonCode?: RestoreReasonCode,
 ): ExecuteRestoreJobResult {
+    return {
+        success: false,
+        statusCode,
+        error,
+        reasonCode,
+        message,
+    };
+}
+
+function buildClaimFailure(
+    statusCode: number,
+    error: string,
+    message: string,
+    reasonCode?: RestoreReasonCode,
+): ExecuteBatchClaimResult {
+    return {
+        success: false,
+        statusCode,
+        error,
+        reasonCode,
+        message,
+    };
+}
+
+function buildCommitFailure(
+    statusCode: number,
+    error: string,
+    message: string,
+    reasonCode?: RestoreReasonCode,
+): ExecuteBatchCommitResult {
     return {
         success: false,
         statusCode,
@@ -429,6 +486,59 @@ function countChunkOutcomesForChunk(
     };
 }
 
+function selectClaimRows(
+    chunks: RestorePlanHashRowInput[][],
+    checkpoint: ExecutionResumeCheckpoint,
+    maxRows: number,
+): {
+    rows: PersistedExecuteBatchClaimRow[];
+    next_chunk_index: number;
+    next_row_index: number;
+} {
+    const selected: PersistedExecuteBatchClaimRow[] = [];
+    let chunkIndex = checkpoint.next_chunk_index;
+    let rowIndex = checkpoint.next_row_index;
+
+    if (chunkIndex >= chunks.length) {
+        return {
+            rows: selected,
+            next_chunk_index: chunkIndex,
+            next_row_index: rowIndex,
+        };
+    }
+
+    while (chunkIndex < chunks.length && selected.length < maxRows) {
+        const rows = chunks[chunkIndex];
+
+        while (rowIndex < rows.length && selected.length < maxRows) {
+            const row = rows[rowIndex];
+            const rowAttempt =
+                (checkpoint.row_attempt_by_row[row.row_id] || 0) + 1;
+
+            selected.push({
+                row_id: row.row_id,
+                chunk_id: asChunkId(chunkIndex),
+                chunk_index: chunkIndex,
+                row_index: rowIndex,
+                row_attempt: rowAttempt,
+            });
+
+            rowIndex += 1;
+        }
+
+        if (rowIndex >= rows.length) {
+            chunkIndex += 1;
+            rowIndex = 0;
+        }
+    }
+
+    return {
+        rows: selected,
+        next_chunk_index: chunkIndex,
+        next_row_index: rowIndex,
+    };
+}
+
 function summarizeExecution(
     plannedRows: number,
     plannedAttachments: number,
@@ -535,7 +645,7 @@ export class RestoreExecutionService {
         private readonly stateStore: RestoreExecutionStateStore =
             new InMemoryRestoreExecutionStateStore(),
         private readonly targetWriter: RestoreTargetWriter =
-            new NoopRestoreTargetWriter(),
+            new FailClosedRestoreTargetWriter(),
     ) {
         this.config = {
             ...DEFAULT_EXECUTE_CONFIG,
@@ -896,6 +1006,677 @@ export class RestoreExecutionService {
             existing,
             toConflictMap(request.runtime_conflicts),
         );
+    }
+
+    async claimBatch(
+        jobId: string,
+        request: ExecuteBatchClaimRequest,
+        claims: AuthTokenClaims,
+    ): Promise<ExecuteBatchClaimResult> {
+        const job = await this.jobs.getJob(jobId);
+
+        if (!job) {
+            return buildClaimFailure(404, 'not_found', 'job not found');
+        }
+
+        const scopeCheck = ensureScopeMatch(job, claims);
+
+        if (!scopeCheck.ok) {
+            return buildClaimFailure(
+                403,
+                'scope_blocked',
+                scopeCheck.message || 'scope mismatch',
+                'blocked_unknown_source_mapping',
+            );
+        }
+
+        if (job.status !== 'running' && job.status !== 'paused') {
+            return buildClaimFailure(
+                409,
+                'job_not_claimable',
+                'job must be running or paused before claiming a batch',
+                'blocked_resume_checkpoint_missing',
+            );
+        }
+
+        const planLookup = await this.lookupAndValidateExecutablePlan(job);
+
+        if (!planLookup.ok) {
+            return buildClaimFailure(
+                planLookup.failure.statusCode,
+                planLookup.failure.success
+                    ? 'failed_internal_error'
+                    : planLookup.failure.error,
+                planLookup.failure.success
+                    ? 'unexpected execute plan lookup success payload'
+                    : planLookup.failure.message,
+                planLookup.failure.success
+                    ? 'failed_internal_error'
+                    : planLookup.failure.reasonCode,
+            );
+        }
+
+        const plan = planLookup.plan;
+        let record = await this.getExecutionRecord(jobId);
+
+        if (!record) {
+            const startedAt = normalizeIsoWithMillis(this.now());
+            const chunkSize = this.config.defaultChunkSize;
+            const chunks = chunkRows(plan.plan_hash_input.rows, chunkSize);
+
+            record = {
+                contract_version: RESTORE_CONTRACT_VERSION,
+                job_id: job.job_id,
+                plan_id: plan.plan.plan_id,
+                plan_hash: plan.plan.plan_hash,
+                plan_checksum: computePlanChecksum(plan),
+                precondition_checksum: computePreconditionChecksum(plan),
+                status: 'paused',
+                reason_code: 'none',
+                started_at: startedAt,
+                completed_at: null,
+                executed_by: request.operator_id,
+                chunk_size: chunkSize,
+                workflow_mode: plan.plan.execution_options.workflow_mode,
+                workflow_allowlist: [],
+                elevated_confirmation_used: false,
+                capabilities_used: normalizeCapabilities(
+                    job.required_capabilities,
+                ),
+                resume_attempt_count: 0,
+                checkpoint: buildInitialCheckpoint(
+                    job.job_id,
+                    plan.plan.plan_hash,
+                    chunks.length,
+                    startedAt,
+                ),
+                summary: {
+                    planned_rows: plan.plan_hash_input.rows.length,
+                    applied_rows: 0,
+                    skipped_rows: 0,
+                    failed_rows: 0,
+                    attachments_planned: plan.media_candidates.length,
+                    attachments_applied: 0,
+                    attachments_skipped: 0,
+                    attachments_failed: 0,
+                    chunk_count: 0,
+                    fallback_chunk_count: 0,
+                    runtime_conflict_count: 0,
+                },
+                chunks: [],
+                row_outcomes: [],
+                media_outcomes: [],
+            };
+
+            await this.persistExecutionDelta(job.job_id, record, [], []);
+        }
+
+        if (record.status === 'completed' || record.status === 'failed') {
+            const response: ExecuteBatchClaimResponse = {
+                accepted: false,
+                job_id: job.job_id,
+                claim_id: null,
+                claimed_at: null,
+                claimed_by: null,
+                claimed_rows: [],
+                has_more_rows: false,
+                message: 'execution is already terminal; no claimable rows remain',
+                reason_code: record.reason_code,
+                requested_max_rows: request.max_rows || null,
+            };
+
+            return {
+                success: true,
+                statusCode: 200,
+                response,
+            };
+        }
+
+        const chunks = chunkRows(plan.plan_hash_input.rows, record.chunk_size);
+        const checkpointChunkIndex = record.checkpoint.next_chunk_index;
+        const checkpointRowIndex = record.checkpoint.next_row_index || 0;
+
+        if (record.checkpoint.total_chunks !== chunks.length) {
+            return buildClaimFailure(
+                409,
+                'resume_checkpoint_mismatch',
+                'checkpoint chunk cardinality mismatches current plan',
+                'blocked_resume_precondition_mismatch',
+            );
+        }
+
+        if (checkpointChunkIndex > chunks.length) {
+            return buildClaimFailure(
+                409,
+                'resume_checkpoint_mismatch',
+                'checkpoint chunk index exceeds current plan chunk bounds',
+                'blocked_resume_precondition_mismatch',
+            );
+        }
+
+        if (
+            checkpointChunkIndex === chunks.length &&
+            checkpointRowIndex !== 0
+        ) {
+            return buildClaimFailure(
+                409,
+                'resume_checkpoint_mismatch',
+                'checkpoint row cursor must reset at terminal chunk index',
+                'blocked_resume_precondition_mismatch',
+            );
+        }
+
+        if (
+            checkpointChunkIndex < chunks.length &&
+            checkpointRowIndex > chunks[checkpointChunkIndex].length
+        ) {
+            return buildClaimFailure(
+                409,
+                'resume_checkpoint_mismatch',
+                'checkpoint row cursor exceeds chunk row bounds',
+                'blocked_resume_precondition_mismatch',
+            );
+        }
+
+        const state = await this.stateStore.read();
+        const existingClaimId = state.active_claim_id_by_job_id[job.job_id];
+
+        if (existingClaimId) {
+            const existingClaim = state.claims_by_id[existingClaimId];
+
+            if (existingClaim && existingClaim.status === 'claimed') {
+                return buildClaimFailure(
+                    409,
+                    'claim_in_progress',
+                    'an uncommitted execute batch claim already exists',
+                    'blocked_resume_precondition_mismatch',
+                );
+            }
+        }
+
+        const requestedMaxRows = request.max_rows || null;
+        const maxRows = request.max_rows || record.chunk_size;
+        const selection = selectClaimRows(
+            chunks,
+            record.checkpoint,
+            maxRows,
+        );
+
+        if (selection.rows.length === 0) {
+            const response: ExecuteBatchClaimResponse = {
+                accepted: false,
+                job_id: job.job_id,
+                claim_id: null,
+                claimed_at: null,
+                claimed_by: null,
+                claimed_rows: [],
+                has_more_rows: false,
+                message: 'no claimable rows remain for this execution',
+                reason_code: 'none',
+                requested_max_rows: requestedMaxRows,
+            };
+
+            return {
+                success: true,
+                statusCode: 200,
+                response,
+            };
+        }
+
+        const claimedAt = normalizeIsoWithMillis(this.now());
+        const claimId = buildClaimId(
+            job.job_id,
+            record.plan_hash,
+            record.checkpoint.next_chunk_index,
+            record.checkpoint.next_row_index,
+            claimedAt,
+        );
+        const claimRecord: PersistedExecuteBatchClaim = {
+            claim_id: claimId,
+            job_id: job.job_id,
+            plan_id: plan.plan.plan_id,
+            plan_hash: plan.plan.plan_hash,
+            claimed_at: claimedAt,
+            claimed_by: request.operator_id,
+            next_chunk_index: selection.next_chunk_index,
+            next_row_index: selection.next_row_index,
+            rows: selection.rows,
+            status: 'claimed',
+            committed_at: null,
+            committed_by: null,
+        };
+        const persisted = await this.stateStore.mutate((mutableState) => {
+            const currentActiveClaimId =
+                mutableState.active_claim_id_by_job_id[job.job_id];
+
+            if (currentActiveClaimId) {
+                const currentActiveClaim =
+                    mutableState.claims_by_id[currentActiveClaimId];
+
+                if (currentActiveClaim && currentActiveClaim.status === 'claimed') {
+                    return false;
+                }
+            }
+
+            mutableState.claims_by_id[claimId] = claimRecord;
+            mutableState.active_claim_id_by_job_id[job.job_id] = claimId;
+
+            return true;
+        });
+
+        if (!persisted) {
+            return buildClaimFailure(
+                409,
+                'claim_in_progress',
+                'an uncommitted execute batch claim already exists',
+                'blocked_resume_precondition_mismatch',
+            );
+        }
+
+        const rowsById = new Map(
+            plan.plan_hash_input.rows.map((row) => [row.row_id, row]),
+        );
+        const claimedRows: ExecuteBatchClaimedRow[] = [];
+
+        for (const claimRow of selection.rows) {
+            const row = rowsById.get(claimRow.row_id);
+
+            if (!row) {
+                return buildClaimFailure(
+                    500,
+                    'claim_plan_mismatch',
+                    'claimed row is missing from persisted plan',
+                    'failed_internal_error',
+                );
+            }
+
+            claimedRows.push({
+                row_id: row.row_id,
+                table: row.table,
+                record_sys_id: row.record_sys_id,
+                action: row.action,
+                chunk_id: claimRow.chunk_id,
+                row_attempt: claimRow.row_attempt,
+                values: row.values,
+            });
+        }
+
+        const response: ExecuteBatchClaimResponse = {
+            accepted: true,
+            job_id: job.job_id,
+            claim_id: claimId,
+            claimed_at: claimedAt,
+            claimed_by: request.operator_id,
+            claimed_rows: claimedRows,
+            has_more_rows: selection.next_chunk_index < chunks.length,
+            message: 'execute batch claim accepted',
+            reason_code: 'none',
+            requested_max_rows: requestedMaxRows,
+        };
+
+        return {
+            success: true,
+            statusCode: 200,
+            response,
+        };
+    }
+
+    async commitBatch(
+        jobId: string,
+        request: ExecuteBatchCommitRequest,
+        claims: AuthTokenClaims,
+    ): Promise<ExecuteBatchCommitResult> {
+        const job = await this.jobs.getJob(jobId);
+
+        if (!job) {
+            return buildCommitFailure(404, 'not_found', 'job not found');
+        }
+
+        const scopeCheck = ensureScopeMatch(job, claims);
+
+        if (!scopeCheck.ok) {
+            return buildCommitFailure(
+                403,
+                'scope_blocked',
+                scopeCheck.message || 'scope mismatch',
+                'blocked_unknown_source_mapping',
+            );
+        }
+
+        if (job.status !== 'running' && job.status !== 'paused') {
+            return buildCommitFailure(
+                409,
+                'job_not_committable',
+                'job must be running or paused before committing a batch',
+                'blocked_resume_checkpoint_missing',
+            );
+        }
+
+        const planLookup = await this.lookupAndValidateExecutablePlan(job);
+
+        if (!planLookup.ok) {
+            return buildCommitFailure(
+                planLookup.failure.statusCode,
+                planLookup.failure.success
+                    ? 'failed_internal_error'
+                    : planLookup.failure.error,
+                planLookup.failure.success
+                    ? 'unexpected execute plan lookup success payload'
+                    : planLookup.failure.message,
+                planLookup.failure.success
+                    ? 'failed_internal_error'
+                    : planLookup.failure.reasonCode,
+            );
+        }
+
+        const plan = planLookup.plan;
+        const state = await this.stateStore.read();
+        const record = state.records_by_job_id[job.job_id];
+
+        if (!record) {
+            return buildCommitFailure(
+                409,
+                'execution_missing',
+                'execution record is unavailable for this job',
+                'blocked_resume_checkpoint_missing',
+            );
+        }
+
+        const claim = state.claims_by_id[request.claim_id];
+
+        if (!claim || claim.job_id !== job.job_id) {
+            return buildCommitFailure(
+                409,
+                'claim_not_found',
+                'execute batch claim is missing or out of scope',
+                'blocked_resume_precondition_mismatch',
+            );
+        }
+
+        if (claim.status !== 'claimed') {
+            return buildCommitFailure(
+                409,
+                'claim_not_claimed',
+                'execute batch claim is no longer claimable',
+                'blocked_resume_precondition_mismatch',
+            );
+        }
+
+        const activeClaimId = state.active_claim_id_by_job_id[job.job_id];
+
+        if (activeClaimId !== request.claim_id) {
+            return buildCommitFailure(
+                409,
+                'claim_not_active',
+                'execute batch claim is not the active claim for this job',
+                'blocked_resume_precondition_mismatch',
+            );
+        }
+
+        const chunks = chunkRows(plan.plan_hash_input.rows, record.chunk_size);
+        const planRowsById = new Map(
+            plan.plan_hash_input.rows.map((row) => [row.row_id, row]),
+        );
+        const outcomeByRowId = new Map<string, typeof request.row_outcomes[0]>();
+
+        for (const rowOutcome of request.row_outcomes) {
+            if (outcomeByRowId.has(rowOutcome.row_id)) {
+                return buildCommitFailure(
+                    409,
+                    'claim_commit_mismatch',
+                    'row outcomes must be unique by row_id',
+                    'blocked_resume_precondition_mismatch',
+                );
+            }
+
+            outcomeByRowId.set(rowOutcome.row_id, rowOutcome);
+        }
+
+        if (outcomeByRowId.size !== claim.rows.length) {
+            return buildCommitFailure(
+                409,
+                'claim_commit_mismatch',
+                'committed row outcomes must match the claimed row count',
+                'blocked_resume_precondition_mismatch',
+            );
+        }
+
+        const updatedRecord = cloneExecutionRecord(record);
+        const journalEntries = cloneJournalEntries(
+            state.rollback_journal_by_job_id[job.job_id] || [],
+        );
+        const mirrorEntries = cloneMirrorEntries(
+            state.sn_mirror_by_job_id[job.job_id] || [],
+        );
+        const touchedChunks = new Map<string, number>();
+
+        for (const claimRow of claim.rows) {
+            const row = planRowsById.get(claimRow.row_id);
+            const incomingOutcome = outcomeByRowId.get(claimRow.row_id);
+
+            if (!row || !incomingOutcome) {
+                return buildCommitFailure(
+                    409,
+                    'claim_commit_mismatch',
+                    'commit payload does not match claimed rows',
+                    'blocked_resume_precondition_mismatch',
+                );
+            }
+
+            touchedChunks.set(claimRow.chunk_id, claimRow.chunk_index);
+            updatedRecord.checkpoint.row_attempt_by_row[row.row_id] =
+                claimRow.row_attempt;
+            updatedRecord.row_outcomes.push({
+                row_id: row.row_id,
+                table: row.table,
+                record_sys_id: row.record_sys_id,
+                action: row.action,
+                outcome: incomingOutcome.outcome,
+                reason_code: incomingOutcome.reason_code,
+                chunk_id: claimRow.chunk_id,
+                used_row_fallback: false,
+                message: incomingOutcome.message,
+            });
+
+            if (incomingOutcome.outcome === 'applied') {
+                this.appendRollbackJournal(
+                    updatedRecord,
+                    row,
+                    claimRow.chunk_id,
+                    claimRow.row_attempt,
+                    journalEntries,
+                    mirrorEntries,
+                );
+            }
+        }
+
+        const committedAt = normalizeIsoWithMillis(this.now());
+        updatedRecord.checkpoint.next_chunk_index = claim.next_chunk_index;
+        updatedRecord.checkpoint.next_row_index = claim.next_row_index;
+        updatedRecord.checkpoint.last_chunk_id = claim.rows.length > 0
+            ? claim.rows[claim.rows.length - 1].chunk_id
+            : updatedRecord.checkpoint.last_chunk_id;
+        updatedRecord.checkpoint.updated_at = committedAt;
+        updatedRecord.checkpoint.checkpoint_id = buildCheckpointId(
+            updatedRecord.job_id,
+            updatedRecord.plan_hash,
+            claim.next_chunk_index,
+            claim.next_row_index,
+        );
+
+        for (const [chunkId, chunkIndex] of touchedChunks.entries()) {
+            const counts = countChunkOutcomesForChunk(
+                updatedRecord.row_outcomes,
+                chunkId,
+            );
+            const fallbackConflictIds = new Set<string>();
+
+            for (const rowOutcome of updatedRecord.row_outcomes) {
+                if (rowOutcome.chunk_id !== chunkId || !rowOutcome.conflict_id) {
+                    continue;
+                }
+
+                fallbackConflictIds.add(rowOutcome.conflict_id);
+            }
+
+            const chunkStatus = counts.failedCount > 0
+                ? 'failed'
+                : fallbackConflictIds.size > 0
+                ? 'row_fallback'
+                : 'applied';
+            const fallbackTriggerConflictIds = Array
+                .from(fallbackConflictIds)
+                .sort((left, right) => left.localeCompare(right));
+            const existingChunkIndex = updatedRecord.chunks.findIndex((chunk) => {
+                return chunk.chunk_id === chunkId;
+            });
+            const existingChunk = existingChunkIndex >= 0
+                ? updatedRecord.chunks[existingChunkIndex]
+                : undefined;
+            const chunkOutcome: ExecuteChunkOutcome = {
+                chunk_id: chunkId,
+                row_count: chunks[chunkIndex]?.length || 0,
+                status: chunkStatus,
+                started_at: existingChunk?.started_at || claim.claimed_at,
+                completed_at: committedAt,
+                applied_count: counts.appliedCount,
+                skipped_count: counts.skippedCount,
+                failed_count: counts.failedCount,
+                fallback_trigger_conflict_ids: fallbackTriggerConflictIds,
+            };
+
+            if (existingChunkIndex >= 0) {
+                updatedRecord.chunks[existingChunkIndex] = chunkOutcome;
+            } else {
+                updatedRecord.chunks.push(chunkOutcome);
+            }
+        }
+
+        updatedRecord.summary = summarizeExecution(
+            plan.plan_hash_input.rows.length,
+            plan.media_candidates.length,
+            updatedRecord.chunks,
+            updatedRecord.row_outcomes,
+            updatedRecord.media_outcomes,
+        );
+
+        if (
+            updatedRecord.checkpoint.next_chunk_index >= chunks.length &&
+            updatedRecord.media_outcomes.length === 0 &&
+            plan.media_candidates.length > 0
+        ) {
+            this.processMediaCandidates(plan, updatedRecord);
+            updatedRecord.summary = summarizeExecution(
+                plan.plan_hash_input.rows.length,
+                plan.media_candidates.length,
+                updatedRecord.chunks,
+                updatedRecord.row_outcomes,
+                updatedRecord.media_outcomes,
+            );
+        }
+
+        const atEnd = updatedRecord.checkpoint.next_chunk_index >= chunks.length;
+
+        if (atEnd) {
+            const hasFailures = updatedRecord.summary.failed_rows > 0 ||
+                updatedRecord.summary.attachments_failed > 0;
+            const terminalStatus = hasFailures ? 'failed' : 'completed';
+            const terminalReason: RestoreReasonCode = hasFailures
+                ? 'failed_internal_error'
+                : 'none';
+            const completion = await this.jobs.completeJob(job.job_id, {
+                status: terminalStatus,
+                reason_code: terminalReason,
+            });
+
+            if (!completion.success) {
+                return buildCommitFailure(
+                    500,
+                    'job_completion_failed',
+                    completion.message,
+                    'failed_internal_error',
+                );
+            }
+
+            updatedRecord.status = terminalStatus;
+            updatedRecord.reason_code = terminalReason;
+            updatedRecord.completed_at = normalizeIsoWithMillis(this.now());
+        }
+
+        const updatedClaim: PersistedExecuteBatchClaim = {
+            ...claim,
+            status: 'committed',
+            committed_at: committedAt,
+            committed_by: request.committed_by,
+        };
+        const persisted = await this.stateStore.mutate((mutableState) => {
+            const currentActiveClaimId =
+                mutableState.active_claim_id_by_job_id[job.job_id];
+            const currentClaim = mutableState.claims_by_id[request.claim_id];
+
+            if (
+                currentActiveClaimId !== request.claim_id ||
+                !currentClaim ||
+                currentClaim.status !== 'claimed'
+            ) {
+                return false;
+            }
+
+            mutableState.claims_by_id[request.claim_id] = updatedClaim;
+            delete mutableState.active_claim_id_by_job_id[job.job_id];
+            mutableState.records_by_job_id[job.job_id] =
+                cloneExecutionRecord(updatedRecord);
+
+            if (journalEntries.length > 0) {
+                mutableState.rollback_journal_by_job_id[job.job_id] =
+                    cloneJournalEntries(journalEntries);
+            } else {
+                delete mutableState.rollback_journal_by_job_id[job.job_id];
+            }
+
+            if (mirrorEntries.length > 0) {
+                mutableState.sn_mirror_by_job_id[job.job_id] =
+                    cloneMirrorEntries(mirrorEntries);
+            } else {
+                delete mutableState.sn_mirror_by_job_id[job.job_id];
+            }
+
+            return true;
+        });
+
+        if (!persisted) {
+            return buildCommitFailure(
+                409,
+                'claim_not_active',
+                'execute batch claim is no longer active',
+                'blocked_resume_precondition_mismatch',
+            );
+        }
+
+        const response: ExecuteBatchCommitResponse = {
+            accepted: true,
+            claim_id: request.claim_id,
+            committed_rows: request.row_outcomes.length,
+            job_id: job.job_id,
+            execution_status: updatedRecord.status,
+            checkpoint: {
+                ...updatedRecord.checkpoint,
+                row_attempt_by_row: {
+                    ...updatedRecord.checkpoint.row_attempt_by_row,
+                },
+            },
+            summary: {
+                ...updatedRecord.summary,
+            },
+            message: 'execute batch commit accepted',
+            reason_code: updatedRecord.reason_code,
+        };
+
+        return {
+            success: true,
+            statusCode: 200,
+            response,
+        };
     }
 
     async getExecution(jobId: string): Promise<RestoreExecutionRecord | null> {

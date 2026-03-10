@@ -2,6 +2,7 @@ import { type Pool, type PoolConfig } from 'pg';
 import type { RestoreJournalEntry } from '@rezilient/types';
 import { PostgresSnapshotStore } from '../state/postgres-snapshot-store';
 import {
+    PersistedExecuteBatchClaim,
     RestoreExecutionRecord,
     RestoreJournalMirrorRecord,
 } from './models';
@@ -15,6 +16,8 @@ export interface RestoreExecutionState {
     records_by_job_id: Record<string, RestoreExecutionRecord>;
     rollback_journal_by_job_id: Record<string, RestoreJournalEntry[]>;
     sn_mirror_by_job_id: Record<string, RestoreJournalMirrorRecord[]>;
+    claims_by_id: Record<string, PersistedExecuteBatchClaim>;
+    active_claim_id_by_job_id: Record<string, string>;
 }
 
 export function createEmptyRestoreExecutionState(): RestoreExecutionState {
@@ -22,6 +25,8 @@ export function createEmptyRestoreExecutionState(): RestoreExecutionState {
         records_by_job_id: {},
         rollback_journal_by_job_id: {},
         sn_mirror_by_job_id: {},
+        claims_by_id: {},
+        active_claim_id_by_job_id: {},
     };
 }
 
@@ -100,6 +105,20 @@ function parseState(stateJson: string): RestoreExecutionState {
         );
     }
 
+    const claimsById = (
+        state.claims_by_id &&
+        typeof state.claims_by_id === 'object'
+    )
+        ? state.claims_by_id as Record<string, PersistedExecuteBatchClaim>
+        : {};
+
+    const activeClaimIdByJobId = (
+        state.active_claim_id_by_job_id &&
+        typeof state.active_claim_id_by_job_id === 'object'
+    )
+        ? state.active_claim_id_by_job_id as Record<string, string>
+        : {};
+
     return cloneRestoreExecutionState({
         records_by_job_id:
             state.records_by_job_id as Record<string, RestoreExecutionRecord>,
@@ -113,6 +132,8 @@ function parseState(stateJson: string): RestoreExecutionState {
                 string,
                 RestoreJournalMirrorRecord[]
             >,
+        claims_by_id: claimsById,
+        active_claim_id_by_job_id: activeClaimIdByJobId,
     });
 }
 

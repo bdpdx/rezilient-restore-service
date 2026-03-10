@@ -21,7 +21,7 @@ import {
 } from './materialization-service';
 import { InMemoryRestorePlanStateStore } from './plan-state-store';
 import { RestorePlanService } from './plan-service';
-import { InMemoryRestoreTargetStateLookup } from './target-reconciliation';
+import type { FinalizeTargetReconciliationRequest } from './models';
 
 const PIT_ALGORITHM_VERSION =
     'pit.v1.sys_updated_on-sys_mod_count-__time-event_id';
@@ -198,6 +198,19 @@ function buildArtifactBody(
     };
 }
 
+function buildFinalizeRequest(
+    records: Array<{
+        table: string;
+        record_sys_id: string;
+        target_state: 'exists' | 'missing';
+    }>,
+): FinalizeTargetReconciliationRequest {
+    return {
+        finalized_by: 'sn-worker',
+        reconciled_records: records,
+    };
+}
+
 function seedScopeMaterializationRecord(input: {
     artifactReader: InMemoryRestoreArtifactBodyReader;
     eventId: string;
@@ -328,7 +341,6 @@ function createScopeDrivenFixture(options?: {
     resolveHandler?: (
         input: ResolveSourceMappingInput,
     ) => Promise<AcpResolveSourceMappingResult>;
-    targetStateLookup?: InMemoryRestoreTargetStateLookup;
 }): ScopeDrivenFixture {
     const registry = new SourceRegistry([
         {
@@ -352,7 +364,6 @@ function createScopeDrivenFixture(options?: {
         createResolver(options?.resolveHandler),
         new RestoreRowMaterializationService(
             artifactReader,
-            options?.targetStateLookup,
         ),
     );
 
@@ -383,64 +394,75 @@ describe('RestorePlanService', () => {
         }
     });
 
-    test('createDryRunPlan materializes rows for scope-driven request', async () => {
-        const fixture = createScopeDrivenFixture();
-
-        seedScopeMaterializationRecord({
-            artifactReader: fixture.artifactReader,
-            eventId: 'evt-scope-01',
-            eventTime: '2026-02-18T15:20:00.000Z',
-            indexReader: fixture.indexReader,
-            offset: '100',
-            partition: 0,
-            recordSysId: 'rec-01',
-            sysModCount: 2,
-            sysUpdatedOn: '2026-02-18 15:20:00',
-            table: 'x_app.ticket',
-        });
-
-        const result = await fixture.service.createDryRunPlan(
-            buildScopeDrivenDryRunRequest('plan-scope-driven', {
-                scope: {
-                    mode: 'record',
-                    tables: ['x_app.ticket'],
-                    record_sys_ids: ['rec-01'],
-                },
-            }),
-            claims(),
-        );
-
-        assert.equal(result.success, true);
-        if (!result.success) {
-            return;
-        }
-
-        assert.equal(result.record.gate.executability, 'executable');
-        assert.equal(result.record.plan_hash_input.rows.length, 1);
-        assert.equal(result.record.pit_resolutions.length, 1);
-        assert.equal(
-            result.record.pit_resolutions[0].winning_event_id,
-            'evt-scope-01',
-        );
-        assert.equal(
-            result.record.plan_hash_input.rows[0].metadata.metadata.event_id,
-            'evt-scope-01',
-        );
-    });
-
     test(
-        'createDryRunPlan reconciles source insert into update when target '
-        + 'record exists',
+        'createDryRunPlan returns draft reconciliation request for scope-driven '
+        + 'materialization',
         async () => {
-            const targetStateLookup = new InMemoryRestoreTargetStateLookup();
-            targetStateLookup.setTargetRecordState({
-                record_sys_id: 'rec-01',
-                state: 'exists',
+            const fixture = createScopeDrivenFixture();
+
+            seedScopeMaterializationRecord({
+                artifactReader: fixture.artifactReader,
+                eventId: 'evt-scope-01',
+                eventTime: '2026-02-18T15:20:00.000Z',
+                indexReader: fixture.indexReader,
+                offset: '100',
+                partition: 0,
+                recordSysId: 'rec-01',
+                sysModCount: 2,
+                sysUpdatedOn: '2026-02-18 15:20:00',
                 table: 'x_app.ticket',
             });
-            const fixture = createScopeDrivenFixture({
-                targetStateLookup,
-            });
+
+            const result = await fixture.service.createDryRunPlan(
+                buildScopeDrivenDryRunRequest('plan-scope-driven', {
+                    scope: {
+                        mode: 'record',
+                        tables: ['x_app.ticket'],
+                        record_sys_ids: ['rec-01'],
+                    },
+                }),
+                claims(),
+            );
+
+            assert.equal(result.success, true);
+            if (!result.success) {
+                return;
+            }
+
+            assert.equal(result.statusCode, 202);
+            assert.equal(result.reconciliation_state, 'draft');
+            assert.equal(result.target_reconciliation_records.length, 1);
+            assert.equal(result.record.plan_hash_input.rows.length, 1);
+            assert.equal(result.record.plan_hash_input.rows[0].action, 'update');
+            assert.equal(
+                result.record.plan_hash_input.rows[0].metadata.metadata.event_id,
+                'evt-scope-01',
+            );
+            assert.equal(
+                result.target_reconciliation_records[0].record_sys_id,
+                'rec-01',
+            );
+            assert.equal(result.target_reconciliation_records[0].table, 'x_app.ticket');
+            assert.equal(
+                result.target_reconciliation_records[0].source_operation,
+                'U',
+            );
+            assert.equal(
+                result.target_reconciliation_records[0].source_action,
+                'update',
+            );
+            assert.equal(
+                await fixture.service.getPlan('plan-scope-driven'),
+                null,
+            );
+        },
+    );
+
+    test(
+        'finalizeTargetReconciliation reconciles source insert into update '
+        + 'when target record exists',
+        async () => {
+            const fixture = createScopeDrivenFixture();
 
             seedScopeMaterializationRecord({
                 artifactReader: fixture.artifactReader,
@@ -456,7 +478,7 @@ describe('RestorePlanService', () => {
                 table: 'x_app.ticket',
             });
 
-            const result = await fixture.service.createDryRunPlan(
+            const draft = await fixture.service.createDryRunPlan(
                 buildScopeDrivenDryRunRequest('plan-scope-insert-reconciled', {
                     scope: {
                         mode: 'record',
@@ -467,35 +489,47 @@ describe('RestorePlanService', () => {
                 claims(),
             );
 
-            assert.equal(result.success, true);
-            if (!result.success) {
+            assert.equal(draft.success, true);
+            if (!draft.success) {
                 return;
             }
 
-            assert.equal(result.record.plan_hash_input.rows.length, 1);
-            assert.equal(result.record.plan_hash_input.rows[0].action, 'update');
-            assert.equal(result.record.plan.action_counts.update, 1);
-            assert.equal(result.record.plan.action_counts.insert, 0);
+            assert.equal(draft.reconciliation_state, 'draft');
+            assert.equal(draft.record.plan_hash_input.rows[0].action, 'insert');
+
+            const finalized = await fixture.service.finalizeTargetReconciliation(
+                'plan-scope-insert-reconciled',
+                buildFinalizeRequest([{
+                    table: 'x_app.ticket',
+                    record_sys_id: 'rec-01',
+                    target_state: 'exists',
+                }]),
+                claims(),
+            );
+
+            assert.equal(finalized.success, true);
+            if (!finalized.success) {
+                return;
+            }
+
+            assert.equal(finalized.statusCode, 201);
+            assert.equal(finalized.record.plan_hash_input.rows.length, 1);
+            assert.equal(finalized.record.plan_hash_input.rows[0].action, 'update');
+            assert.equal(finalized.record.plan.action_counts.update, 1);
+            assert.equal(finalized.record.plan.action_counts.insert, 0);
             assert.equal(
-                result.record.plan_hash_input.rows[0].metadata.metadata.operation,
+                finalized.record.plan_hash_input.rows[0].metadata.metadata.operation,
                 'I',
             );
+            assert.equal(finalized.reused_existing_plan, false);
         },
     );
 
     test(
-        'createDryRunPlan blocks when source update points to missing target '
-        + 'record',
+        'finalizeTargetReconciliation blocks when source update points to '
+        + 'missing target record',
         async () => {
-            const targetStateLookup = new InMemoryRestoreTargetStateLookup();
-            targetStateLookup.setTargetRecordState({
-                record_sys_id: 'rec-01',
-                state: 'missing',
-                table: 'x_app.ticket',
-            });
-            const fixture = createScopeDrivenFixture({
-                targetStateLookup,
-            });
+            const fixture = createScopeDrivenFixture();
 
             seedScopeMaterializationRecord({
                 artifactReader: fixture.artifactReader,
@@ -511,7 +545,7 @@ describe('RestorePlanService', () => {
                 table: 'x_app.ticket',
             });
 
-            const result = await fixture.service.createDryRunPlan(
+            const draft = await fixture.service.createDryRunPlan(
                 buildScopeDrivenDryRunRequest('plan-scope-update-missing', {
                     scope: {
                         mode: 'record',
@@ -522,49 +556,94 @@ describe('RestorePlanService', () => {
                 claims(),
             );
 
-            assert.equal(result.success, false);
-            if (result.success) {
+            assert.equal(draft.success, true);
+            if (!draft.success) {
                 return;
             }
 
-            assert.equal(result.statusCode, 409);
-            assert.equal(result.error, 'restore_plan_materialization_failed');
-            assert.equal(result.reasonCode, 'blocked_reference_conflict');
+            const finalized = await fixture.service.finalizeTargetReconciliation(
+                'plan-scope-update-missing',
+                buildFinalizeRequest([{
+                    table: 'x_app.ticket',
+                    record_sys_id: 'rec-01',
+                    target_state: 'missing',
+                }]),
+                claims(),
+            );
+
+            assert.equal(finalized.success, false);
+            if (finalized.success) {
+                return;
+            }
+
+            assert.equal(finalized.statusCode, 409);
+            assert.equal(finalized.error, 'restore_plan_materialization_failed');
+            assert.equal(finalized.reasonCode, 'blocked_reference_conflict');
         },
     );
 
     test(
-        'createDryRunPlan keeps deterministic plan_hash with '
+        'finalizeTargetReconciliation enforces exact target reconciliation '
+        + 'request set',
+        async () => {
+            const fixture = createScopeDrivenFixture();
+
+            seedScopeMaterializationRecord({
+                artifactReader: fixture.artifactReader,
+                eventId: 'evt-scope-validate',
+                eventTime: '2026-02-18T15:21:00.000Z',
+                indexReader: fixture.indexReader,
+                offset: '111',
+                partition: 0,
+                recordSysId: 'rec-01',
+                sourceOperation: 'I',
+                sysModCount: 3,
+                sysUpdatedOn: '2026-02-18 15:21:00',
+                table: 'x_app.ticket',
+            });
+
+            const draft = await fixture.service.createDryRunPlan(
+                buildScopeDrivenDryRunRequest('plan-scope-validate', {
+                    scope: {
+                        mode: 'record',
+                        tables: ['x_app.ticket'],
+                        record_sys_ids: ['rec-01'],
+                    },
+                }),
+                claims(),
+            );
+
+            assert.equal(draft.success, true);
+            if (!draft.success) {
+                return;
+            }
+
+            const invalid = await fixture.service.finalizeTargetReconciliation(
+                'plan-scope-validate',
+                buildFinalizeRequest([{
+                    table: 'x_app.other',
+                    record_sys_id: 'rec-99',
+                    target_state: 'exists',
+                }]),
+                claims(),
+            );
+
+            assert.equal(invalid.success, false);
+            if (invalid.success) {
+                return;
+            }
+
+            assert.equal(invalid.statusCode, 400);
+            assert.equal(invalid.error, 'invalid_request');
+        },
+    );
+
+    test(
+        'finalizeTargetReconciliation keeps deterministic plan_hash with '
         + 'target-aware reconciliation',
         async () => {
-            const targetLookupA = new InMemoryRestoreTargetStateLookup();
-            targetLookupA.setTargetRecordState({
-                record_sys_id: 'rec-alpha',
-                state: 'exists',
-                table: 'x_app.ticket',
-            });
-            targetLookupA.setTargetRecordState({
-                record_sys_id: 'rec-bravo',
-                state: 'missing',
-                table: 'x_app.ticket',
-            });
-            const targetLookupB = new InMemoryRestoreTargetStateLookup();
-            targetLookupB.setTargetRecordState({
-                record_sys_id: 'rec-alpha',
-                state: 'exists',
-                table: 'x_app.ticket',
-            });
-            targetLookupB.setTargetRecordState({
-                record_sys_id: 'rec-bravo',
-                state: 'missing',
-                table: 'x_app.ticket',
-            });
-            const fixtureA = createScopeDrivenFixture({
-                targetStateLookup: targetLookupA,
-            });
-            const fixtureB = createScopeDrivenFixture({
-                targetStateLookup: targetLookupB,
-            });
+            const fixtureA = createScopeDrivenFixture();
+            const fixtureB = createScopeDrivenFixture();
 
             seedScopeMaterializationRecord({
                 artifactReader: fixtureA.artifactReader,
@@ -629,31 +708,70 @@ describe('RestorePlanService', () => {
                     },
                 },
             );
-            const resultA = await fixtureA.service.createDryRunPlan(
+            const draftA = await fixtureA.service.createDryRunPlan(
                 request,
                 claims(),
             );
-            const resultB = await fixtureB.service.createDryRunPlan(
+            const draftB = await fixtureB.service.createDryRunPlan(
                 request,
                 claims(),
             );
 
-            assert.equal(resultA.success, true);
-            assert.equal(resultB.success, true);
-            if (!resultA.success || !resultB.success) {
+            assert.equal(draftA.success, true);
+            assert.equal(draftB.success, true);
+            if (!draftA.success || !draftB.success) {
+                return;
+            }
+
+            const finalizedA = await fixtureA.service.finalizeTargetReconciliation(
+                'plan-scope-target-det',
+                buildFinalizeRequest([
+                    {
+                        table: 'x_app.ticket',
+                        record_sys_id: 'rec-alpha',
+                        target_state: 'exists',
+                    },
+                    {
+                        table: 'x_app.ticket',
+                        record_sys_id: 'rec-bravo',
+                        target_state: 'missing',
+                    },
+                ]),
+                claims(),
+            );
+            const finalizedB = await fixtureB.service.finalizeTargetReconciliation(
+                'plan-scope-target-det',
+                buildFinalizeRequest([
+                    {
+                        table: 'x_app.ticket',
+                        record_sys_id: 'rec-bravo',
+                        target_state: 'missing',
+                    },
+                    {
+                        table: 'x_app.ticket',
+                        record_sys_id: 'rec-alpha',
+                        target_state: 'exists',
+                    },
+                ]),
+                claims(),
+            );
+
+            assert.equal(finalizedA.success, true);
+            assert.equal(finalizedB.success, true);
+            if (!finalizedA.success || !finalizedB.success) {
                 return;
             }
 
             assert.equal(
-                resultA.record.plan.plan_hash,
-                resultB.record.plan.plan_hash,
+                finalizedA.record.plan.plan_hash,
+                finalizedB.record.plan.plan_hash,
             );
             assert.deepEqual(
-                resultA.record.plan_hash_input.rows,
-                resultB.record.plan_hash_input.rows,
+                finalizedA.record.plan_hash_input.rows,
+                finalizedB.record.plan_hash_input.rows,
             );
             const actionByRecord = new Map(
-                resultA.record.plan_hash_input.rows.map((row) => {
+                finalizedA.record.plan_hash_input.rows.map((row) => {
                     return [row.record_sys_id, row.action];
                 }),
             );
@@ -733,6 +851,11 @@ describe('RestorePlanService', () => {
             if (!resultA.success || !resultB.success) {
                 return;
             }
+
+            assert.equal(resultA.reconciliation_state, 'draft');
+            assert.equal(resultB.reconciliation_state, 'draft');
+            assert.equal(resultA.target_reconciliation_records.length, 2);
+            assert.equal(resultB.target_reconciliation_records.length, 2);
 
             assert.equal(
                 resultA.record.plan.plan_hash,

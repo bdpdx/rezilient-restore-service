@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { RestoreWatermark as RestoreWatermarkSchema } from '@rezilient/types';
 import { RestoreExecutionService } from '../execute/execute-service';
+import { NoopRestoreTargetWriter } from '../execute/models';
 import { RestoreJobService } from '../jobs/job-service';
 import { RestoreLockManager } from '../locks/lock-manager';
 import { RestorePlanService } from '../plans/plan-service';
@@ -146,6 +147,8 @@ async function createFixture(): Promise<{
         plans,
         {},
         now,
+        undefined,
+        new NoopRestoreTargetWriter(),
     );
     const evidence = new RestoreEvidenceService(
         jobs,
@@ -518,6 +521,8 @@ test('exportEvidence returns failure when job not found', async () => {
         plans,
         {},
         now,
+        undefined,
+        new NoopRestoreTargetWriter(),
     );
     const evidence = new RestoreEvidenceService(
         jobs,
@@ -640,6 +645,8 @@ test('exportEvidence returns failure when plan not found', async () => {
         emptyPlanService,
         {},
         now,
+        undefined,
+        new NoopRestoreTargetWriter(),
     );
     const evidence = new RestoreEvidenceService(
         jobs,

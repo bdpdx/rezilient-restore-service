@@ -257,6 +257,42 @@ export type ResumeRestoreJobRequest = z.infer<
     typeof ResumeRestoreJobRequestSchema
 >;
 
+export const ExecuteBatchClaimRequestSchema = z
+    .object({
+        operator_id: z.string().min(1),
+        max_rows: z.number().int().positive().max(1000).optional(),
+    })
+    .strict();
+
+export type ExecuteBatchClaimRequest = z.infer<
+    typeof ExecuteBatchClaimRequestSchema
+>;
+
+export const ExecuteBatchCommitRowOutcomeSchema = z
+    .object({
+        row_id: z.string().min(1),
+        outcome: ExecutionOutcomeSchema,
+        reason_code: RestoreReasonCodeSchema,
+        message: z.string().min(1).optional(),
+    })
+    .strict();
+
+export type ExecuteBatchCommitRowOutcome = z.infer<
+    typeof ExecuteBatchCommitRowOutcomeSchema
+>;
+
+export const ExecuteBatchCommitRequestSchema = z
+    .object({
+        claim_id: z.string().min(1),
+        committed_by: z.string().min(1),
+        row_outcomes: z.array(ExecuteBatchCommitRowOutcomeSchema).min(1),
+    })
+    .strict();
+
+export type ExecuteBatchCommitRequest = z.infer<
+    typeof ExecuteBatchCommitRequestSchema
+>;
+
 export interface ExecutionResumeCheckpoint {
     checkpoint_id: string;
     next_chunk_index: number;
@@ -420,6 +456,113 @@ export interface RestoreTargetWriter {
     applyRow(
         input: RestoreTargetWriteRequest,
     ): Promise<RestoreTargetWriteResult>;
+}
+
+export interface ExecuteBatchClaimedRow {
+    row_id: string;
+    table: string;
+    record_sys_id: string;
+    action: RestorePlanAction;
+    chunk_id: string;
+    row_attempt: number;
+    values?: RestorePlanHashRowInput['values'];
+}
+
+export interface PersistedExecuteBatchClaimRow {
+    row_id: string;
+    chunk_id: string;
+    chunk_index: number;
+    row_index: number;
+    row_attempt: number;
+}
+
+export interface PersistedExecuteBatchClaim {
+    claim_id: string;
+    job_id: string;
+    plan_id: string;
+    plan_hash: string;
+    claimed_at: string;
+    claimed_by: string;
+    next_chunk_index: number;
+    next_row_index: number;
+    rows: PersistedExecuteBatchClaimRow[];
+    status: 'claimed' | 'committed';
+    committed_at: string | null;
+    committed_by: string | null;
+}
+
+export interface ExecuteBatchClaimResponse {
+    accepted: boolean;
+    job_id: string;
+    claim_id: string | null;
+    claimed_at: string | null;
+    claimed_by: string | null;
+    claimed_rows: ExecuteBatchClaimedRow[];
+    has_more_rows: boolean;
+    message: string;
+    reason_code: RestoreReasonCode;
+    requested_max_rows: number | null;
+}
+
+export interface ExecuteBatchCommitResponse {
+    accepted: boolean;
+    claim_id: string;
+    committed_rows: number;
+    job_id: string;
+    execution_status: ExecutionStatus | null;
+    checkpoint: ExecutionResumeCheckpoint | null;
+    summary: ExecuteSummary | null;
+    message: string;
+    reason_code: RestoreReasonCode;
+}
+
+export interface ExecuteBatchClaimSuccess {
+    success: true;
+    statusCode: number;
+    response: ExecuteBatchClaimResponse;
+}
+
+export interface ExecuteBatchClaimFailure {
+    success: false;
+    statusCode: number;
+    error: string;
+    reasonCode?: RestoreReasonCode;
+    message: string;
+}
+
+export type ExecuteBatchClaimResult =
+    | ExecuteBatchClaimSuccess
+    | ExecuteBatchClaimFailure;
+
+export interface ExecuteBatchCommitSuccess {
+    success: true;
+    statusCode: number;
+    response: ExecuteBatchCommitResponse;
+}
+
+export interface ExecuteBatchCommitFailure {
+    success: false;
+    statusCode: number;
+    error: string;
+    reasonCode?: RestoreReasonCode;
+    message: string;
+}
+
+export type ExecuteBatchCommitResult =
+    | ExecuteBatchCommitSuccess
+    | ExecuteBatchCommitFailure;
+
+export class FailClosedRestoreTargetWriter
+implements RestoreTargetWriter {
+    async applyRow(
+        _input: RestoreTargetWriteRequest,
+    ): Promise<RestoreTargetWriteResult> {
+        return {
+            outcome: 'failed',
+            reason_code: 'failed_internal_error',
+            message: 'target apply runtime support is unavailable',
+        };
+    }
 }
 
 export class NoopRestoreTargetWriter

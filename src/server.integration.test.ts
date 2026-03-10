@@ -22,6 +22,7 @@ import type {
     RestoreTargetWriteResult,
     RestoreTargetWriter,
 } from './execute/models';
+import { NoopRestoreTargetWriter } from './execute/models';
 import {
     PostgresRestoreExecutionStateStore,
     RestoreExecutionStateStore,
@@ -41,7 +42,10 @@ import {
     PostgresRestorePlanStateStore,
     RestorePlanStateStore,
 } from './plans/plan-state-store';
-import { InMemoryRestoreTargetStateLookup } from './plans/target-reconciliation';
+import {
+    InMemoryRestoreTargetStateLookup,
+    NoopRestoreTargetStateLookup,
+} from './plans/target-reconciliation';
 import {
     AcpListSourceMappingsResult,
     AcpResolveSourceMappingResult,
@@ -310,6 +314,7 @@ function createService(
         sourceMappingListProvider?: SourceMappingListProvider;
         stateStores?: ServiceStateStores;
         targetWriter?: RestoreTargetWriter;
+        failClosedRuntimeComposition?: boolean;
         executePreflightReconcileStaleAfterMs?: number;
     },
 ): Server {
@@ -336,9 +341,13 @@ function createService(
     const restoreIndexReader = options?.restoreIndexReader
         || new InMemoryRestoreIndexStateReader();
     const artifactBodyReader = new InMemoryRestoreArtifactBodyReader();
-    const targetStateLookup = options?.targetRecordStates
+    const failClosedRuntimeComposition =
+        options?.failClosedRuntimeComposition === true;
+    const targetStateLookup = failClosedRuntimeComposition
+        ? undefined
+        : options?.targetRecordStates
         ? new InMemoryRestoreTargetStateLookup()
-        : undefined;
+        : new NoopRestoreTargetStateLookup();
 
     if (
         typeof (restoreIndexReader as Partial<SeedableRestoreIndexStateReader>)
@@ -397,13 +406,15 @@ function createService(
         }
     }
 
-    if (targetStateLookup && options?.targetRecordStates) {
+    if (options?.targetRecordStates && targetStateLookup) {
         for (const targetRecord of options.targetRecordStates) {
-            targetStateLookup.setTargetRecordState({
-                record_sys_id: targetRecord.recordSysId,
-                state: targetRecord.state,
-                table: targetRecord.table,
-            });
+            if (targetStateLookup instanceof InMemoryRestoreTargetStateLookup) {
+                targetStateLookup.setTargetRecordState({
+                    record_sys_id: targetRecord.recordSysId,
+                    state: targetRecord.state,
+                    table: targetRecord.table,
+                });
+            }
         }
     }
 
@@ -427,7 +438,12 @@ function createService(
         options?.executeConfig,
         now,
         options?.stateStores?.execute,
-        options?.targetWriter,
+        options?.targetWriter ||
+            (
+                failClosedRuntimeComposition
+                    ? undefined
+                    : new NoopRestoreTargetWriter()
+            ),
     );
     const evidence = new RestoreEvidenceService(
         jobs,
@@ -1451,6 +1467,226 @@ test('object-level authorization gates scoped reads and object actions', async (
     }
 });
 
+test(
+    'protocol endpoints validate payloads and persist execute claim/commit state',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const server = createService(signingKey);
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+
+        try {
+            const planId = 'plan-protocol-surface';
+            const fixture = await createPlanAndJob(
+                baseUrl,
+                token,
+                planId,
+            );
+
+            const finalizeInvalid = await postJson(
+                baseUrl,
+                `/v1/plans/${encodeURIComponent(planId)}` +
+                    '/target-reconciliation/finalize',
+                token,
+                {
+                    finalized_by: 'sn-worker',
+                    reconciled_records: [],
+                },
+            );
+
+            assert.equal(finalizeInvalid.status, 400);
+            assert.equal(finalizeInvalid.body.error, 'invalid_request');
+
+            const finalizeValid = await postJson(
+                baseUrl,
+                `/v1/plans/${encodeURIComponent(planId)}` +
+                    '/target-reconciliation/finalize',
+                token,
+                {
+                    finalized_by: 'sn-worker',
+                    reconciled_records: [{
+                        table: 'incident',
+                        record_sys_id: 'rec-01',
+                        target_state: 'exists',
+                    }],
+                },
+            );
+
+            assert.equal(finalizeValid.status, 200);
+            assert.equal(finalizeValid.body.accepted, true);
+            assert.equal(finalizeValid.body.reconciliation_state, 'finalized');
+            assert.equal(finalizeValid.body.reused_existing_plan, true);
+            assert.equal(finalizeValid.body.requested_record_count, 1);
+
+            const claimInvalid = await postJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}` +
+                    '/execute-batches/claim',
+                token,
+                {},
+            );
+
+            assert.equal(claimInvalid.status, 400);
+            assert.equal(claimInvalid.body.error, 'invalid_request');
+
+            const claimValid = await postJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}` +
+                    '/execute-batches/claim',
+                token,
+                {
+                    operator_id: 'sn-worker',
+                    max_rows: 1,
+                },
+            );
+
+            assert.equal(claimValid.status, 200);
+            assert.equal(claimValid.body.accepted, true);
+            assert.equal(claimValid.body.job_id, fixture.jobId);
+            assert.equal(claimValid.body.requested_max_rows, 1);
+            const claimValidRows = claimValid.body.claimed_rows as Array<
+                Record<string, unknown>
+            >;
+
+            assert.equal(claimValidRows.length, 1);
+            assert.equal(claimValidRows[0]?.row_id, 'row-01');
+
+            const overlapClaim = await postJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}` +
+                    '/execute-batches/claim',
+                token,
+                {
+                    operator_id: 'sn-worker',
+                    max_rows: 1,
+                },
+            );
+
+            assert.equal(overlapClaim.status, 409);
+            assert.equal(overlapClaim.body.error, 'claim_in_progress');
+
+            const commitInvalid = await postJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}` +
+                    '/execute-batches/commit',
+                token,
+                {
+                    claim_id: 'claim-01',
+                    committed_by: 'sn-worker',
+                    row_outcomes: [],
+                },
+            );
+
+            assert.equal(commitInvalid.status, 400);
+            assert.equal(commitInvalid.body.error, 'invalid_request');
+
+            const commitMismatch = await postJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}` +
+                    '/execute-batches/commit',
+                token,
+                {
+                    claim_id: claimValid.body.claim_id,
+                    committed_by: 'sn-worker',
+                    row_outcomes: [{
+                        row_id: 'row-99',
+                        outcome: 'applied',
+                        reason_code: 'none',
+                    }],
+                },
+            );
+
+            assert.equal(commitMismatch.status, 409);
+            assert.equal(commitMismatch.body.error, 'claim_commit_mismatch');
+            assert.equal(
+                commitMismatch.body.reason_code,
+                'blocked_resume_precondition_mismatch',
+            );
+
+            const commitValid = await postJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}` +
+                    '/execute-batches/commit',
+                token,
+                {
+                    claim_id: claimValid.body.claim_id,
+                    committed_by: 'sn-worker',
+                    row_outcomes: [{
+                        row_id: 'row-01',
+                        outcome: 'applied',
+                        reason_code: 'none',
+                    }],
+                },
+            );
+
+            assert.equal(commitValid.status, 200);
+            assert.equal(commitValid.body.accepted, true);
+            assert.equal(commitValid.body.reason_code, 'none');
+            assert.equal(commitValid.body.job_id, fixture.jobId);
+            assert.equal(commitValid.body.claim_id, claimValid.body.claim_id);
+            assert.equal(commitValid.body.committed_rows, 1);
+            assert.equal(commitValid.body.execution_status, 'paused');
+            const commitValidSummary = commitValid.body.summary as Record<
+                string,
+                unknown
+            >;
+
+            assert.equal(commitValidSummary.applied_rows, 1);
+            assert.equal(commitValidSummary.failed_rows, 0);
+
+            const secondClaim = await postJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}` +
+                    '/execute-batches/claim',
+                token,
+                {
+                    operator_id: 'sn-worker',
+                    max_rows: 1,
+                },
+            );
+
+            assert.equal(secondClaim.status, 200);
+            assert.equal(secondClaim.body.accepted, true);
+            const secondClaimRows = secondClaim.body.claimed_rows as Array<
+                Record<string, unknown>
+            >;
+
+            assert.equal(secondClaimRows[0]?.row_id, 'row-02');
+
+            const secondCommit = await postJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}` +
+                    '/execute-batches/commit',
+                token,
+                {
+                    claim_id: secondClaim.body.claim_id,
+                    committed_by: 'sn-worker',
+                    row_outcomes: [{
+                        row_id: 'row-02',
+                        outcome: 'failed',
+                        reason_code: 'failed_permission_conflict',
+                        message: 'target rejected write',
+                    }],
+                },
+            );
+
+            assert.equal(secondCommit.status, 200);
+            assert.equal(secondCommit.body.accepted, true);
+            assert.equal(secondCommit.body.execution_status, 'failed');
+            assert.equal(secondCommit.body.reason_code, 'failed_internal_error');
+            const secondCommitSummary = secondCommit.body.summary as Record<
+                string,
+                unknown
+            >;
+
+            assert.equal(secondCommitSummary.applied_rows, 1);
+            assert.equal(secondCommitSummary.failed_rows, 1);
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
+
 test('dry-run returns executable gate when ACP mapping exists', async () => {
     const signingKey = 'test-signing-key';
     const server = createService(signingKey, {
@@ -1477,7 +1713,9 @@ test('dry-run returns executable gate when ACP mapping exists', async () => {
     }
 });
 
-test('dry-run materializes scope-driven requests from indexed events', async () => {
+test(
+    'dry-run returns scope-driven draft with target reconciliation request rows',
+    async () => {
     const signingKey = 'test-signing-key';
     const artifactKey = 'rez/restore/event=evt-scope-01.artifact.json';
     const manifestKey = 'rez/restore/event=evt-scope-01.manifest.json';
@@ -1521,7 +1759,8 @@ test('dry-run materializes scope-driven requests from indexed events', async () 
             createScopeDrivenDryRunPayload('plan-scope-http'),
         );
 
-        assert.equal(response.status, 201);
+        assert.equal(response.status, 202);
+        assert.equal(response.body.reconciliation_state, 'draft');
         const planHashInput = response.body.plan_hash_input as Record<
             string,
             unknown
@@ -1535,6 +1774,14 @@ test('dry-run materializes scope-driven requests from indexed events', async () 
         assert.equal(firstRow.record_sys_id, 'rec-01');
         assert.equal(metadataFields.event_id, 'evt-scope-01');
         assert.equal(metadataFields.topic, 'rez.cdc');
+        const targetReconciliationRecords =
+            response.body.target_reconciliation_records as Array<
+                Record<string, unknown>
+            >;
+
+        assert.equal(targetReconciliationRecords.length, 1);
+        assert.equal(targetReconciliationRecords[0].record_sys_id, 'rec-01');
+        assert.equal(targetReconciliationRecords[0].source_operation, 'U');
 
         const pitResolutions = response.body.pit_resolutions as Array<
             Record<string, unknown>
@@ -1545,11 +1792,12 @@ test('dry-run materializes scope-driven requests from indexed events', async () 
     } finally {
         await closeServer(server);
     }
-});
+},
+);
 
 test(
-    'dry-run reconciles source insert to update and action counts when target '
-    + 'record exists',
+    'scope-driven finalize reconciles source insert to update and '
+    + 'authoritative action counts',
     async () => {
         const signingKey = 'test-signing-key';
         const artifactKey =
@@ -1584,24 +1832,38 @@ test(
                 },
                 manifestKey,
             }],
-            targetRecordStates: [{
-                recordSysId: 'rec-01',
-                state: 'exists',
-                table: 'incident',
-            }],
         });
         const baseUrl = await listen(server);
         const token = createToken(signingKey);
 
         try {
-            const response = await postJson(
+            const draft = await postJson(
                 baseUrl,
                 '/v1/plans/dry-run',
                 token,
                 createScopeDrivenDryRunPayload('plan-scope-http-reconciled'),
             );
 
+            assert.equal(draft.status, 202);
+
+            const response = await postJson(
+                baseUrl,
+                '/v1/plans/plan-scope-http-reconciled'
+                    + '/target-reconciliation/finalize',
+                token,
+                {
+                    finalized_by: 'sn-worker',
+                    reconciled_records: [{
+                        table: 'incident',
+                        record_sys_id: 'rec-01',
+                        target_state: 'exists',
+                    }],
+                },
+            );
+
             assert.equal(response.status, 201);
+            assert.equal(response.body.accepted, true);
+            assert.equal(response.body.reconciliation_state, 'finalized');
             const planHashInput = response.body.plan_hash_input as Record<
                 string,
                 unknown
@@ -1625,8 +1887,8 @@ test(
 );
 
 test(
-    'dry-run blocks scope-driven materialization when source update points to '
-    + 'missing target row',
+    'scope-driven finalize blocks when source update points to missing target '
+    + 'row',
     async () => {
         const signingKey = 'test-signing-key';
         const artifactKey =
@@ -1661,10 +1923,81 @@ test(
                 },
                 manifestKey,
             }],
-            targetRecordStates: [{
+        });
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+
+        try {
+            const draft = await postJson(
+                baseUrl,
+                '/v1/plans/dry-run',
+                token,
+                createScopeDrivenDryRunPayload('plan-scope-http-missing'),
+            );
+
+            assert.equal(draft.status, 202);
+
+            const response = await postJson(
+                baseUrl,
+                '/v1/plans/plan-scope-http-missing'
+                    + '/target-reconciliation/finalize',
+                token,
+                {
+                    finalized_by: 'sn-worker',
+                    reconciled_records: [{
+                        table: 'incident',
+                        record_sys_id: 'rec-01',
+                        target_state: 'missing',
+                    }],
+                },
+            );
+
+            assert.equal(response.status, 409);
+            assert.equal(response.body.error, 'restore_plan_materialization_failed');
+            assert.equal(response.body.reason_code, 'blocked_reference_conflict');
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
+
+test(
+    'scope-driven dry-run draft does not depend on target lookup runtime '
+    + 'composition',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const artifactKey =
+            'rez/restore/event=evt-scope-runtime-block.artifact.json';
+        const manifestKey =
+            'rez/restore/event=evt-scope-runtime-block.manifest.json';
+        const server = createService(signingKey, {
+            failClosedRuntimeComposition: true,
+            sourceMappingResolver: createResolver(createResolveResult()),
+            indexedEventCandidates: [{
+                artifactKey,
+                eventId: 'evt-scope-runtime-block',
+                eventTime: '2026-02-16T11:59:00.000Z',
+                manifestKey,
+                offset: '100',
+                partition: 1,
                 recordSysId: 'rec-01',
-                state: 'missing',
+                sysModCount: 2,
+                sysUpdatedOn: '2026-02-16 11:59:00',
                 table: 'incident',
+                topic: 'rez.cdc',
+            }],
+            artifactBodies: [{
+                artifactKey,
+                body: {
+                    __op: 'U',
+                    __schema_version: 3,
+                    __type: 'cdc.write',
+                    row_enc: {
+                        alg: 'AES-256-GCM',
+                        ciphertext: 'cipher-scope-runtime-block',
+                    },
+                },
+                manifestKey,
             }],
         });
         const baseUrl = await listen(server);
@@ -1675,12 +2008,17 @@ test(
                 baseUrl,
                 '/v1/plans/dry-run',
                 token,
-                createScopeDrivenDryRunPayload('plan-scope-http-missing'),
+                createScopeDrivenDryRunPayload('plan-scope-runtime-blocked'),
             );
 
-            assert.equal(response.status, 409);
-            assert.equal(response.body.error, 'restore_plan_materialization_failed');
-            assert.equal(response.body.reason_code, 'blocked_reference_conflict');
+            assert.equal(response.status, 202);
+            assert.equal(response.body.reconciliation_state, 'draft');
+            const records = response.body.target_reconciliation_records as Array<
+                Record<string, unknown>
+            >;
+
+            assert.equal(records.length, 1);
+            assert.equal(records[0].record_sys_id, 'rec-01');
         } finally {
             await closeServer(server);
         }
@@ -2415,6 +2753,61 @@ test('execute endpoint records chunk fallback and row outcomes', async () => {
         await closeServer(server);
     }
 });
+
+test(
+    'execute endpoint fails closed when target apply runtime support is not composed',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const server = createService(signingKey, {
+            failClosedRuntimeComposition: true,
+        });
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+
+        try {
+            const fixture = await createPlanAndJob(
+                baseUrl,
+                token,
+                'plan-execute-runtime-blocked',
+                {
+                    requiredCapabilities: ['restore_execute'],
+                },
+            );
+            const executeResponse = await postJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}/execution`,
+                token,
+                createExecutePayload({
+                    capabilities: ['restore_execute'],
+                    chunkSize: 2,
+                }),
+            );
+
+            assert.equal(executeResponse.status, 200);
+            const execution = executeResponse.body.execution as Record<
+                string,
+                unknown
+            >;
+            const summary = execution.summary as Record<string, unknown>;
+            const rowOutcomes = execution.row_outcomes as Array<
+                Record<string, unknown>
+            >;
+
+            assert.equal(execution.status, 'failed');
+            assert.equal(summary.applied_rows, 0);
+            assert.equal(summary.failed_rows, 2);
+            assert.equal(summary.skipped_rows, 0);
+            assert.equal(rowOutcomes.length, 2);
+            assert.equal(rowOutcomes[0]?.reason_code, 'failed_internal_error');
+            assert.match(
+                String(rowOutcomes[0]?.message || ''),
+                /target apply runtime support is unavailable/i,
+            );
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
 
 test('execute endpoint reports failed outcomes when target writer apply fails', async () => {
     const signingKey = 'test-signing-key';

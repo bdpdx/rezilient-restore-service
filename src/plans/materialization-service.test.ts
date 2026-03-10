@@ -11,6 +11,7 @@ import {
 import {
     buildTargetStateLookupKey,
     InMemoryRestoreTargetStateLookup,
+    NoopRestoreTargetStateLookup,
     reconcileSourceOperationWithTargetState,
     RESTORE_TARGET_EXISTENCE_CHECK_POLICY,
     type RestoreTargetStateLookup,
@@ -65,7 +66,7 @@ function buildServiceFixture(options?: {
     const reader = new InMemoryRestoreArtifactBodyReader();
     const service = new RestoreRowMaterializationService(
         reader,
-        options?.targetStateLookup,
+        options?.targetStateLookup || new NoopRestoreTargetStateLookup(),
     );
 
     return {
@@ -73,6 +74,44 @@ function buildServiceFixture(options?: {
         service,
     };
 }
+
+test(
+    'materializeRows fails closed by default when target lookup support is missing',
+    async () => {
+        const reader = new InMemoryRestoreArtifactBodyReader();
+        const service = new RestoreRowMaterializationService(reader);
+        const candidate = buildCandidate({
+            artifactKey: 'rez/restore/event=evt-default.artifact.json',
+            eventId: 'evt-default',
+            manifestKey: 'rez/restore/event=evt-default.manifest.json',
+        });
+
+        reader.setArtifactBody({
+            artifactKey: candidate.artifactKey,
+            body: buildArtifact({
+                __op: 'U',
+                row_enc: encryptedPayload('default-ciphertext'),
+            }),
+            manifestKey: candidate.manifestKey,
+        });
+
+        await assert.rejects(
+            async () => service.materializeRows({
+                candidates: [candidate],
+                instanceId: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+                tenantId: 'tenant-acme',
+            }),
+            (error: unknown) => {
+                assert.ok(error instanceof RestoreRowMaterializationError);
+                assert.equal(error.code, 'target_state_lookup_unavailable');
+                assert.match(error.message, /target state lookup/i);
+
+                return true;
+            },
+        );
+    },
+);
 
 test(
     'target existence checks are enabled for dry-run visibility and execute',
@@ -123,6 +162,131 @@ test('in-memory target lookup resolves state and defaults to missing', async () 
 
     assert.equal(result.get('x_app.ticket|rec-01'), 'exists');
     assert.equal(result.get('x_app.ticket|rec-02'), 'missing');
+});
+
+test(
+    'materializeRowsForTargetReconciliationDraft returns deterministic '
+    + 'request rows with source actions',
+    async () => {
+        const { reader, service } = buildServiceFixture();
+        const candidate = buildCandidate({
+            artifactKey: 'rez/restore/event=evt-draft.artifact.json',
+            eventId: 'evt-draft',
+            manifestKey: 'rez/restore/event=evt-draft.manifest.json',
+        });
+
+        reader.setArtifactBody({
+            artifactKey: candidate.artifactKey,
+            body: buildArtifact({
+                __op: 'I',
+                row_enc: encryptedPayload('draft-ciphertext'),
+            }),
+            manifestKey: candidate.manifestKey,
+        });
+
+        const draft = await service.materializeRowsForTargetReconciliationDraft({
+            candidates: [candidate],
+            instanceId: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+            tenantId: 'tenant-acme',
+        });
+
+        assert.equal(draft.rows.length, 1);
+        assert.equal(draft.draftRows.length, 1);
+        assert.equal(draft.rows[0].action, 'insert');
+        assert.equal(draft.draftRows[0].source_operation, 'I');
+        assert.equal(draft.pitResolutions.length, 1);
+    },
+);
+
+test(
+    'finalizeDraftRows recomputes row action and precondition hash from '
+    + 'target-state results',
+    async () => {
+        const { reader, service } = buildServiceFixture();
+        const candidate = buildCandidate({
+            artifactKey: 'rez/restore/event=evt-finalize.artifact.json',
+            eventId: 'evt-finalize',
+            manifestKey: 'rez/restore/event=evt-finalize.manifest.json',
+        });
+
+        reader.setArtifactBody({
+            artifactKey: candidate.artifactKey,
+            body: buildArtifact({
+                __op: 'I',
+                row_enc: encryptedPayload('finalize-ciphertext'),
+            }),
+            manifestKey: candidate.manifestKey,
+        });
+
+        const draft = await service.materializeRowsForTargetReconciliationDraft({
+            candidates: [candidate],
+            instanceId: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+            tenantId: 'tenant-acme',
+        });
+        const key = buildTargetStateLookupKey({
+            record_sys_id: 'rec-01',
+            table: 'x_app.ticket',
+        });
+        const targetStateByKey = new Map([
+            [key, 'exists' as const],
+        ]);
+
+        const reconciledRows = service.finalizeDraftRows({
+            draftRows: draft.draftRows,
+            targetStateByKey,
+            requireTargetStates: true,
+        });
+
+        assert.equal(reconciledRows.length, 1);
+        assert.equal(reconciledRows[0].action, 'update');
+        assert.notEqual(
+            reconciledRows[0].precondition_hash,
+            draft.rows[0].precondition_hash,
+        );
+    },
+);
+
+test('finalizeDraftRows rejects missing required target-state results', async () => {
+    const { reader, service } = buildServiceFixture();
+    const candidate = buildCandidate({
+        artifactKey: 'rez/restore/event=evt-finalize-missing.artifact.json',
+        eventId: 'evt-finalize-missing',
+        manifestKey: 'rez/restore/event=evt-finalize-missing.manifest.json',
+    });
+
+    reader.setArtifactBody({
+        artifactKey: candidate.artifactKey,
+        body: buildArtifact({
+            __op: 'U',
+            row_enc: encryptedPayload('finalize-missing-ciphertext'),
+        }),
+        manifestKey: candidate.manifestKey,
+    });
+
+    const draft = await service.materializeRowsForTargetReconciliationDraft({
+        candidates: [candidate],
+        instanceId: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        tenantId: 'tenant-acme',
+    });
+
+    assert.throws(
+        () => {
+            service.finalizeDraftRows({
+                draftRows: draft.draftRows,
+                targetStateByKey: new Map(),
+                requireTargetStates: true,
+            });
+        },
+        (error: unknown) => {
+            assert.ok(error instanceof RestoreRowMaterializationError);
+            assert.equal(error.code, 'target_reconciliation_incomplete');
+
+            return true;
+        },
+    );
 });
 
 test('reconciliation policy covers required source/target combinations', () => {

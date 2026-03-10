@@ -11,6 +11,7 @@ import {
 import {
     RestoreExecutionService,
 } from './execute/execute-service';
+import { NoopRestoreTargetWriter } from './execute/models';
 import {
     PostgresRestoreExecutionStateStore,
 } from './execute/execute-state-store';
@@ -237,6 +238,7 @@ function createFixture(
         new PostgresRestoreExecutionStateStore('postgres://unused', {
             pool: pool as any,
         }),
+        new NoopRestoreTargetWriter(),
     );
     const evidence = new RestoreEvidenceService(
         jobs,

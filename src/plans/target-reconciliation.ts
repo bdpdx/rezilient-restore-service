@@ -23,6 +23,13 @@ export interface RestoreTargetStateLookup {
     ): Promise<Map<string, RestoreTargetRecordState>>;
 }
 
+export class RestoreTargetStateLookupUnavailableError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'RestoreTargetStateLookupUnavailableError';
+    }
+}
+
 export type RestoreSourceOperation = 'D' | 'I' | 'U';
 
 export type RestoreTargetActionReconciliationResult =
@@ -147,6 +154,15 @@ implements RestoreTargetStateLookup {
         }
 
         return states;
+    }
+}
+
+export class FailClosedRestoreTargetStateLookup
+implements RestoreTargetStateLookup {
+    async lookupTargetState(): Promise<Map<string, RestoreTargetRecordState>> {
+        throw new RestoreTargetStateLookupUnavailableError(
+            'target state lookup runtime support is unavailable',
+        );
     }
 }
 

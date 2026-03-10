@@ -1,9 +1,12 @@
 import { strict as assert } from 'node:assert';
 import { describe, test } from 'node:test';
 import {
+    ExecuteBatchClaimRequestSchema,
+    ExecuteBatchCommitRequestSchema,
     ExecuteRestoreJobRequestSchema,
     ExecuteRuntimeConflictInputSchema,
     ExecuteWorkflowInputSchema,
+    FailClosedRestoreTargetWriter,
     NoopRestoreTargetWriter,
     ResumeRestoreJobRequestSchema,
     ExecutionChunkStatusSchema,
@@ -204,6 +207,51 @@ describe('ResumeRestoreJobRequestSchema', () => {
     });
 });
 
+describe('ExecuteBatchClaimRequestSchema', () => {
+    test('accepts valid claim request', () => {
+        const result = ExecuteBatchClaimRequestSchema.safeParse({
+            operator_id: 'sn-worker',
+            max_rows: 50,
+        });
+
+        assert.equal(result.success, true);
+    });
+
+    test('rejects claim request with missing operator_id', () => {
+        const result = ExecuteBatchClaimRequestSchema.safeParse({
+            max_rows: 50,
+        });
+
+        assert.equal(result.success, false);
+    });
+});
+
+describe('ExecuteBatchCommitRequestSchema', () => {
+    test('accepts valid commit request', () => {
+        const result = ExecuteBatchCommitRequestSchema.safeParse({
+            claim_id: 'claim-01',
+            committed_by: 'sn-worker',
+            row_outcomes: [{
+                row_id: 'row-01',
+                outcome: 'applied',
+                reason_code: 'none',
+            }],
+        });
+
+        assert.equal(result.success, true);
+    });
+
+    test('rejects commit request with empty row_outcomes', () => {
+        const result = ExecuteBatchCommitRequestSchema.safeParse({
+            claim_id: 'claim-01',
+            committed_by: 'sn-worker',
+            row_outcomes: [],
+        });
+
+        assert.equal(result.success, false);
+    });
+});
+
 describe('chunk outcome schema', () => {
     test('validates all status values', () => {
         for (const status of [
@@ -278,6 +326,24 @@ describe('media outcome schema', () => {
 });
 
 describe('target writer contract', () => {
+    test('fail-closed target writer returns explicit failure', async () => {
+        const writer = new FailClosedRestoreTargetWriter();
+        const result = await writer.applyRow({
+            chunk_id: 'chunk_0001',
+            executed_by: 'op-1',
+            job_id: 'job-1',
+            plan_hash: 'b'.repeat(64),
+            row: buildPlanRow(),
+            row_attempt: 1,
+        });
+
+        assert.deepEqual(result, {
+            outcome: 'failed',
+            reason_code: 'failed_internal_error',
+            message: 'target apply runtime support is unavailable',
+        });
+    });
+
     test('noop target writer returns deterministic placeholder result', async () => {
         const writer = new NoopRestoreTargetWriter();
         const result = await writer.applyRow({

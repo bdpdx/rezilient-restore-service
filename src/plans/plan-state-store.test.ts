@@ -10,6 +10,7 @@ describe('InMemoryRestorePlanStateStore', () => {
     test('read returns empty initial state', async () => {
         const store = new InMemoryRestorePlanStateStore();
         const state = await store.read();
+        assert.deepEqual(state.drafts_by_id, {});
         assert.deepEqual(state.plans_by_id, {});
     });
 
@@ -62,6 +63,7 @@ describe('PostgresRestorePlanStateStore', () => {
         );
         try {
             const state = await store.read();
+            assert.deepEqual(state.drafts_by_id, {});
             assert.deepEqual(state.plans_by_id, {});
         } finally {
             await store.close();
@@ -113,6 +115,10 @@ describe('parseState', () => {
     test('handles missing plans_by_id by throwing', async () => {
         const store = new InMemoryRestorePlanStateStore();
         const state = await store.read();
+        assert.ok(
+            state.drafts_by_id !== undefined,
+            'drafts_by_id should exist',
+        );
         assert.ok(
             state.plans_by_id !== undefined,
             'plans_by_id should exist',

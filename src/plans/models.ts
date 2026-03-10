@@ -27,6 +27,7 @@ import type {
     RestoreMediaCandidate,
     RestorePitContract,
     RestorePitCandidate as SharedRestorePitCandidate,
+    RestorePitRowTuple,
     RestorePlan,
     RestorePlanHashInput,
     RestorePlanHashRowInput,
@@ -132,6 +133,25 @@ export interface RestorePitResolutionRecord {
     winning_event_time: string;
 }
 
+export type RestoreSourceOperation = 'D' | 'I' | 'U';
+export type RestoreRowAction = 'delete' | 'insert' | 'update';
+
+export interface RestoreTargetReconciliationRequestRecord {
+    row_id: string;
+    table: string;
+    record_sys_id: string;
+    source_operation: RestoreSourceOperation;
+    source_action: RestoreRowAction;
+}
+
+export interface RestoreTargetReconciliationDraftRowRecord {
+    artifact_key: string;
+    manifest_key: string;
+    row: RestorePlanHashRowInput;
+    source_operation: RestoreSourceOperation;
+    winner_tuple: RestorePitRowTuple;
+}
+
 export type FreshnessUnknownDetail =
     | 'no_indexed_coverage'
     | 'partition_not_indexed'
@@ -162,10 +182,33 @@ export interface RestoreDryRunPlanRecord {
     watermarks: RestoreWatermark[];
 }
 
+export interface RestoreDryRunPlanDraftRecord {
+    tenant_id: string;
+    instance_id: string;
+    source: string;
+    plan_id: string;
+    requested_by: string;
+    pit: RestorePitContract;
+    scope: RestoreScope;
+    execution_options: RestoreExecutionOptions;
+    conflicts: RestoreConflict[];
+    delete_candidates: RestoreDeleteCandidate[];
+    media_candidates: RestoreMediaCandidate[];
+    watermark_hints: RestoreDryRunWatermarkHint[];
+    approval: RestoreApprovalMetadata;
+    pit_resolutions: RestorePitResolutionRecord[];
+    draft_rows: RestoreTargetReconciliationDraftRowRecord[];
+    target_reconciliation_records: RestoreTargetReconciliationRequestRecord[];
+    authoritative_watermarks: RestoreWatermark[];
+    created_at: string;
+}
+
 export interface CreateDryRunPlanSuccess {
     success: true;
     statusCode: number;
     record: RestoreDryRunPlanRecord;
+    reconciliation_state: 'draft' | 'finalized';
+    target_reconciliation_records: RestoreTargetReconciliationRequestRecord[];
 }
 
 export interface CreateDryRunPlanFailure {
@@ -180,6 +223,62 @@ export interface CreateDryRunPlanFailure {
 export type CreateDryRunPlanResult =
     | CreateDryRunPlanSuccess
     | CreateDryRunPlanFailure;
+
+export const TargetReconciliationRecordStateSchema = z.enum([
+    'exists',
+    'missing',
+]);
+
+export type TargetReconciliationRecordState = z.infer<
+    typeof TargetReconciliationRecordStateSchema
+>;
+
+export const FinalizeTargetReconciliationRecordSchema = z
+    .object({
+        table: z.string().min(1),
+        record_sys_id: z.string().min(1),
+        target_state: TargetReconciliationRecordStateSchema,
+    })
+    .strict();
+
+export type FinalizeTargetReconciliationRecord = z.infer<
+    typeof FinalizeTargetReconciliationRecordSchema
+>;
+
+export const FinalizeTargetReconciliationRequestSchema = z
+    .object({
+        finalized_by: z.string().min(1),
+        reconciled_records: z
+            .array(FinalizeTargetReconciliationRecordSchema)
+            .min(1),
+    })
+    .strict();
+
+export type FinalizeTargetReconciliationRequest = z.infer<
+    typeof FinalizeTargetReconciliationRequestSchema
+>;
+
+export interface FinalizeTargetReconciliationSuccess {
+    success: true;
+    statusCode: number;
+    record: RestoreDryRunPlanRecord;
+    reused_existing_plan: boolean;
+    requested_record_count: number;
+    finalized_record_count: number;
+}
+
+export interface FinalizeTargetReconciliationFailure {
+    success: false;
+    statusCode: number;
+    error: string;
+    reasonCode?: RestoreReasonCode;
+    message: string;
+    requested_record_count: number;
+}
+
+export type FinalizeTargetReconciliationResult =
+    | FinalizeTargetReconciliationSuccess
+    | FinalizeTargetReconciliationFailure;
 
 export interface RestoreActionCountsRecord {
     update: number;

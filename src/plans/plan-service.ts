@@ -26,12 +26,18 @@ import {
     CreateDryRunPlanFailure,
     CreateDryRunPlanRequest,
     CreateDryRunPlanResult,
+    FinalizeTargetReconciliationRequest,
+    FinalizeTargetReconciliationResult,
     FreshnessUnknownDetail,
     parseCreateDryRunPlanRequest,
     RestoreActionCountsRecord,
+    RestoreDryRunPlanDraftRecord,
     RestoreDryRunGate,
     RestoreDryRunPlanRecord,
     RestorePitResolutionRecord,
+    RestoreTargetReconciliationDraftRowRecord,
+    RestoreTargetReconciliationRequestRecord,
+    TargetReconciliationRecordState,
 } from './models';
 import {
     InMemoryRestorePlanStateStore,
@@ -48,6 +54,7 @@ import {
     RestoreRowMaterializationService,
 } from './materialization-service';
 import type { MaterializationScopeRecord } from './materialization-service';
+import { buildTargetStateLookupKey } from './target-reconciliation';
 
 function buildActionCounts(
     request: Pick<CreateDryRunPlanRequest, 'conflicts' | 'media_candidates'>,
@@ -94,6 +101,12 @@ function buildActionCounts(
     }
 
     return counts;
+}
+
+function cloneUnknown<T>(
+    value: T,
+): T {
+    return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function countUnresolvedDeleteCandidates(
@@ -466,7 +479,33 @@ function buildPitResolutions(
     return out;
 }
 
+function buildTargetReconciliationRequestRecords(
+    draftRows: RestoreTargetReconciliationDraftRowRecord[],
+): RestoreTargetReconciliationRequestRecord[] {
+    return [...draftRows]
+        .sort((left, right) => {
+            return left.row.row_id.localeCompare(right.row.row_id);
+        })
+        .map((draftRow) => {
+            if (draftRow.row.action === 'skip') {
+                throw new Error(
+                    'scope-driven draft rows cannot contain skip actions',
+                );
+            }
+
+            return {
+                row_id: draftRow.row.row_id,
+                table: draftRow.row.table,
+                record_sys_id: draftRow.row.record_sys_id,
+                source_operation: draftRow.source_operation,
+                source_action: draftRow.row.action,
+            };
+        });
+}
+
 type ResolvePlanRowsResult = {
+    draftRows?: RestoreTargetReconciliationDraftRowRecord[];
+    reconciliationState: 'draft' | 'finalized';
     pitResolutions: RestorePitResolutionRecord[];
     rows: RestorePlanHashRowInput[];
 } | {
@@ -640,75 +679,321 @@ export class RestorePlanService {
             };
         }
 
-        const actionCounts = buildActionCounts(
-            requestForPlanning,
-            resolvedRows.rows,
-        );
-        const planHashInput = buildPlanHashInput(
-            requestForPlanning,
-            actionCounts,
-        );
-        const planHashData = computeRestorePlanHash(planHashInput);
+        const planRecord = this.buildPlanRecord({
+            authoritativeWatermarks,
+            pitResolutions: resolvedRows.pitResolutions,
+            request: requestForPlanning,
+        });
+
         return this.stateStore.mutate((state) => {
-            const existing = state.plans_by_id[request.plan_id];
+            const existingFinalized = state.plans_by_id[request.plan_id];
 
-            if (existing && existing.plan.plan_hash !== planHashData.plan_hash) {
-                return {
-                    success: false,
-                    statusCode: 409,
-                    error: 'plan_hash_mismatch',
-                    reasonCode: 'blocked_plan_hash_mismatch',
-                    message: 'plan_id already exists with a different plan_hash',
-                };
-            }
+            if (existingFinalized) {
+                if (
+                    resolvedRows.reconciliationState === 'finalized' &&
+                    existingFinalized.plan.plan_hash !== planRecord.plan.plan_hash
+                ) {
+                    return {
+                        success: false,
+                        statusCode: 409,
+                        error: 'plan_hash_mismatch',
+                        reasonCode: 'blocked_plan_hash_mismatch',
+                        message:
+                            'plan_id already exists with a different '
+                            + 'plan_hash',
+                    };
+                }
 
-            if (existing) {
                 return {
                     success: true,
                     statusCode: 200,
-                    record: existing,
+                    record: existingFinalized,
+                    reconciliation_state: 'finalized',
+                    target_reconciliation_records: [],
                 };
             }
 
-            const nowIso = normalizeIsoWithMillis(this.now());
-            const gate = evaluateGate({
-                request: requestForPlanning,
-                watermarks: authoritativeWatermarks,
-            });
-            const plan = RestorePlan.parse({
-                contract_version: RESTORE_CONTRACT_VERSION,
-                plan_id: request.plan_id,
-                plan_hash: planHashData.plan_hash,
-                plan_hash_algorithm: PLAN_HASH_ALGORITHM,
-                plan_hash_input_version: PLAN_HASH_INPUT_VERSION,
-                generated_at: nowIso,
-                pit: request.pit,
-                scope: request.scope,
-                execution_options: request.execution_options,
-                action_counts: actionCounts,
-                conflicts: request.conflicts,
-                approval: buildApprovalPlaceholder(request.approval),
-                metadata_allowlist_version: RESTORE_METADATA_ALLOWLIST_VERSION,
-            });
-            const record: RestoreDryRunPlanRecord = {
-                tenant_id: request.tenant_id,
-                instance_id: request.instance_id,
-                source: request.source,
-                plan,
-                plan_hash_input: planHashInput,
-                gate,
-                delete_candidates: [...request.delete_candidates],
-                media_candidates: [...request.media_candidates],
-                pit_resolutions: resolvedRows.pitResolutions,
-                watermarks: [...authoritativeWatermarks],
-            };
+            if (resolvedRows.reconciliationState === 'draft') {
+                const existingDraft = state.drafts_by_id[request.plan_id];
 
-            state.plans_by_id[request.plan_id] = record;
+                if (existingDraft) {
+                    return this.buildDraftCreateResult(existingDraft, 200);
+                }
+
+                const draftRows = resolvedRows.draftRows || [];
+                const draftRecord: RestoreDryRunPlanDraftRecord = {
+                    tenant_id: request.tenant_id,
+                    instance_id: request.instance_id,
+                    source: request.source,
+                    plan_id: request.plan_id,
+                    requested_by: request.requested_by,
+                    pit: cloneUnknown(request.pit),
+                    scope: cloneUnknown(request.scope),
+                    execution_options: cloneUnknown(request.execution_options),
+                    conflicts: cloneUnknown(request.conflicts),
+                    delete_candidates: cloneUnknown(request.delete_candidates),
+                    media_candidates: cloneUnknown(request.media_candidates),
+                    watermark_hints: cloneUnknown(request.watermarks),
+                    approval: buildApprovalPlaceholder(request.approval),
+                    pit_resolutions: cloneUnknown(resolvedRows.pitResolutions),
+                    draft_rows: cloneUnknown(draftRows),
+                    target_reconciliation_records:
+                        buildTargetReconciliationRequestRecords(
+                            draftRows,
+                        ),
+                    authoritative_watermarks:
+                        cloneUnknown(authoritativeWatermarks),
+                    created_at: normalizeIsoWithMillis(this.now()),
+                };
+
+                state.drafts_by_id[request.plan_id] = draftRecord;
+
+                return this.buildDraftCreateResult(draftRecord, 202);
+            }
+
+            if (state.drafts_by_id[request.plan_id]) {
+                return {
+                    success: false,
+                    statusCode: 409,
+                    error: 'plan_id_conflict',
+                    reasonCode: 'blocked_plan_hash_mismatch',
+                    message:
+                        'plan_id already exists with a pending target '
+                        + 'reconciliation draft',
+                };
+            }
+
+            state.plans_by_id[request.plan_id] = planRecord;
 
             return {
                 success: true,
                 statusCode: 201,
-                record,
+                record: planRecord,
+                reconciliation_state: 'finalized',
+                target_reconciliation_records: [],
+            };
+        });
+    }
+
+    async finalizeTargetReconciliation(
+        planId: string,
+        request: FinalizeTargetReconciliationRequest,
+        claims: AuthTokenClaims,
+    ): Promise<FinalizeTargetReconciliationResult> {
+        const requestedRecordCount = request.reconciled_records.length;
+
+        return this.stateStore.mutate((state) => {
+            const existingFinalized = state.plans_by_id[planId];
+
+            if (existingFinalized) {
+                if (
+                    !this.isScopeMatch({
+                        tenantId: existingFinalized.tenant_id,
+                        instanceId: existingFinalized.instance_id,
+                        source: existingFinalized.source,
+                        claims,
+                    })
+                ) {
+                    return {
+                        success: false,
+                        statusCode: 404,
+                        error: 'not_found',
+                        reasonCode: 'blocked_unknown_source_mapping',
+                        message:
+                            'plan is not visible in the caller token scope',
+                        requested_record_count: requestedRecordCount,
+                    };
+                }
+
+                return {
+                    success: true,
+                    statusCode: 200,
+                    record: existingFinalized,
+                    reused_existing_plan: true,
+                    requested_record_count: requestedRecordCount,
+                    finalized_record_count:
+                        existingFinalized.plan_hash_input.rows.length,
+                };
+            }
+
+            const draft = state.drafts_by_id[planId];
+
+            if (
+                !draft ||
+                !this.isScopeMatch({
+                    tenantId: draft.tenant_id,
+                    instanceId: draft.instance_id,
+                    source: draft.source,
+                    claims,
+                })
+            ) {
+                return {
+                    success: false,
+                    statusCode: 404,
+                    error: 'not_found',
+                    reasonCode: 'blocked_unknown_source_mapping',
+                    message:
+                        'plan is not visible in the caller token scope',
+                    requested_record_count: requestedRecordCount,
+                };
+            }
+
+            const targetStateByKey = new Map<
+                string,
+                TargetReconciliationRecordState
+            >();
+
+            for (const record of request.reconciled_records) {
+                const key = buildTargetStateLookupKey({
+                    record_sys_id: record.record_sys_id,
+                    table: record.table,
+                });
+
+                if (targetStateByKey.has(key)) {
+                    return {
+                        success: false,
+                        statusCode: 400,
+                        error: 'invalid_request',
+                        message:
+                            'duplicate reconciled_records entries are not '
+                            + 'allowed',
+                        requested_record_count: requestedRecordCount,
+                    };
+                }
+
+                targetStateByKey.set(key, record.target_state);
+            }
+
+            const expectedKeySet = new Set<string>();
+
+            for (const record of draft.target_reconciliation_records) {
+                expectedKeySet.add(buildTargetStateLookupKey({
+                    record_sys_id: record.record_sys_id,
+                    table: record.table,
+                }));
+            }
+
+            for (const expectedKey of expectedKeySet) {
+                if (!targetStateByKey.has(expectedKey)) {
+                    return {
+                        success: false,
+                        statusCode: 400,
+                        error: 'invalid_request',
+                        message:
+                            'reconciled_records is missing required target '
+                            + 'reconciliation rows',
+                        requested_record_count: requestedRecordCount,
+                    };
+                }
+            }
+
+            for (const providedKey of targetStateByKey.keys()) {
+                if (!expectedKeySet.has(providedKey)) {
+                    return {
+                        success: false,
+                        statusCode: 400,
+                        error: 'invalid_request',
+                        message:
+                            'reconciled_records contains rows not present in '
+                            + 'the target reconciliation request set',
+                        requested_record_count: requestedRecordCount,
+                    };
+                }
+            }
+
+            let finalizedRows: RestorePlanHashRowInput[];
+
+            try {
+                finalizedRows = this.rowMaterializationService
+                    .finalizeDraftRows({
+                        draftRows: draft.draft_rows,
+                        targetStateByKey,
+                        requireTargetStates: true,
+                    });
+            } catch (error: unknown) {
+                if (error instanceof RestoreRowMaterializationError) {
+                    if (error.code === 'target_reconciliation_blocked') {
+                        return {
+                            success: false,
+                            statusCode: 409,
+                            error: 'restore_plan_materialization_failed',
+                            reasonCode: 'blocked_reference_conflict',
+                            message:
+                                'target reconciliation blocked finalization: '
+                                + error.message,
+                            requested_record_count: requestedRecordCount,
+                        };
+                    }
+
+                    if (error.code === 'target_reconciliation_incomplete') {
+                        return {
+                            success: false,
+                            statusCode: 400,
+                            error: 'invalid_request',
+                            message:
+                                'target reconciliation results are incomplete',
+                            requested_record_count: requestedRecordCount,
+                        };
+                    }
+
+                    return {
+                        success: false,
+                        statusCode: 409,
+                        error: 'restore_plan_materialization_failed',
+                        reasonCode: 'failed_internal_error',
+                        message:
+                            'target reconciliation finalization failed '
+                            + `(${error.code}): ${error.message}`,
+                        requested_record_count: requestedRecordCount,
+                    };
+                }
+
+                return {
+                    success: false,
+                    statusCode: 503,
+                    error: 'restore_index_unavailable',
+                    reasonCode: 'blocked_freshness_unknown',
+                    message:
+                        'target reconciliation finalization failed: '
+                        + String((error as Error)?.message || error),
+                    requested_record_count: requestedRecordCount,
+                };
+            }
+
+            const requestForPlanning: CreateDryRunPlanRequest = {
+                input_mode: 'scope_driven',
+                tenant_id: draft.tenant_id,
+                instance_id: draft.instance_id,
+                source: draft.source,
+                plan_id: draft.plan_id,
+                requested_by: draft.requested_by,
+                pit: cloneUnknown(draft.pit),
+                scope: cloneUnknown(draft.scope),
+                execution_options: cloneUnknown(draft.execution_options),
+                rows: finalizedRows,
+                conflicts: cloneUnknown(draft.conflicts),
+                delete_candidates: cloneUnknown(draft.delete_candidates),
+                media_candidates: cloneUnknown(draft.media_candidates),
+                watermarks: cloneUnknown(draft.watermark_hints),
+                pit_candidates: [],
+                approval: cloneUnknown(draft.approval),
+            };
+            const finalizedPlanRecord = this.buildPlanRecord({
+                authoritativeWatermarks: draft.authoritative_watermarks,
+                pitResolutions: draft.pit_resolutions,
+                request: requestForPlanning,
+            });
+
+            state.plans_by_id[planId] = finalizedPlanRecord;
+            delete state.drafts_by_id[planId];
+
+            return {
+                success: true,
+                statusCode: 201,
+                record: finalizedPlanRecord,
+                reused_existing_plan: false,
+                requested_record_count: requestedRecordCount,
+                finalized_record_count: finalizedRows.length,
             };
         });
     }
@@ -738,11 +1023,114 @@ export class RestorePlanService {
             });
     }
 
+    private buildDraftCreateResult(
+        draft: RestoreDryRunPlanDraftRecord,
+        statusCode: number,
+    ): CreateDryRunPlanResult {
+        const requestForPlanning: CreateDryRunPlanRequest = {
+            input_mode: 'scope_driven',
+            tenant_id: draft.tenant_id,
+            instance_id: draft.instance_id,
+            source: draft.source,
+            plan_id: draft.plan_id,
+            requested_by: draft.requested_by,
+            pit: cloneUnknown(draft.pit),
+            scope: cloneUnknown(draft.scope),
+            execution_options: cloneUnknown(draft.execution_options),
+            rows: draft.draft_rows.map((draftRow) => {
+                return cloneUnknown(draftRow.row);
+            }),
+            conflicts: cloneUnknown(draft.conflicts),
+            delete_candidates: cloneUnknown(draft.delete_candidates),
+            media_candidates: cloneUnknown(draft.media_candidates),
+            watermarks: cloneUnknown(draft.watermark_hints),
+            pit_candidates: [],
+            approval: cloneUnknown(draft.approval),
+        };
+        const previewRecord = this.buildPlanRecord({
+            authoritativeWatermarks: draft.authoritative_watermarks,
+            pitResolutions: draft.pit_resolutions,
+            request: requestForPlanning,
+        });
+
+        return {
+            success: true,
+            statusCode,
+            record: previewRecord,
+            reconciliation_state: 'draft',
+            target_reconciliation_records:
+                cloneUnknown(draft.target_reconciliation_records),
+        };
+    }
+
+    private buildPlanRecord(input: {
+        authoritativeWatermarks: RestoreWatermark[];
+        pitResolutions: RestorePitResolutionRecord[];
+        request: CreateDryRunPlanRequest;
+    }): RestoreDryRunPlanRecord {
+        const actionCounts = buildActionCounts(
+            input.request,
+            input.request.rows,
+        );
+        const planHashInput = buildPlanHashInput(
+            input.request,
+            actionCounts,
+        );
+        const planHashData = computeRestorePlanHash(planHashInput);
+        const nowIso = normalizeIsoWithMillis(this.now());
+        const gate = evaluateGate({
+            request: input.request,
+            watermarks: input.authoritativeWatermarks,
+        });
+        const plan = RestorePlan.parse({
+            contract_version: RESTORE_CONTRACT_VERSION,
+            plan_id: input.request.plan_id,
+            plan_hash: planHashData.plan_hash,
+            plan_hash_algorithm: PLAN_HASH_ALGORITHM,
+            plan_hash_input_version: PLAN_HASH_INPUT_VERSION,
+            generated_at: nowIso,
+            pit: input.request.pit,
+            scope: input.request.scope,
+            execution_options: input.request.execution_options,
+            action_counts: actionCounts,
+            conflicts: input.request.conflicts,
+            approval: buildApprovalPlaceholder(input.request.approval),
+            metadata_allowlist_version: RESTORE_METADATA_ALLOWLIST_VERSION,
+        });
+
+        return {
+            tenant_id: input.request.tenant_id,
+            instance_id: input.request.instance_id,
+            source: input.request.source,
+            plan,
+            plan_hash_input: planHashInput,
+            gate,
+            delete_candidates: cloneUnknown(input.request.delete_candidates),
+            media_candidates: cloneUnknown(input.request.media_candidates),
+            pit_resolutions: cloneUnknown(input.pitResolutions),
+            watermarks: cloneUnknown(input.authoritativeWatermarks),
+        };
+    }
+
+    private isScopeMatch(input: {
+        tenantId: string;
+        instanceId: string;
+        source: string;
+        claims: AuthTokenClaims;
+    }): boolean {
+        return (
+            input.claims.tenant_id === input.tenantId &&
+            input.claims.instance_id === input.instanceId &&
+            input.claims.source === input.source
+        );
+    }
+
     private async resolvePlanRows(
         request: CreateDryRunPlanRequest,
     ): Promise<ResolvePlanRowsResult> {
         if (request.input_mode === 'legacy_rows') {
             return {
+                reconciliationState: 'finalized',
                 pitResolutions: buildPitResolutions(request),
                 rows: [...request.rows],
             };
@@ -814,7 +1202,7 @@ export class RestorePlanService {
 
         try {
             const materialized = await this.rowMaterializationService
-                .materializeRows({
+                .materializeRowsForTargetReconciliationDraft({
                     candidates: lookupResult.candidates,
                     instanceId: request.instance_id,
                     scopeRecords,
@@ -837,6 +1225,8 @@ export class RestorePlanService {
             }
 
             return {
+                draftRows: materialized.draftRows,
+                reconciliationState: 'draft',
                 pitResolutions: materialized.pitResolutions,
                 rows: materialized.rows,
             };
@@ -853,20 +1243,6 @@ export class RestorePlanService {
                             message:
                                 'scope/PIT row materialization failed '
                             + `(missing PIT candidates): ${error.message}`,
-                        },
-                    };
-                }
-
-                if (error.code === 'target_reconciliation_blocked') {
-                    return {
-                        failure: {
-                            success: false,
-                            statusCode: 409,
-                            error: 'restore_plan_materialization_failed',
-                            reasonCode: 'blocked_reference_conflict',
-                            message:
-                                'scope/PIT row materialization blocked by '
-                                + `target reconciliation: ${error.message}`,
                         },
                     };
                 }
