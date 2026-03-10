@@ -1347,9 +1347,31 @@ export function createRestoreServiceServer(
                         return;
                     }
 
-                    sendJson(response, result.statusCode, {
+                    const responsePayload: Record<string, unknown> = {
                         ...result.response,
-                    });
+                    };
+
+                    if (
+                        result.response.execution_status === 'completed' ||
+                        result.response.execution_status === 'failed'
+                    ) {
+                        const evidenceResult = await deps.evidence.ensureEvidence(
+                            result.response.job_id,
+                        );
+
+                        if (evidenceResult.success) {
+                            responsePayload.evidence = {
+                                evidence_id:
+                                    evidenceResult.record.evidence.evidence_id,
+                                signature_verification:
+                                    evidenceResult.record.verification
+                                        .signature_verification,
+                                reused: evidenceResult.reused,
+                            };
+                        }
+                    }
+
+                    sendJson(response, result.statusCode, responsePayload);
 
                     return;
                 }

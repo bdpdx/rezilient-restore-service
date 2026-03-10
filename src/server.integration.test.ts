@@ -1674,6 +1674,17 @@ test(
             assert.equal(secondCommit.body.accepted, true);
             assert.equal(secondCommit.body.execution_status, 'failed');
             assert.equal(secondCommit.body.reason_code, 'failed_internal_error');
+            const commitEvidence = secondCommit.body.evidence as Record<
+                string,
+                unknown
+            >;
+
+            assert.equal(typeof commitEvidence.evidence_id, 'string');
+            assert.equal(
+                commitEvidence.signature_verification,
+                'verified',
+            );
+            assert.equal(commitEvidence.reused, false);
             const secondCommitSummary = secondCommit.body.summary as Record<
                 string,
                 unknown
@@ -1681,6 +1692,34 @@ test(
 
             assert.equal(secondCommitSummary.applied_rows, 1);
             assert.equal(secondCommitSummary.failed_rows, 1);
+
+            const committedEvidence = await getJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}/evidence`,
+                token,
+            );
+
+            assert.equal(committedEvidence.status, 200);
+            const committedEvidenceBody = committedEvidence.body as Record<
+                string,
+                unknown
+            >;
+            const committedEvidenceRecord = committedEvidenceBody.evidence as Record<
+                string,
+                unknown
+            >;
+            const committedVerification = committedEvidenceBody.verification as Record<
+                string,
+                unknown
+            >;
+            assert.equal(
+                committedEvidenceRecord.evidence_id,
+                commitEvidence.evidence_id,
+            );
+            assert.equal(
+                committedVerification.signature_verification,
+                'verified',
+            );
         } finally {
             await closeServer(server);
         }
