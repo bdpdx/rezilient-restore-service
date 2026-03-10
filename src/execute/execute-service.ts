@@ -31,8 +31,10 @@ import {
     RestoreJournalMirrorRecord,
     RestoreRollbackJournalBundle,
     RestoreReasonCode,
+    RestoreTargetWriter,
     ResumeRestoreJobRequest,
     ResumeRestoreJobRequestSchema,
+    NoopRestoreTargetWriter,
     normalizeCapabilities,
 } from './models';
 
@@ -98,9 +100,13 @@ function buildCheckpointId(
     jobId: string,
     planHash: string,
     nextChunkIndex: number,
+    nextRowIndex: number,
 ): string {
     const checksum = createHash('sha256')
-        .update(`${jobId}:${planHash}:${nextChunkIndex}`, 'utf8')
+        .update(
+            `${jobId}:${planHash}:${nextChunkIndex}:${nextRowIndex}`,
+            'utf8',
+        )
         .digest('hex');
 
     return `chk_${checksum.slice(0, 24)}`;
@@ -334,12 +340,92 @@ function buildInitialCheckpoint(
     nowIso: string,
 ): ExecutionResumeCheckpoint {
     return {
-        checkpoint_id: buildCheckpointId(jobId, planHash, 0),
+        checkpoint_id: buildCheckpointId(jobId, planHash, 0, 0),
         next_chunk_index: 0,
+        next_row_index: 0,
         total_chunks: totalChunks,
         last_chunk_id: null,
         row_attempt_by_row: {},
         updated_at: nowIso,
+    };
+}
+
+function latestRowOutcomesByRowId(
+    rowOutcomes: ExecuteRowOutcome[],
+): Map<string, ExecuteRowOutcome> {
+    const latest = new Map<string, ExecuteRowOutcome>();
+
+    for (const row of rowOutcomes) {
+        latest.set(row.row_id, row);
+    }
+
+    return latest;
+}
+
+function latestMediaOutcomesByCandidateId(
+    mediaOutcomes: ExecuteMediaOutcome[],
+): Map<string, ExecuteMediaOutcome> {
+    const latest = new Map<string, ExecuteMediaOutcome>();
+
+    for (const media of mediaOutcomes) {
+        latest.set(media.candidate_id, media);
+    }
+
+    return latest;
+}
+
+function latestChunksByChunkId(
+    chunks: ExecuteChunkOutcome[],
+): Map<string, ExecuteChunkOutcome> {
+    const latest = new Map<string, ExecuteChunkOutcome>();
+
+    for (const chunk of chunks) {
+        latest.set(chunk.chunk_id, chunk);
+    }
+
+    return latest;
+}
+
+function countChunkOutcomesForChunk(
+    rowOutcomes: ExecuteRowOutcome[],
+    chunkId: string,
+): {
+    appliedCount: number;
+    skippedCount: number;
+    failedCount: number;
+} {
+    const effectiveRows = new Map<string, ExecuteRowOutcome>();
+
+    for (const outcome of rowOutcomes) {
+        if (outcome.chunk_id !== chunkId) {
+            continue;
+        }
+
+        effectiveRows.set(outcome.row_id, outcome);
+    }
+
+    let appliedCount = 0;
+    let skippedCount = 0;
+    let failedCount = 0;
+
+    for (const outcome of effectiveRows.values()) {
+        if (outcome.outcome === 'applied') {
+            appliedCount += 1;
+            continue;
+        }
+
+        if (outcome.outcome === 'skipped') {
+            skippedCount += 1;
+            continue;
+        }
+
+        failedCount += 1;
+    }
+
+    return {
+        appliedCount,
+        skippedCount,
+        failedCount,
     };
 }
 
@@ -358,7 +444,9 @@ function summarizeExecution(
     let attachmentsFailed = 0;
     const runtimeConflictIds = new Set<string>();
 
-    for (const row of rowOutcomes) {
+    const effectiveRows = latestRowOutcomesByRowId(rowOutcomes);
+
+    for (const row of effectiveRows.values()) {
         if (row.outcome === 'applied') {
             appliedRows += 1;
         } else if (row.outcome === 'skipped') {
@@ -373,14 +461,17 @@ function summarizeExecution(
     }
 
     let fallbackChunkCount = 0;
+    const effectiveChunks = latestChunksByChunkId(chunks);
 
-    for (const chunk of chunks) {
+    for (const chunk of effectiveChunks.values()) {
         if (chunk.status === 'row_fallback') {
             fallbackChunkCount += 1;
         }
     }
 
-    for (const media of mediaOutcomes) {
+    const effectiveMedia = latestMediaOutcomesByCandidateId(mediaOutcomes);
+
+    for (const media of effectiveMedia.values()) {
         if (media.outcome === 'applied') {
             attachmentsApplied += 1;
             continue;
@@ -403,7 +494,7 @@ function summarizeExecution(
         attachments_applied: attachmentsApplied,
         attachments_skipped: attachmentsSkipped,
         attachments_failed: attachmentsFailed,
-        chunk_count: chunks.length,
+        chunk_count: effectiveChunks.size,
         fallback_chunk_count: fallbackChunkCount,
         runtime_conflict_count: runtimeConflictIds.size,
     };
@@ -443,6 +534,8 @@ export class RestoreExecutionService {
         private readonly now: () => Date = () => new Date(),
         private readonly stateStore: RestoreExecutionStateStore =
             new InMemoryRestoreExecutionStateStore(),
+        private readonly targetWriter: RestoreTargetWriter =
+            new NoopRestoreTargetWriter(),
     ) {
         this.config = {
             ...DEFAULT_EXECUTE_CONFIG,
@@ -927,6 +1020,43 @@ export class RestoreExecutionService {
             );
         }
 
+        const checkpointNextChunkIndex = record.checkpoint.next_chunk_index;
+        const checkpointNextRowIndex = record.checkpoint.next_row_index ?? 0;
+        record.checkpoint.next_row_index = checkpointNextRowIndex;
+
+        if (checkpointNextChunkIndex > chunks.length) {
+            return buildFailure(
+                409,
+                'resume_checkpoint_mismatch',
+                'checkpoint chunk index exceeds current plan chunk bounds',
+                'blocked_resume_precondition_mismatch',
+            );
+        }
+
+        if (
+            checkpointNextChunkIndex === chunks.length &&
+            checkpointNextRowIndex !== 0
+        ) {
+            return buildFailure(
+                409,
+                'resume_checkpoint_mismatch',
+                'checkpoint row cursor must reset at terminal chunk index',
+                'blocked_resume_precondition_mismatch',
+            );
+        }
+
+        if (
+            checkpointNextChunkIndex < chunks.length &&
+            checkpointNextRowIndex > chunks[checkpointNextChunkIndex].length
+        ) {
+            return buildFailure(
+                409,
+                'resume_checkpoint_mismatch',
+                'checkpoint row cursor exceeds chunk row bounds',
+                'blocked_resume_precondition_mismatch',
+            );
+        }
+
         if (record.checkpoint.next_chunk_index >= chunks.length) {
             const completion = await this.jobs.completeJob(job.job_id, {
                 status: 'completed',
@@ -972,16 +1102,13 @@ export class RestoreExecutionService {
         const maxChunksPerAttempt = this.config.maxChunksPerAttempt > 0
             ? this.config.maxChunksPerAttempt
             : chunks.length;
-        const startChunkIndex = record.checkpoint.next_chunk_index;
-        const stopExclusive = Math.min(
-            chunks.length,
-            startChunkIndex + maxChunksPerAttempt,
-        );
+        let chunkIndex = checkpointNextChunkIndex;
+        let rowIndex = checkpointNextRowIndex;
+        let completedChunkCount = 0;
 
-        for (
-            let chunkIndex = startChunkIndex;
-            chunkIndex < stopExclusive;
-            chunkIndex += 1
+        while (
+            chunkIndex < chunks.length &&
+            completedChunkCount < maxChunksPerAttempt
         ) {
             const rows = chunks[chunkIndex];
             const chunkId = asChunkId(chunkIndex);
@@ -997,11 +1124,29 @@ export class RestoreExecutionService {
             }
 
             const useFallback = triggerConflictIds.length > 0;
-            let appliedCount = 0;
-            let skippedCount = 0;
-            let failedCount = 0;
+            const existingChunkCounts = countChunkOutcomesForChunk(
+                record.row_outcomes,
+                chunkId,
+            );
+            let appliedCount = existingChunkCounts.appliedCount;
+            let skippedCount = existingChunkCounts.skippedCount;
+            let failedCount = existingChunkCounts.failedCount;
 
-            for (const row of rows) {
+            if (rowIndex < 0 || rowIndex > rows.length) {
+                return buildFailure(
+                    409,
+                    'resume_checkpoint_mismatch',
+                    'checkpoint row cursor exceeds chunk row bounds',
+                    'blocked_resume_precondition_mismatch',
+                );
+            }
+
+            for (
+                let currentRowIndex = rowIndex;
+                currentRowIndex < rows.length;
+                currentRowIndex += 1
+            ) {
+                const row = rows[currentRowIndex];
                 const attempt =
                     (record.checkpoint.row_attempt_by_row[row.row_id] || 0) + 1;
                 record.checkpoint.row_attempt_by_row[row.row_id] = attempt;
@@ -1024,10 +1169,7 @@ export class RestoreExecutionService {
                         message: conflict.reason,
                     });
                     skippedCount += 1;
-                    continue;
-                }
-
-                if (row.action === 'skip') {
+                } else if (row.action === 'skip') {
                     record.row_outcomes.push({
                         row_id: row.row_id,
                         table: row.table,
@@ -1039,50 +1181,125 @@ export class RestoreExecutionService {
                         used_row_fallback: useFallback,
                     });
                     skippedCount += 1;
-                    continue;
+                } else {
+                    let writeResult;
+
+                    try {
+                        writeResult = await this.targetWriter.applyRow({
+                            chunk_id: chunkId,
+                            executed_by: record.executed_by,
+                            job_id: record.job_id,
+                            plan_hash: record.plan_hash,
+                            row,
+                            row_attempt: attempt,
+                        });
+                    } catch (error) {
+                        const message = error instanceof Error
+                            ? error.message
+                            : 'target writer apply threw non-error value';
+
+                        record.row_outcomes.push({
+                            row_id: row.row_id,
+                            table: row.table,
+                            record_sys_id: row.record_sys_id,
+                            action: row.action,
+                            outcome: 'failed',
+                            reason_code: 'failed_internal_error',
+                            chunk_id: chunkId,
+                            used_row_fallback: useFallback,
+                            message,
+                        });
+                        failedCount += 1;
+                        writeResult = null;
+                    }
+
+                    if (writeResult) {
+                        record.row_outcomes.push({
+                            row_id: row.row_id,
+                            table: row.table,
+                            record_sys_id: row.record_sys_id,
+                            action: row.action,
+                            outcome: writeResult.outcome,
+                            reason_code: writeResult.reason_code,
+                            chunk_id: chunkId,
+                            used_row_fallback: useFallback,
+                            message: writeResult.message,
+                        });
+
+                        if (writeResult.outcome === 'applied') {
+                            this.appendRollbackJournal(
+                                record,
+                                row,
+                                chunkId,
+                                attempt,
+                                journalEntries,
+                                mirrorEntries,
+                            );
+                            appliedCount += 1;
+                        } else if (writeResult.outcome === 'skipped') {
+                            skippedCount += 1;
+                        } else {
+                            failedCount += 1;
+                        }
+                    }
                 }
 
-                record.row_outcomes.push({
-                    row_id: row.row_id,
-                    table: row.table,
-                    record_sys_id: row.record_sys_id,
-                    action: row.action,
-                    outcome: 'applied',
-                    reason_code: 'none',
-                    chunk_id: chunkId,
-                    used_row_fallback: useFallback,
-                });
-                this.appendRollbackJournal(
+                const rowCompletedAt = normalizeIsoWithMillis(this.now());
+                record.checkpoint.next_chunk_index = chunkIndex;
+                record.checkpoint.next_row_index = currentRowIndex + 1;
+                record.checkpoint.last_chunk_id = chunkId;
+                record.checkpoint.updated_at = rowCompletedAt;
+                record.checkpoint.checkpoint_id = buildCheckpointId(
+                    record.job_id,
+                    record.plan_hash,
+                    chunkIndex,
+                    record.checkpoint.next_row_index,
+                );
+
+                await this.persistExecutionDelta(
+                    job.job_id,
                     record,
-                    row,
-                    chunkId,
-                    attempt,
                     journalEntries,
                     mirrorEntries,
                 );
-                appliedCount += 1;
             }
 
             const chunkCompletedAt = normalizeIsoWithMillis(this.now());
-            record.chunks.push({
+            const chunkStatus = failedCount > 0
+                ? 'failed'
+                : useFallback
+                ? 'row_fallback'
+                : 'applied';
+            const chunkOutcome: ExecuteChunkOutcome = {
                 chunk_id: chunkId,
                 row_count: rows.length,
-                status: useFallback ? 'row_fallback' : 'applied',
+                status: chunkStatus,
                 started_at: chunkStartedAt,
                 completed_at: chunkCompletedAt,
                 applied_count: appliedCount,
                 skipped_count: skippedCount,
                 failed_count: failedCount,
                 fallback_trigger_conflict_ids: triggerConflictIds,
+            };
+            const existingChunkIndex = record.chunks.findIndex((chunk) => {
+                return chunk.chunk_id === chunkId;
             });
 
+            if (existingChunkIndex >= 0) {
+                record.chunks[existingChunkIndex] = chunkOutcome;
+            } else {
+                record.chunks.push(chunkOutcome);
+            }
+
             record.checkpoint.next_chunk_index = chunkIndex + 1;
+            record.checkpoint.next_row_index = 0;
             record.checkpoint.last_chunk_id = chunkId;
             record.checkpoint.updated_at = chunkCompletedAt;
             record.checkpoint.checkpoint_id = buildCheckpointId(
                 record.job_id,
                 record.plan_hash,
                 record.checkpoint.next_chunk_index,
+                0,
             );
 
             await this.persistExecutionDelta(
@@ -1091,6 +1308,10 @@ export class RestoreExecutionService {
                 journalEntries,
                 mirrorEntries,
             );
+
+            chunkIndex += 1;
+            rowIndex = 0;
+            completedChunkCount += 1;
         }
 
         record.summary = summarizeExecution(

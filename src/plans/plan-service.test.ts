@@ -21,6 +21,7 @@ import {
 } from './materialization-service';
 import { InMemoryRestorePlanStateStore } from './plan-state-store';
 import { RestorePlanService } from './plan-service';
+import { InMemoryRestoreTargetStateLookup } from './target-reconciliation';
 
 const PIT_ALGORITHM_VERSION =
     'pit.v1.sys_updated_on-sys_mod_count-__time-event_id';
@@ -208,6 +209,7 @@ function seedScopeMaterializationRecord(input: {
     sysModCount: number;
     sysUpdatedOn: string;
     table: string;
+    sourceOperation?: 'I' | 'U' | 'D';
 }): void {
     const artifactKey = `rez/restore/event=${input.eventId}.artifact.json`;
     const manifestKey = `rez/restore/event=${input.eventId}.manifest.json`;
@@ -231,6 +233,7 @@ function seedScopeMaterializationRecord(input: {
     input.artifactReader.setArtifactBody({
         artifactKey,
         body: buildArtifactBody({
+            __op: input.sourceOperation || 'U',
             row_enc: {
                 alg: 'AES-256-GCM',
                 ciphertext: `cipher-${input.recordSysId}`,
@@ -325,6 +328,7 @@ function createScopeDrivenFixture(options?: {
     resolveHandler?: (
         input: ResolveSourceMappingInput,
     ) => Promise<AcpResolveSourceMappingResult>;
+    targetStateLookup?: InMemoryRestoreTargetStateLookup;
 }): ScopeDrivenFixture {
     const registry = new SourceRegistry([
         {
@@ -346,7 +350,10 @@ function createScopeDrivenFixture(options?: {
         new InMemoryRestorePlanStateStore(),
         indexReader,
         createResolver(options?.resolveHandler),
-        new RestoreRowMaterializationService(artifactReader),
+        new RestoreRowMaterializationService(
+            artifactReader,
+            options?.targetStateLookup,
+        ),
     );
 
     return {
@@ -420,6 +427,240 @@ describe('RestorePlanService', () => {
             'evt-scope-01',
         );
     });
+
+    test(
+        'createDryRunPlan reconciles source insert into update when target '
+        + 'record exists',
+        async () => {
+            const targetStateLookup = new InMemoryRestoreTargetStateLookup();
+            targetStateLookup.setTargetRecordState({
+                record_sys_id: 'rec-01',
+                state: 'exists',
+                table: 'x_app.ticket',
+            });
+            const fixture = createScopeDrivenFixture({
+                targetStateLookup,
+            });
+
+            seedScopeMaterializationRecord({
+                artifactReader: fixture.artifactReader,
+                eventId: 'evt-scope-insert',
+                eventTime: '2026-02-18T15:22:00.000Z',
+                indexReader: fixture.indexReader,
+                offset: '111',
+                partition: 0,
+                recordSysId: 'rec-01',
+                sourceOperation: 'I',
+                sysModCount: 3,
+                sysUpdatedOn: '2026-02-18 15:22:00',
+                table: 'x_app.ticket',
+            });
+
+            const result = await fixture.service.createDryRunPlan(
+                buildScopeDrivenDryRunRequest('plan-scope-insert-reconciled', {
+                    scope: {
+                        mode: 'record',
+                        tables: ['x_app.ticket'],
+                        record_sys_ids: ['rec-01'],
+                    },
+                }),
+                claims(),
+            );
+
+            assert.equal(result.success, true);
+            if (!result.success) {
+                return;
+            }
+
+            assert.equal(result.record.plan_hash_input.rows.length, 1);
+            assert.equal(result.record.plan_hash_input.rows[0].action, 'update');
+            assert.equal(result.record.plan.action_counts.update, 1);
+            assert.equal(result.record.plan.action_counts.insert, 0);
+            assert.equal(
+                result.record.plan_hash_input.rows[0].metadata.metadata.operation,
+                'I',
+            );
+        },
+    );
+
+    test(
+        'createDryRunPlan blocks when source update points to missing target '
+        + 'record',
+        async () => {
+            const targetStateLookup = new InMemoryRestoreTargetStateLookup();
+            targetStateLookup.setTargetRecordState({
+                record_sys_id: 'rec-01',
+                state: 'missing',
+                table: 'x_app.ticket',
+            });
+            const fixture = createScopeDrivenFixture({
+                targetStateLookup,
+            });
+
+            seedScopeMaterializationRecord({
+                artifactReader: fixture.artifactReader,
+                eventId: 'evt-scope-update',
+                eventTime: '2026-02-18T15:23:00.000Z',
+                indexReader: fixture.indexReader,
+                offset: '112',
+                partition: 0,
+                recordSysId: 'rec-01',
+                sourceOperation: 'U',
+                sysModCount: 4,
+                sysUpdatedOn: '2026-02-18 15:23:00',
+                table: 'x_app.ticket',
+            });
+
+            const result = await fixture.service.createDryRunPlan(
+                buildScopeDrivenDryRunRequest('plan-scope-update-missing', {
+                    scope: {
+                        mode: 'record',
+                        tables: ['x_app.ticket'],
+                        record_sys_ids: ['rec-01'],
+                    },
+                }),
+                claims(),
+            );
+
+            assert.equal(result.success, false);
+            if (result.success) {
+                return;
+            }
+
+            assert.equal(result.statusCode, 409);
+            assert.equal(result.error, 'restore_plan_materialization_failed');
+            assert.equal(result.reasonCode, 'blocked_reference_conflict');
+        },
+    );
+
+    test(
+        'createDryRunPlan keeps deterministic plan_hash with '
+        + 'target-aware reconciliation',
+        async () => {
+            const targetLookupA = new InMemoryRestoreTargetStateLookup();
+            targetLookupA.setTargetRecordState({
+                record_sys_id: 'rec-alpha',
+                state: 'exists',
+                table: 'x_app.ticket',
+            });
+            targetLookupA.setTargetRecordState({
+                record_sys_id: 'rec-bravo',
+                state: 'missing',
+                table: 'x_app.ticket',
+            });
+            const targetLookupB = new InMemoryRestoreTargetStateLookup();
+            targetLookupB.setTargetRecordState({
+                record_sys_id: 'rec-alpha',
+                state: 'exists',
+                table: 'x_app.ticket',
+            });
+            targetLookupB.setTargetRecordState({
+                record_sys_id: 'rec-bravo',
+                state: 'missing',
+                table: 'x_app.ticket',
+            });
+            const fixtureA = createScopeDrivenFixture({
+                targetStateLookup: targetLookupA,
+            });
+            const fixtureB = createScopeDrivenFixture({
+                targetStateLookup: targetLookupB,
+            });
+
+            seedScopeMaterializationRecord({
+                artifactReader: fixtureA.artifactReader,
+                eventId: 'evt-alpha',
+                eventTime: '2026-02-18T15:24:00.000Z',
+                indexReader: fixtureA.indexReader,
+                offset: '121',
+                partition: 0,
+                recordSysId: 'rec-alpha',
+                sourceOperation: 'I',
+                sysModCount: 4,
+                sysUpdatedOn: '2026-02-18 15:24:00',
+                table: 'x_app.ticket',
+            });
+            seedScopeMaterializationRecord({
+                artifactReader: fixtureA.artifactReader,
+                eventId: 'evt-bravo',
+                eventTime: '2026-02-18T15:25:00.000Z',
+                indexReader: fixtureA.indexReader,
+                offset: '122',
+                partition: 0,
+                recordSysId: 'rec-bravo',
+                sourceOperation: 'I',
+                sysModCount: 1,
+                sysUpdatedOn: '2026-02-18 15:25:00',
+                table: 'x_app.ticket',
+            });
+            seedScopeMaterializationRecord({
+                artifactReader: fixtureB.artifactReader,
+                eventId: 'evt-bravo',
+                eventTime: '2026-02-18T15:25:00.000Z',
+                indexReader: fixtureB.indexReader,
+                offset: '122',
+                partition: 0,
+                recordSysId: 'rec-bravo',
+                sourceOperation: 'I',
+                sysModCount: 1,
+                sysUpdatedOn: '2026-02-18 15:25:00',
+                table: 'x_app.ticket',
+            });
+            seedScopeMaterializationRecord({
+                artifactReader: fixtureB.artifactReader,
+                eventId: 'evt-alpha',
+                eventTime: '2026-02-18T15:24:00.000Z',
+                indexReader: fixtureB.indexReader,
+                offset: '121',
+                partition: 0,
+                recordSysId: 'rec-alpha',
+                sourceOperation: 'I',
+                sysModCount: 4,
+                sysUpdatedOn: '2026-02-18 15:24:00',
+                table: 'x_app.ticket',
+            });
+
+            const request = buildScopeDrivenDryRunRequest(
+                'plan-scope-target-det',
+                {
+                    scope: {
+                        mode: 'record',
+                        tables: ['x_app.ticket'],
+                        record_sys_ids: ['rec-alpha', 'rec-bravo'],
+                    },
+                },
+            );
+            const resultA = await fixtureA.service.createDryRunPlan(
+                request,
+                claims(),
+            );
+            const resultB = await fixtureB.service.createDryRunPlan(
+                request,
+                claims(),
+            );
+
+            assert.equal(resultA.success, true);
+            assert.equal(resultB.success, true);
+            if (!resultA.success || !resultB.success) {
+                return;
+            }
+
+            assert.equal(
+                resultA.record.plan.plan_hash,
+                resultB.record.plan.plan_hash,
+            );
+            assert.deepEqual(
+                resultA.record.plan_hash_input.rows,
+                resultB.record.plan_hash_input.rows,
+            );
+            const actionByRecord = new Map(
+                resultA.record.plan_hash_input.rows.map((row) => {
+                    return [row.record_sys_id, row.action];
+                }),
+            );
+            assert.equal(actionByRecord.get('rec-alpha'), 'update');
+            assert.equal(actionByRecord.get('rec-bravo'), 'insert');
+        },
+    );
 
     test(
         'createDryRunPlan keeps deterministic plan_hash for '

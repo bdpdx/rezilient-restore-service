@@ -8,6 +8,13 @@ import {
     RestoreRowMaterializationError,
     RestoreRowMaterializationService,
 } from './materialization-service';
+import {
+    buildTargetStateLookupKey,
+    InMemoryRestoreTargetStateLookup,
+    reconcileSourceOperationWithTargetState,
+    RESTORE_TARGET_EXISTENCE_CHECK_POLICY,
+    type RestoreTargetStateLookup,
+} from './target-reconciliation';
 
 function encryptedPayload(
     ciphertext: string,
@@ -49,18 +56,243 @@ function buildArtifact(
     };
 }
 
-function buildServiceFixture(): {
+function buildServiceFixture(options?: {
+    targetStateLookup?: RestoreTargetStateLookup;
+}): {
     reader: InMemoryRestoreArtifactBodyReader;
     service: RestoreRowMaterializationService;
 } {
     const reader = new InMemoryRestoreArtifactBodyReader();
-    const service = new RestoreRowMaterializationService(reader);
+    const service = new RestoreRowMaterializationService(
+        reader,
+        options?.targetStateLookup,
+    );
 
     return {
         reader,
         service,
     };
 }
+
+test(
+    'target existence checks are enabled for dry-run visibility and execute',
+    () => {
+        assert.equal(
+            RESTORE_TARGET_EXISTENCE_CHECK_POLICY.dry_run_plan_visibility,
+            true,
+        );
+        assert.equal(
+            RESTORE_TARGET_EXISTENCE_CHECK_POLICY.execute_time_revalidation,
+            true,
+        );
+    },
+);
+
+test('target state lookup key is table + record_sys_id', () => {
+    const key = buildTargetStateLookupKey({
+        record_sys_id: ' rec-01 ',
+        table: ' x_app.ticket ',
+    });
+
+    assert.equal(key, 'x_app.ticket|rec-01');
+});
+
+test('in-memory target lookup resolves state and defaults to missing', async () => {
+    const lookup = new InMemoryRestoreTargetStateLookup();
+    lookup.setTargetRecordState({
+        record_sys_id: 'rec-01',
+        state: 'exists',
+        table: 'x_app.ticket',
+    });
+
+    const result = await lookup.lookupTargetState({
+        instance_id: 'sn-dev-01',
+        records: [
+            {
+                record_sys_id: 'rec-01',
+                table: 'x_app.ticket',
+            },
+            {
+                record_sys_id: 'rec-02',
+                table: 'x_app.ticket',
+            },
+        ],
+        source: 'sn://acme-dev.service-now.com',
+        tenant_id: 'tenant-acme',
+    });
+
+    assert.equal(result.get('x_app.ticket|rec-01'), 'exists');
+    assert.equal(result.get('x_app.ticket|rec-02'), 'missing');
+});
+
+test('reconciliation policy covers required source/target combinations', () => {
+    const sourceInsertTargetExists = reconcileSourceOperationWithTargetState({
+        source_operation: 'I',
+        target_state: 'exists',
+    });
+    const sourceInsertTargetMissing = reconcileSourceOperationWithTargetState({
+        source_operation: 'I',
+        target_state: 'missing',
+    });
+    const sourceUpdateTargetMissing = reconcileSourceOperationWithTargetState({
+        source_operation: 'U',
+        target_state: 'missing',
+    });
+    const sourceDelete = reconcileSourceOperationWithTargetState({
+        source_operation: 'D',
+        target_state: 'missing',
+    });
+
+    assert.deepEqual(sourceInsertTargetExists, {
+        decision: 'apply',
+        plan_action: 'update',
+        policy_case: 'source_insert_target_exists',
+    });
+    assert.deepEqual(sourceInsertTargetMissing, {
+        decision: 'apply',
+        plan_action: 'insert',
+        policy_case: 'source_insert_target_missing',
+    });
+    assert.deepEqual(sourceUpdateTargetMissing, {
+        blocking_reason: 'target_missing_for_source_update',
+        conflict_class: 'missing_row_conflict',
+        decision: 'block',
+        policy_case: 'source_update_target_missing',
+    });
+    assert.deepEqual(sourceDelete, {
+        decision: 'apply',
+        plan_action: 'delete',
+        policy_case: 'source_delete',
+    });
+});
+
+test(
+    'materializeRows reconciles source insert to update when target exists',
+    async () => {
+        const targetLookup = new InMemoryRestoreTargetStateLookup();
+        targetLookup.setTargetRecordState({
+            record_sys_id: 'rec-01',
+            state: 'exists',
+            table: 'x_app.ticket',
+        });
+        const { reader, service } = buildServiceFixture({
+            targetStateLookup: targetLookup,
+        });
+        const candidate = buildCandidate({
+            artifactKey: 'rez/restore/event=evt-insert.artifact.json',
+            eventId: 'evt-insert',
+            manifestKey: 'rez/restore/event=evt-insert.manifest.json',
+        });
+
+        reader.setArtifactBody({
+            artifactKey: candidate.artifactKey,
+            body: buildArtifact({
+                __op: 'I',
+                row_enc: encryptedPayload('insert-ciphertext'),
+            }),
+            manifestKey: candidate.manifestKey,
+        });
+
+        const result = await service.materializeRows({
+            candidates: [candidate],
+            instanceId: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+            tenantId: 'tenant-acme',
+        });
+
+        assert.equal(result.rows.length, 1);
+        assert.equal(result.rows[0].action, 'update');
+        assert.equal(result.rows[0].metadata.metadata.operation, 'I');
+    },
+);
+
+test(
+    'materializeRows keeps source insert as insert when target is missing',
+    async () => {
+        const targetLookup = new InMemoryRestoreTargetStateLookup();
+        targetLookup.setTargetRecordState({
+            record_sys_id: 'rec-01',
+            state: 'missing',
+            table: 'x_app.ticket',
+        });
+        const { reader, service } = buildServiceFixture({
+            targetStateLookup: targetLookup,
+        });
+        const candidate = buildCandidate({
+            artifactKey: 'rez/restore/event=evt-missing.artifact.json',
+            eventId: 'evt-missing',
+            manifestKey: 'rez/restore/event=evt-missing.manifest.json',
+        });
+
+        reader.setArtifactBody({
+            artifactKey: candidate.artifactKey,
+            body: buildArtifact({
+                __op: 'I',
+                row_enc: encryptedPayload('missing-ciphertext'),
+            }),
+            manifestKey: candidate.manifestKey,
+        });
+
+        const result = await service.materializeRows({
+            candidates: [candidate],
+            instanceId: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+            tenantId: 'tenant-acme',
+        });
+
+        assert.equal(result.rows.length, 1);
+        assert.equal(result.rows[0].action, 'insert');
+        assert.equal(result.rows[0].metadata.metadata.operation, 'I');
+    },
+);
+
+test(
+    'materializeRows fails closed when source update targets missing row',
+    async () => {
+        const targetLookup = new InMemoryRestoreTargetStateLookup();
+        targetLookup.setTargetRecordState({
+            record_sys_id: 'rec-01',
+            state: 'missing',
+            table: 'x_app.ticket',
+        });
+        const { reader, service } = buildServiceFixture({
+            targetStateLookup: targetLookup,
+        });
+        const candidate = buildCandidate({
+            artifactKey: 'rez/restore/event=evt-update.artifact.json',
+            eventId: 'evt-update',
+            manifestKey: 'rez/restore/event=evt-update.manifest.json',
+        });
+
+        reader.setArtifactBody({
+            artifactKey: candidate.artifactKey,
+            body: buildArtifact({
+                __op: 'U',
+                row_enc: encryptedPayload('update-ciphertext'),
+            }),
+            manifestKey: candidate.manifestKey,
+        });
+
+        await assert.rejects(
+            async () => service.materializeRows({
+                candidates: [candidate],
+                instanceId: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+                tenantId: 'tenant-acme',
+            }),
+            (error: unknown) => {
+                assert.ok(error instanceof RestoreRowMaterializationError);
+                assert.equal(error.code, 'target_reconciliation_blocked');
+                assert.equal(
+                    error.details.blocking_reason,
+                    'target_missing_for_source_update',
+                );
+
+                return true;
+            },
+        );
+    },
+);
 
 test('materializeRows selects PIT winner with tie-break tuple ordering',
 async () => {

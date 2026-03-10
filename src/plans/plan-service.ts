@@ -852,7 +852,21 @@ export class RestorePlanService {
                             freshnessUnknownDetail: 'no_indexed_coverage',
                             message:
                                 'scope/PIT row materialization failed '
-                                + `(missing PIT candidates): ${error.message}`,
+                            + `(missing PIT candidates): ${error.message}`,
+                        },
+                    };
+                }
+
+                if (error.code === 'target_reconciliation_blocked') {
+                    return {
+                        failure: {
+                            success: false,
+                            statusCode: 409,
+                            error: 'restore_plan_materialization_failed',
+                            reasonCode: 'blocked_reference_conflict',
+                            message:
+                                'scope/PIT row materialization blocked by '
+                                + `target reconciliation: ${error.message}`,
                         },
                     };
                 }

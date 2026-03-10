@@ -4,6 +4,7 @@ import {
     ExecuteRestoreJobRequestSchema,
     ExecuteRuntimeConflictInputSchema,
     ExecuteWorkflowInputSchema,
+    NoopRestoreTargetWriter,
     ResumeRestoreJobRequestSchema,
     ExecutionChunkStatusSchema,
     ExecutionOutcomeSchema,
@@ -25,6 +26,45 @@ function buildValidConflict() {
         reason_code: 'blocked_reference_conflict' as const,
         reason: 'value mismatch',
         resolution: 'abort_and_replan' as const,
+    };
+}
+
+function buildPlanRow() {
+    return {
+        row_id: 'row-01',
+        table: 'incident',
+        record_sys_id: 'rec-01',
+        action: 'update' as const,
+        precondition_hash: 'a'.repeat(64),
+        metadata: {
+            allowlist_version: 'rrs.metadata.allowlist.v1' as const,
+            metadata: {
+                tenant_id: 'tenant-acme',
+                instance_id: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+                table: 'incident',
+                record_sys_id: 'rec-01',
+                event_id: 'evt-01',
+                event_type: 'cdc.write',
+                operation: 'U' as const,
+                schema_version: 3,
+                sys_updated_on: '2026-02-16 11:59:59',
+                sys_mod_count: 1,
+                __time: '2026-02-16T11:59:59.000Z',
+                topic: 'rez.cdc',
+                partition: 0,
+                offset: '100',
+            },
+        },
+        values: {
+            diff_enc: {
+                alg: 'AES-256-CBC' as const,
+                module: 'x_rezrp_rezilient.encrypter' as const,
+                format: 'kmf' as const,
+                compression: 'none' as const,
+                ciphertext: 'cipher-row-01',
+            },
+        },
     };
 }
 
@@ -234,5 +274,25 @@ describe('media outcome schema', () => {
             mediaOutcome.observed_sha256_plain.length,
             64,
         );
+    });
+});
+
+describe('target writer contract', () => {
+    test('noop target writer returns deterministic placeholder result', async () => {
+        const writer = new NoopRestoreTargetWriter();
+        const result = await writer.applyRow({
+            chunk_id: 'chunk_0001',
+            executed_by: 'op-1',
+            job_id: 'job-1',
+            plan_hash: 'b'.repeat(64),
+            row: buildPlanRow(),
+            row_attempt: 1,
+        });
+
+        assert.deepEqual(result, {
+            outcome: 'applied',
+            reason_code: 'none',
+            message: 'noop target writer placeholder',
+        });
     });
 });

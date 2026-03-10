@@ -1,6 +1,9 @@
 import { z } from 'zod';
 import { RESTORE_CONTRACT_VERSION } from '@rezilient/types';
-import type { RestoreJournalEntry } from '@rezilient/types';
+import type {
+    RestoreJournalEntry,
+    RestorePlanHashRowInput,
+} from '@rezilient/types';
 
 const RESTORE_CAPABILITIES = [
     'restore_execute',
@@ -257,6 +260,7 @@ export type ResumeRestoreJobRequest = z.infer<
 export interface ExecutionResumeCheckpoint {
     checkpoint_id: string;
     next_chunk_index: number;
+    next_row_index: number;
     total_chunks: number;
     last_chunk_id: string | null;
     row_attempt_by_row: Record<string, number>;
@@ -395,6 +399,40 @@ export interface ExecuteServiceConfig {
     mediaMaxItems: number;
     mediaMaxBytes: number;
     mediaMaxRetryAttempts: number;
+}
+
+export interface RestoreTargetWriteRequest {
+    chunk_id: string;
+    executed_by: string;
+    job_id: string;
+    plan_hash: string;
+    row: RestorePlanHashRowInput;
+    row_attempt: number;
+}
+
+export interface RestoreTargetWriteResult {
+    outcome: ExecutionOutcome;
+    reason_code: RestoreReasonCode;
+    message?: string;
+}
+
+export interface RestoreTargetWriter {
+    applyRow(
+        input: RestoreTargetWriteRequest,
+    ): Promise<RestoreTargetWriteResult>;
+}
+
+export class NoopRestoreTargetWriter
+implements RestoreTargetWriter {
+    async applyRow(
+        _input: RestoreTargetWriteRequest,
+    ): Promise<RestoreTargetWriteResult> {
+        return {
+            outcome: 'applied',
+            reason_code: 'none',
+            message: 'noop target writer placeholder',
+        };
+    }
 }
 
 export function normalizeCapabilities(

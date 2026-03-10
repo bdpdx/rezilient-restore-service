@@ -11,6 +11,17 @@ import {
 import { SourceRegistry } from '../registry/source-registry';
 import { InMemoryRestoreIndexStateReader } from '../restore-index/state-reader';
 import { RestoreExecutionService } from './execute-service';
+import {
+    InMemoryRestoreExecutionStateStore,
+    RestoreExecutionState,
+    RestoreExecutionStateStore,
+} from './execute-state-store';
+import type {
+    RestoreReasonCode,
+    RestoreTargetWriteRequest,
+    RestoreTargetWriteResult,
+    RestoreTargetWriter,
+} from './models';
 
 const FIXED_NOW = new Date('2026-02-16T12:00:00.000Z');
 const LEGACY_ROWS_COMPAT_OPTIONS = {
@@ -34,6 +45,93 @@ function claims() {
         instance_id: 'sn-dev-01',
         source: 'sn://acme-dev.service-now.com',
     };
+}
+
+class RecordingTargetWriter implements RestoreTargetWriter {
+    readonly applyCalls: RestoreTargetWriteRequest[] = [];
+
+    readonly appliedActionsByRecord = new Map<
+        string,
+        'delete' | 'insert' | 'skip' | 'update'
+    >();
+
+    private readonly failedRecords = new Map<
+        string,
+        {
+            reason_code: RestoreReasonCode;
+            message: string;
+        }
+    >();
+
+    failRecord(
+        recordSysId: string,
+        reasonCode: RestoreReasonCode,
+        message: string,
+    ): void {
+        this.failedRecords.set(recordSysId, {
+            reason_code: reasonCode,
+            message,
+        });
+    }
+
+    async applyRow(
+        input: RestoreTargetWriteRequest,
+    ): Promise<RestoreTargetWriteResult> {
+        this.applyCalls.push(input);
+
+        const failure = this.failedRecords.get(input.row.record_sys_id);
+
+        if (failure) {
+            return {
+                outcome: 'failed',
+                reason_code: failure.reason_code,
+                message: failure.message,
+            };
+        }
+
+        this.appliedActionsByRecord.set(
+            input.row.record_sys_id,
+            input.row.action,
+        );
+
+        return {
+            outcome: 'applied',
+            reason_code: 'none',
+        };
+    }
+}
+
+class FailOnMutateExecutionStateStore implements RestoreExecutionStateStore {
+    private readonly delegate = new InMemoryRestoreExecutionStateStore();
+
+    private mutationCount = 0;
+
+    private failed = false;
+
+    constructor(private readonly failOnMutation: number) {
+    }
+
+    async read() {
+        return this.delegate.read();
+    }
+
+    async mutate<T>(
+        mutator: (
+            state: RestoreExecutionState,
+        ) => T | Promise<T>,
+    ): Promise<T> {
+        this.mutationCount += 1;
+
+        if (
+            !this.failed &&
+            this.mutationCount === this.failOnMutation
+        ) {
+            this.failed = true;
+            throw new Error('simulated execution state persist failure');
+        }
+
+        return this.delegate.mutate(mutator);
+    }
 }
 
 function createRow(
@@ -309,6 +407,8 @@ async function buildFixture(options?: {
     rows?: ReturnType<typeof createRow>[];
     mediaCandidates?: Record<string, unknown>[];
     requiredCapabilities?: string[];
+    targetWriter?: RestoreTargetWriter;
+    stateStore?: RestoreExecutionStateStore;
 }) {
     const registry = new SourceRegistry([
         {
@@ -342,6 +442,8 @@ async function buildFixture(options?: {
         plans,
         options?.executeConfig,
         now,
+        options?.stateStore,
+        options?.targetWriter,
     );
     const planRows = options?.rows || [
         createRow('row-01'),
@@ -845,6 +947,123 @@ test('override capability and elevated confirmation are enforced', async () => {
     assert.equal(withOverride.success, true);
 });
 
+test('execute routes update/insert/delete rows through target writer apply path', async () => {
+    const targetWriter = new RecordingTargetWriter();
+    const fixture = await buildFixture({
+        rows: [
+            createRow('row-update', 'update'),
+            createRow('row-insert', 'insert'),
+            createRow('row-delete', 'delete'),
+            createRow('row-skip', 'skip'),
+        ],
+        executeConfig: {
+            elevatedSkipRatioPercent: 100,
+        },
+        targetWriter,
+    });
+    const result = await fixture.execute.executeJob(
+        fixture.jobId,
+        {
+            operator_id: 'operator@example.com',
+            operator_capabilities: [
+                'restore_delete',
+                'restore_execute',
+            ],
+            chunk_size: 4,
+        },
+        claims(),
+    );
+
+    assert.equal(result.success, true);
+
+    if (!result.success) {
+        return;
+    }
+
+    const applyActions = targetWriter.applyCalls
+        .map((call) => call.row.action)
+        .sort((left, right) => left.localeCompare(right));
+
+    assert.deepEqual(applyActions, [
+        'delete',
+        'insert',
+        'update',
+    ]);
+    assert.equal(targetWriter.applyCalls.length, 3);
+    assert.equal(targetWriter.appliedActionsByRecord.size, 3);
+    assert.equal(result.record.summary.applied_rows, 3);
+    assert.equal(result.record.summary.skipped_rows, 1);
+    assert.equal(result.record.summary.failed_rows, 0);
+
+    const skippedOutcome = result.record.row_outcomes.find((outcome) =>
+        outcome.row_id === 'row-skip'
+    );
+
+    assert.equal(skippedOutcome?.outcome, 'skipped');
+    const journal = await fixture.execute.getRollbackJournal(fixture.jobId);
+
+    assert.notEqual(journal, null);
+    assert.equal(journal?.journal_entries.length, 3);
+    assert.equal(journal?.sn_mirror_entries.length, 3);
+});
+
+test('target writer failed apply yields failed row outcome and truthful summary', async () => {
+    const targetWriter = new RecordingTargetWriter();
+
+    targetWriter.failRecord(
+        'rec-row-02',
+        'failed_permission_conflict',
+        'target rejected write',
+    );
+
+    const fixture = await buildFixture({
+        rows: [
+            createRow('row-01'),
+            createRow('row-02'),
+        ],
+        targetWriter,
+    });
+    const result = await fixture.execute.executeJob(
+        fixture.jobId,
+        {
+            operator_id: 'operator@example.com',
+            operator_capabilities: ['restore_execute'],
+            chunk_size: 2,
+        },
+        claims(),
+    );
+
+    assert.equal(result.success, true);
+
+    if (!result.success) {
+        return;
+    }
+
+    assert.equal(result.record.status, 'failed');
+    assert.equal(result.record.summary.applied_rows, 1);
+    assert.equal(result.record.summary.failed_rows, 1);
+    assert.equal(result.record.summary.skipped_rows, 0);
+    assert.equal(result.record.chunks[0].status, 'failed');
+    assert.equal(result.record.chunks[0].applied_count, 1);
+    assert.equal(result.record.chunks[0].failed_count, 1);
+
+    const failedOutcome = result.record.row_outcomes.find((outcome) =>
+        outcome.row_id === 'row-02'
+    );
+
+    assert.equal(failedOutcome?.outcome, 'failed');
+    assert.equal(
+        failedOutcome?.reason_code,
+        'failed_permission_conflict',
+    );
+    assert.equal(failedOutcome?.message, 'target rejected write');
+    const journal = await fixture.execute.getRollbackJournal(fixture.jobId);
+
+    assert.notEqual(journal, null);
+    assert.equal(journal?.journal_entries.length, 1);
+    assert.equal(journal?.sn_mirror_entries.length, 1);
+});
+
 test('chunk failure falls back to row isolation and records outcomes', async () => {
     const fixture = await buildFixture({
         rows: [
@@ -890,6 +1109,44 @@ test('chunk failure falls back to row isolation and records outcomes', async () 
     assert.equal(result.record.summary.fallback_chunk_count, 1);
 });
 
+test('checkpoint does not advance to next chunk until chunk progress is durably persisted', async () => {
+    const targetWriter = new RecordingTargetWriter();
+    const fixture = await buildFixture({
+        rows: [
+            createRow('row-01'),
+            createRow('row-02'),
+        ],
+        targetWriter,
+        stateStore: new FailOnMutateExecutionStateStore(2),
+    });
+
+    await assert.rejects(
+        async () => fixture.execute.executeJob(
+            fixture.jobId,
+            {
+                operator_id: 'operator@example.com',
+                operator_capabilities: ['restore_execute'],
+                chunk_size: 2,
+            },
+            claims(),
+        ),
+        /simulated execution state persist failure/,
+    );
+
+    const checkpoint = await fixture.execute.getCheckpoint(fixture.jobId);
+
+    assert.notEqual(checkpoint, null);
+    assert.equal(checkpoint?.next_chunk_index, 0);
+    assert.equal(checkpoint?.next_row_index, 1);
+
+    const journal = await fixture.execute.getRollbackJournal(fixture.jobId);
+
+    assert.notEqual(journal, null);
+    assert.equal(journal?.journal_entries.length, 1);
+    assert.equal(journal?.sn_mirror_entries.length, 1);
+    assert.equal(targetWriter.applyCalls.length, 2);
+});
+
 test('resume continues from checkpoint when execution pauses by chunk budget', async () => {
     const fixture = await buildFixture({
         rows: [
@@ -921,6 +1178,7 @@ test('resume continues from checkpoint when execution pauses by chunk budget', a
     assert.equal(first.statusCode, 202);
     assert.equal(first.record.status, 'paused');
     assert.equal(first.record.checkpoint.next_chunk_index, 1);
+    assert.equal(first.record.checkpoint.next_row_index, 0);
     assert.equal(first.record.summary.applied_rows, 1);
 
     const resumed = await fixture.execute.resumeJob(
@@ -943,6 +1201,7 @@ test('resume continues from checkpoint when execution pauses by chunk budget', a
     assert.equal(resumed.statusCode, 202);
     assert.equal(resumed.record.status, 'paused');
     assert.equal(resumed.record.checkpoint.next_chunk_index, 2);
+    assert.equal(resumed.record.checkpoint.next_row_index, 0);
 
     const resumedAgain = await fixture.execute.resumeJob(
         fixture.jobId,
@@ -965,6 +1224,98 @@ test('resume continues from checkpoint when execution pauses by chunk budget', a
     assert.equal(resumedAgain.record.status, 'completed');
     assert.equal(resumedAgain.record.summary.applied_rows, 3);
     assert.equal(resumedAgain.record.checkpoint.next_chunk_index, 3);
+    assert.equal(resumedAgain.record.checkpoint.next_row_index, 0);
+});
+
+test('partial-failure chunk pause/resume remains truthful and avoids double-apply of successful rows', async () => {
+    const targetWriter = new RecordingTargetWriter();
+
+    targetWriter.failRecord(
+        'rec-row-02',
+        'failed_permission_conflict',
+        'target rejected write',
+    );
+
+    const fixture = await buildFixture({
+        rows: [
+            createRow('row-01'),
+            createRow('row-02'),
+            createRow('row-03'),
+        ],
+        executeConfig: {
+            maxChunksPerAttempt: 1,
+            elevatedSkipRatioPercent: 100,
+        },
+        targetWriter,
+    });
+
+    const first = await fixture.execute.executeJob(
+        fixture.jobId,
+        {
+            operator_id: 'operator@example.com',
+            operator_capabilities: ['restore_execute'],
+            chunk_size: 2,
+        },
+        claims(),
+    );
+
+    assert.equal(first.success, true);
+
+    if (!first.success) {
+        return;
+    }
+
+    assert.equal(first.statusCode, 202);
+    assert.equal(first.record.status, 'paused');
+    assert.equal(first.record.summary.applied_rows, 1);
+    assert.equal(first.record.summary.failed_rows, 1);
+    assert.equal(first.record.summary.skipped_rows, 0);
+    assert.equal(first.record.checkpoint.next_chunk_index, 1);
+    assert.equal(first.record.checkpoint.next_row_index, 0);
+
+    const resumed = await fixture.execute.resumeJob(
+        fixture.jobId,
+        {
+            operator_id: 'operator@example.com',
+            operator_capabilities: ['restore_execute'],
+            expected_plan_checksum: first.record.plan_checksum,
+            expected_precondition_checksum: first.record.precondition_checksum,
+        },
+        claims(),
+    );
+
+    assert.equal(resumed.success, true);
+
+    if (!resumed.success) {
+        return;
+    }
+
+    assert.equal(resumed.statusCode, 200);
+    assert.equal(resumed.record.status, 'failed');
+    assert.equal(resumed.record.summary.applied_rows, 2);
+    assert.equal(resumed.record.summary.failed_rows, 1);
+    assert.equal(resumed.record.summary.skipped_rows, 0);
+
+    const callCountByRow = new Map<string, number>();
+
+    for (const call of targetWriter.applyCalls) {
+        const rowId = call.row.row_id;
+        callCountByRow.set(rowId, (callCountByRow.get(rowId) || 0) + 1);
+    }
+
+    assert.equal(callCountByRow.get('row-01'), 1);
+    assert.equal(callCountByRow.get('row-02'), 1);
+    assert.equal(callCountByRow.get('row-03'), 1);
+
+    const journal = await fixture.execute.getRollbackJournal(fixture.jobId);
+
+    assert.notEqual(journal, null);
+    assert.equal(journal?.journal_entries.length, 2);
+    assert.equal(journal?.sn_mirror_entries.length, 2);
+
+    for (const entry of journal?.journal_entries || []) {
+        assert.notEqual(entry.plan_row_id, 'row-02');
+    }
 });
 
 test('duplicate resume attempts are idempotent after completion', async () => {

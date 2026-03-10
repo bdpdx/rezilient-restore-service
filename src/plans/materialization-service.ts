@@ -15,6 +15,13 @@ import type {
     RestoreIndexIndexedEventLookupCandidate,
 } from '../restore-index/state-reader';
 import type { RestorePitResolutionRecord } from './models';
+import {
+    buildTargetStateLookupKey,
+    NoopRestoreTargetStateLookup,
+    reconcileSourceOperationWithTargetState,
+    type RestoreTargetRecordState,
+    type RestoreTargetStateLookup,
+} from './target-reconciliation';
 
 export type RestoreArtifactBodyReference = {
     artifactKey: string;
@@ -50,7 +57,8 @@ export type RestoreRowMaterializationErrorCode =
     | 'invalid_artifact_body'
     | 'missing_artifact_body'
     | 'missing_encrypted_row_material'
-    | 'missing_pit_candidates';
+    | 'missing_pit_candidates'
+    | 'target_reconciliation_blocked';
 
 export class RestoreRowMaterializationError extends Error {
     constructor(
@@ -494,6 +502,11 @@ function groupByRecord(
     return grouped;
 }
 
+type MaterializationWinner = {
+    winnerCandidate: RestoreIndexIndexedEventLookupCandidate;
+    winnerTuple: RestorePitRowTuple;
+};
+
 export class InMemoryRestoreArtifactBodyReader
 implements RestoreArtifactBodyReader {
     private readonly bodiesByReference = new Map<string, unknown>();
@@ -530,11 +543,16 @@ implements RestoreArtifactBodyReader {
 export class RestoreRowMaterializationService {
     constructor(
         private readonly artifactBodyReader: RestoreArtifactBodyReader,
+        private readonly targetStateLookup: RestoreTargetStateLookup =
+            new NoopRestoreTargetStateLookup(),
     ) {}
 
     async materializeRows(
         input: MaterializeRestoreRowsInput,
     ): Promise<MaterializeRestoreRowsResult> {
+        const instanceId = readRequiredText(input.instanceId, 'instanceId');
+        const source = readRequiredText(input.source, 'source');
+        const tenantId = readRequiredText(input.tenantId, 'tenantId');
         const groupedCandidates = groupByRecord(input.candidates);
         const normalizedScopeRecords = input.scopeRecords
             ? normalizeScopeRecords(input.scopeRecords)
@@ -569,6 +587,7 @@ export class RestoreRowMaterializationService {
 
         const materializedRows: RestorePlanHashRowInput[] = [];
         const pitResolutions: RestorePitResolutionRecord[] = [];
+        const winners: MaterializationWinner[] = [];
         const targetRecordKeys = normalizedScopeRecords.length > 0
             ? normalizedScopeRecords.map((record) => {
                 return buildReferenceKey(record.table, record.recordSysId);
@@ -583,6 +602,27 @@ export class RestoreRowMaterializationService {
                 winnerCandidate,
                 winnerTuple,
             } = resolvePitWinner(recordCandidates);
+            winners.push({
+                winnerCandidate,
+                winnerTuple,
+            });
+        }
+
+        const targetStateByKey = await this.targetStateLookup.lookupTargetState({
+            instance_id: instanceId,
+            records: winners.map((winner) => {
+                return {
+                    record_sys_id: winner.winnerCandidate.recordSysId,
+                    table: winner.winnerCandidate.table,
+                };
+            }),
+            source,
+            tenant_id: tenantId,
+        });
+
+        for (const winner of winners) {
+            const winnerCandidate = winner.winnerCandidate;
+            const winnerTuple = winner.winnerTuple;
             const artifactReference = {
                 artifactKey: winnerCandidate.artifactKey,
                 manifestKey: winnerCandidate.manifestKey,
@@ -615,7 +655,15 @@ export class RestoreRowMaterializationService {
 
             const row = this.buildMaterializedRow({
                 artifactBody: parsedArtifactBody,
-                input,
+                instanceId,
+                source,
+                targetState: targetStateByKey.get(
+                    buildTargetStateLookupKey({
+                        record_sys_id: winnerCandidate.recordSysId,
+                        table: winnerCandidate.table,
+                    }),
+                ),
+                tenantId,
                 winnerCandidate,
                 winnerTuple,
             });
@@ -645,13 +693,21 @@ export class RestoreRowMaterializationService {
 
     private buildMaterializedRow(input: {
         artifactBody: Record<string, unknown>;
-        input: MaterializeRestoreRowsInput;
+        instanceId: string;
+        source: string;
+        targetState?: RestoreTargetRecordState;
+        tenantId: string;
         winnerCandidate: RestoreIndexIndexedEventLookupCandidate;
         winnerTuple: RestorePitRowTuple;
     }): RestorePlanHashRowInput {
         const winnerCandidate = input.winnerCandidate;
         const operation = deriveOperationFromArtifact(input.artifactBody);
-        const action = toAction(operation);
+        const action = this.resolveRowAction({
+            operation,
+            recordSysId: winnerCandidate.recordSysId,
+            table: winnerCandidate.table,
+            targetState: input.targetState,
+        });
         const eventType = deriveEventTypeFromArtifact(
             input.artifactBody,
             operation,
@@ -681,20 +737,17 @@ export class RestoreRowMaterializationService {
                 __time: winnerCandidate.eventTime,
                 event_id: winnerCandidate.eventId,
                 event_type: eventType,
-                instance_id: readRequiredText(
-                    input.input.instanceId,
-                    'instanceId',
-                ),
+                instance_id: input.instanceId,
                 offset: winnerCandidate.offset,
                 operation,
                 partition: winnerCandidate.partition,
                 record_sys_id: winnerCandidate.recordSysId,
                 schema_version: schemaVersion,
-                source: readRequiredText(input.input.source, 'source'),
+                source: input.source,
                 sys_mod_count: winnerCandidate.sysModCount ?? undefined,
                 sys_updated_on: input.winnerTuple.sys_updated_on,
                 table: winnerCandidate.table,
-                tenant_id: readRequiredText(input.input.tenantId, 'tenantId'),
+                tenant_id: input.tenantId,
                 topic: winnerCandidate.topic,
             },
         };
@@ -708,5 +761,39 @@ export class RestoreRowMaterializationService {
             table: winnerCandidate.table,
             values,
         });
+    }
+
+    private resolveRowAction(input: {
+        operation: 'D' | 'I' | 'U';
+        recordSysId: string;
+        table: string;
+        targetState?: RestoreTargetRecordState;
+    }): 'delete' | 'insert' | 'update' {
+        if (!input.targetState) {
+            return toAction(input.operation);
+        }
+
+        const reconciliation = reconcileSourceOperationWithTargetState({
+            source_operation: input.operation,
+            target_state: input.targetState,
+        });
+
+        if (reconciliation.decision === 'apply') {
+            return reconciliation.plan_action;
+        }
+
+        throw new RestoreRowMaterializationError(
+            'target_reconciliation_blocked',
+            'target reconciliation blocked scope/PIT row materialization',
+            {
+                blocking_reason: reconciliation.blocking_reason,
+                conflict_class: reconciliation.conflict_class,
+                policy_case: reconciliation.policy_case,
+                record_sys_id: input.recordSysId,
+                source_operation: input.operation,
+                table: input.table,
+                target_state: input.targetState,
+            },
+        );
     }
 }

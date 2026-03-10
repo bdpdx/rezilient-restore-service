@@ -16,6 +16,12 @@ import {
     RestoreEvidenceStateStore,
 } from './evidence/evidence-state-store';
 import { RestoreExecutionService } from './execute/execute-service';
+import type {
+    RestoreReasonCode,
+    RestoreTargetWriteRequest,
+    RestoreTargetWriteResult,
+    RestoreTargetWriter,
+} from './execute/models';
 import {
     PostgresRestoreExecutionStateStore,
     RestoreExecutionStateStore,
@@ -35,6 +41,7 @@ import {
     PostgresRestorePlanStateStore,
     RestorePlanStateStore,
 } from './plans/plan-state-store';
+import { InMemoryRestoreTargetStateLookup } from './plans/target-reconciliation';
 import {
     AcpListSourceMappingsResult,
     AcpResolveSourceMappingResult,
@@ -92,6 +99,50 @@ const FIXED_NOW = new Date('2026-02-16T12:00:00.000Z');
 
 function now(): Date {
     return new Date(FIXED_NOW.getTime());
+}
+
+class RecordingTargetWriter implements RestoreTargetWriter {
+    readonly applyCalls: RestoreTargetWriteRequest[] = [];
+
+    private readonly failedRecords = new Map<
+        string,
+        {
+            reason_code: RestoreReasonCode;
+            message: string;
+        }
+    >();
+
+    failRecord(
+        recordSysId: string,
+        reasonCode: RestoreReasonCode,
+        message: string,
+    ): void {
+        this.failedRecords.set(recordSysId, {
+            reason_code: reasonCode,
+            message,
+        });
+    }
+
+    async applyRow(
+        input: RestoreTargetWriteRequest,
+    ): Promise<RestoreTargetWriteResult> {
+        this.applyCalls.push(input);
+
+        const failure = this.failedRecords.get(input.row.record_sys_id);
+
+        if (failure) {
+            return {
+                outcome: 'failed',
+                reason_code: failure.reason_code,
+                message: failure.message,
+            };
+        }
+
+        return {
+            outcome: 'applied',
+            reason_code: 'none',
+        };
+    }
 }
 
 async function listen(server: Server): Promise<string> {
@@ -249,10 +300,16 @@ function createService(
             body: Record<string, unknown>;
             manifestKey: string;
         }>;
+        targetRecordStates?: Array<{
+            recordSysId: string;
+            state: 'exists' | 'missing';
+            table: string;
+        }>;
         restoreIndexReader?: RestoreIndexStateReader;
         sourceMappingResolver?: SourceMappingResolver;
         sourceMappingListProvider?: SourceMappingListProvider;
         stateStores?: ServiceStateStores;
+        targetWriter?: RestoreTargetWriter;
         executePreflightReconcileStaleAfterMs?: number;
     },
 ): Server {
@@ -279,6 +336,9 @@ function createService(
     const restoreIndexReader = options?.restoreIndexReader
         || new InMemoryRestoreIndexStateReader();
     const artifactBodyReader = new InMemoryRestoreArtifactBodyReader();
+    const targetStateLookup = options?.targetRecordStates
+        ? new InMemoryRestoreTargetStateLookup()
+        : undefined;
 
     if (
         typeof (restoreIndexReader as Partial<SeedableRestoreIndexStateReader>)
@@ -337,13 +397,26 @@ function createService(
         }
     }
 
+    if (targetStateLookup && options?.targetRecordStates) {
+        for (const targetRecord of options.targetRecordStates) {
+            targetStateLookup.setTargetRecordState({
+                record_sys_id: targetRecord.recordSysId,
+                state: targetRecord.state,
+                table: targetRecord.table,
+            });
+        }
+    }
+
     const plans = new RestorePlanService(
         sourceRegistry,
         now,
         options?.stateStores?.plans,
         restoreIndexReader,
         options?.sourceMappingResolver,
-        new RestoreRowMaterializationService(artifactBodyReader),
+        new RestoreRowMaterializationService(
+            artifactBodyReader,
+            targetStateLookup,
+        ),
         {
             allowLegacyRowsCompat: true,
         },
@@ -354,6 +427,7 @@ function createService(
         options?.executeConfig,
         now,
         options?.stateStores?.execute,
+        options?.targetWriter,
     );
     const evidence = new RestoreEvidenceService(
         jobs,
@@ -1473,6 +1547,146 @@ test('dry-run materializes scope-driven requests from indexed events', async () 
     }
 });
 
+test(
+    'dry-run reconciles source insert to update and action counts when target '
+    + 'record exists',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const artifactKey =
+            'rez/restore/event=evt-scope-insert.artifact.json';
+        const manifestKey =
+            'rez/restore/event=evt-scope-insert.manifest.json';
+        const server = createService(signingKey, {
+            sourceMappingResolver: createResolver(createResolveResult()),
+            indexedEventCandidates: [{
+                artifactKey,
+                eventId: 'evt-scope-insert',
+                eventTime: '2026-02-16T11:59:00.000Z',
+                manifestKey,
+                offset: '100',
+                partition: 1,
+                recordSysId: 'rec-01',
+                sysModCount: 2,
+                sysUpdatedOn: '2026-02-16 11:59:00',
+                table: 'incident',
+                topic: 'rez.cdc',
+            }],
+            artifactBodies: [{
+                artifactKey,
+                body: {
+                    __op: 'I',
+                    __schema_version: 3,
+                    __type: 'cdc.write',
+                    row_enc: {
+                        alg: 'AES-256-GCM',
+                        ciphertext: 'cipher-scope-insert',
+                    },
+                },
+                manifestKey,
+            }],
+            targetRecordStates: [{
+                recordSysId: 'rec-01',
+                state: 'exists',
+                table: 'incident',
+            }],
+        });
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+
+        try {
+            const response = await postJson(
+                baseUrl,
+                '/v1/plans/dry-run',
+                token,
+                createScopeDrivenDryRunPayload('plan-scope-http-reconciled'),
+            );
+
+            assert.equal(response.status, 201);
+            const planHashInput = response.body.plan_hash_input as Record<
+                string,
+                unknown
+            >;
+            const rows = planHashInput.rows as Array<Record<string, unknown>>;
+            const firstRow = rows[0];
+            const metadata = firstRow.metadata as Record<string, unknown>;
+            const metadataFields = metadata.metadata as Record<string, unknown>;
+            const plan = response.body.plan as Record<string, unknown>;
+            const actionCounts = plan.action_counts as Record<string, unknown>;
+
+            assert.equal(rows.length, 1);
+            assert.equal(firstRow.action, 'update');
+            assert.equal(metadataFields.operation, 'I');
+            assert.equal(actionCounts.update, 1);
+            assert.equal(actionCounts.insert, 0);
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
+
+test(
+    'dry-run blocks scope-driven materialization when source update points to '
+    + 'missing target row',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const artifactKey =
+            'rez/restore/event=evt-scope-update.artifact.json';
+        const manifestKey =
+            'rez/restore/event=evt-scope-update.manifest.json';
+        const server = createService(signingKey, {
+            sourceMappingResolver: createResolver(createResolveResult()),
+            indexedEventCandidates: [{
+                artifactKey,
+                eventId: 'evt-scope-update',
+                eventTime: '2026-02-16T11:59:00.000Z',
+                manifestKey,
+                offset: '100',
+                partition: 1,
+                recordSysId: 'rec-01',
+                sysModCount: 2,
+                sysUpdatedOn: '2026-02-16 11:59:00',
+                table: 'incident',
+                topic: 'rez.cdc',
+            }],
+            artifactBodies: [{
+                artifactKey,
+                body: {
+                    __op: 'U',
+                    __schema_version: 3,
+                    __type: 'cdc.write',
+                    row_enc: {
+                        alg: 'AES-256-GCM',
+                        ciphertext: 'cipher-scope-update',
+                    },
+                },
+                manifestKey,
+            }],
+            targetRecordStates: [{
+                recordSysId: 'rec-01',
+                state: 'missing',
+                table: 'incident',
+            }],
+        });
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+
+        try {
+            const response = await postJson(
+                baseUrl,
+                '/v1/plans/dry-run',
+                token,
+                createScopeDrivenDryRunPayload('plan-scope-http-missing'),
+            );
+
+            assert.equal(response.status, 409);
+            assert.equal(response.body.error, 'restore_plan_materialization_failed');
+            assert.equal(response.body.reason_code, 'blocked_reference_conflict');
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
+
 test('dry-run fails closed when ACP mapping is missing', async () => {
     const signingKey = 'test-signing-key';
     const server = createService(signingKey, {
@@ -2202,6 +2416,104 @@ test('execute endpoint records chunk fallback and row outcomes', async () => {
     }
 });
 
+test('execute endpoint reports failed outcomes when target writer apply fails', async () => {
+    const signingKey = 'test-signing-key';
+    const targetWriter = new RecordingTargetWriter();
+
+    targetWriter.failRecord(
+        'rec-02',
+        'failed_permission_conflict',
+        'target rejected write',
+    );
+
+    const server = createService(signingKey, {
+        targetWriter,
+    });
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+
+    try {
+        const fixture = await createPlanAndJob(
+            baseUrl,
+            token,
+            'plan-execute-target-write-failure',
+            {
+                requiredCapabilities: ['restore_execute'],
+            },
+        );
+        const executeResponse = await postJson(
+            baseUrl,
+            `/v1/jobs/${encodeURIComponent(fixture.jobId)}/execution`,
+            token,
+            createExecutePayload({
+                capabilities: ['restore_execute'],
+                chunkSize: 2,
+            }),
+        );
+
+        assert.equal(executeResponse.status, 200);
+        const execution = executeResponse.body.execution as Record<
+            string,
+            unknown
+        >;
+
+        assert.equal(execution.status, 'failed');
+
+        const summary = execution.summary as Record<string, unknown>;
+
+        assert.equal(summary.applied_rows, 1);
+        assert.equal(summary.failed_rows, 1);
+        assert.equal(summary.skipped_rows, 0);
+
+        const chunks = execution.chunks as Array<Record<string, unknown>>;
+
+        assert.equal(chunks[0]?.status, 'failed');
+        assert.equal(chunks[0]?.applied_count, 1);
+        assert.equal(chunks[0]?.failed_count, 1);
+
+        const rowOutcomes = execution.row_outcomes as Array<
+            Record<string, unknown>
+        >;
+        const byRowId = new Map<string, Record<string, unknown>>();
+
+        for (const outcome of rowOutcomes) {
+            byRowId.set(String(outcome.row_id || ''), outcome);
+        }
+
+        assert.equal(byRowId.get('row-01')?.outcome, 'applied');
+        assert.equal(byRowId.get('row-02')?.outcome, 'failed');
+        assert.equal(
+            byRowId.get('row-02')?.reason_code,
+            'failed_permission_conflict',
+        );
+        assert.equal(
+            byRowId.get('row-02')?.message,
+            'target rejected write',
+        );
+        assert.equal(targetWriter.applyCalls.length, 2);
+
+        const journalResponse = await getJson(
+            baseUrl,
+            `/v1/jobs/${encodeURIComponent(fixture.jobId)}` +
+            '/rollback-journal',
+            token,
+        );
+
+        assert.equal(journalResponse.status, 200);
+        const rollbackJournal = journalResponse.body.rollback_journal as Array<
+            Record<string, unknown>
+        >;
+        const snMirror = journalResponse.body.sn_mirror as Array<
+            Record<string, unknown>
+        >;
+
+        assert.equal(rollbackJournal.length, 1);
+        assert.equal(snMirror.length, 1);
+    } finally {
+        await closeServer(server);
+    }
+});
+
 test('execute endpoint blocks missing capability for delete actions', async () => {
     const signingKey = 'test-signing-key';
     const server = createService(signingKey);
@@ -2512,6 +2824,7 @@ test('resume endpoint continues paused execution from checkpoint', async () => {
         >;
 
         assert.equal(checkpoint.next_chunk_index, 1);
+        assert.equal(checkpoint.next_row_index, 0);
 
         const resumeResponse = await postJson(
             baseUrl,
@@ -2582,6 +2895,146 @@ test('resume endpoint continues paused execution from checkpoint', async () => {
         >;
 
         assert.equal(duplicateSummary.applied_rows, 2);
+    } finally {
+        await closeServer(server);
+    }
+});
+
+test('resume endpoint keeps mixed-success chunks truthful without double-applying successful rows', async () => {
+    const signingKey = 'test-signing-key';
+    const targetWriter = new RecordingTargetWriter();
+
+    targetWriter.failRecord(
+        'rec-02',
+        'failed_permission_conflict',
+        'target rejected write',
+    );
+
+    const server = createService(signingKey, {
+        executeConfig: {
+            maxChunksPerAttempt: 1,
+        },
+        targetWriter,
+    });
+    const baseUrl = await listen(server);
+    const token = createToken(signingKey);
+
+    try {
+        const fixture = await createPlanAndJob(
+            baseUrl,
+            token,
+            'plan-resume-mixed-success',
+            {
+                dryRunOverrides: {
+                    rows: [
+                        createDryRunRow('row-01', 'rec-01'),
+                        createDryRunRow('row-02', 'rec-02'),
+                        createDryRunRow('row-03', 'rec-03'),
+                    ],
+                },
+            },
+        );
+        const executeResponse = await postJson(
+            baseUrl,
+            `/v1/jobs/${encodeURIComponent(fixture.jobId)}/execution`,
+            token,
+            createExecutePayload({
+                capabilities: ['restore_execute'],
+                chunkSize: 2,
+            }),
+        );
+
+        assert.equal(executeResponse.status, 202);
+
+        const firstExecution = executeResponse.body.execution as Record<
+            string,
+            unknown
+        >;
+        const firstSummary = firstExecution.summary as Record<string, unknown>;
+
+        assert.equal(firstExecution.status, 'paused');
+        assert.equal(firstSummary.applied_rows, 1);
+        assert.equal(firstSummary.failed_rows, 1);
+        assert.equal(firstSummary.skipped_rows, 0);
+
+        const checkpointResponse = await getJson(
+            baseUrl,
+            `/v1/jobs/${encodeURIComponent(fixture.jobId)}/checkpoint`,
+            token,
+        );
+
+        assert.equal(checkpointResponse.status, 200);
+
+        const checkpoint = checkpointResponse.body.checkpoint as Record<
+            string,
+            unknown
+        >;
+
+        assert.equal(checkpoint.next_chunk_index, 1);
+        assert.equal(checkpoint.next_row_index, 0);
+
+        const resumeResponse = await postJson(
+            baseUrl,
+            `/v1/jobs/${encodeURIComponent(fixture.jobId)}/resume`,
+            token,
+            {
+                operator_id: 'operator@example.com',
+                operator_capabilities: ['restore_execute'],
+                expected_plan_checksum: firstExecution.plan_checksum,
+                expected_precondition_checksum:
+                    firstExecution.precondition_checksum,
+            },
+        );
+
+        assert.equal(resumeResponse.status, 200);
+
+        const resumedExecution = resumeResponse.body.execution as Record<
+            string,
+            unknown
+        >;
+        const resumedSummary = resumedExecution.summary as Record<
+            string,
+            unknown
+        >;
+
+        assert.equal(resumedExecution.status, 'failed');
+        assert.equal(resumedSummary.applied_rows, 2);
+        assert.equal(resumedSummary.failed_rows, 1);
+        assert.equal(resumedSummary.skipped_rows, 0);
+
+        const callCountByRow = new Map<string, number>();
+
+        for (const call of targetWriter.applyCalls) {
+            const rowId = String(call.row.row_id);
+            callCountByRow.set(rowId, (callCountByRow.get(rowId) || 0) + 1);
+        }
+
+        assert.equal(callCountByRow.get('row-01'), 1);
+        assert.equal(callCountByRow.get('row-02'), 1);
+        assert.equal(callCountByRow.get('row-03'), 1);
+
+        const journalResponse = await getJson(
+            baseUrl,
+            `/v1/jobs/${encodeURIComponent(fixture.jobId)}` +
+            '/rollback-journal',
+            token,
+        );
+
+        assert.equal(journalResponse.status, 200);
+
+        const rollbackJournal = journalResponse.body.rollback_journal as Array<
+            Record<string, unknown>
+        >;
+        const snMirror = journalResponse.body.sn_mirror as Array<
+            Record<string, unknown>
+        >;
+
+        assert.equal(rollbackJournal.length, 2);
+        assert.equal(snMirror.length, 2);
+
+        for (const entry of rollbackJournal) {
+            assert.notEqual(entry.plan_row_id, 'row-02');
+        }
     } finally {
         await closeServer(server);
     }
