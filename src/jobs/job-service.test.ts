@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { RestoreJobService } from './job-service';
+import {
+    RestoreFinalizedPlanReader,
+    RestoreJobService,
+} from './job-service';
 import {
     AcpResolveSourceMappingResult,
     ResolveSourceMappingInput,
@@ -43,6 +46,42 @@ function baseRequest(planId: string, table: string) {
         lock_scope_tables: [table],
         required_capabilities: ['restore_execute'],
         requested_by: 'operator@example.com',
+    };
+}
+
+interface FinalizedPlanReaderOptions {
+    plansById?: Record<string, string>;
+    defaultPlanHash?: string | null;
+}
+
+function createFinalizedPlanReader(
+    options: FinalizedPlanReaderOptions = {},
+): RestoreFinalizedPlanReader {
+    const planHashesById = new Map(Object.entries(options.plansById || {}));
+    const defaultPlanHash = options.defaultPlanHash === undefined
+        ? 'a'.repeat(64)
+        : options.defaultPlanHash;
+
+    return {
+        async getFinalizedPlan(planId: string) {
+            const planHash = planHashesById.get(planId);
+
+            if (planHash) {
+                return {
+                    plan_id: planId,
+                    plan_hash: planHash,
+                };
+            }
+
+            if (defaultPlanHash === null) {
+                return null;
+            }
+
+            return {
+                plan_id: planId,
+                plan_hash: defaultPlanHash,
+            };
+        },
     };
 }
 
@@ -90,36 +129,33 @@ function createResolver(
     };
 }
 
-function createService(
-    resolver?: SourceMappingResolver,
-): RestoreJobService {
+interface CreateServiceOptions {
+    resolver?: SourceMappingResolver;
+    nowFn?: () => Date;
+    stateStore?: InMemoryRestoreJobStateStore;
+    sourceRegistry?: SourceRegistry;
+    finalizedPlanReader?: RestoreFinalizedPlanReader;
+}
+
+function createService(options: CreateServiceOptions = {}): RestoreJobService {
     return new RestoreJobService(
         new RestoreLockManager(),
-        new SourceRegistry([
+        options.sourceRegistry || new SourceRegistry([
             {
                 tenantId: 'tenant-acme',
                 instanceId: 'sn-dev-01',
                 source: 'sn://acme-dev.service-now.com',
             },
         ]),
-        now,
-        undefined,
-        resolver,
+        options.nowFn || now,
+        options.stateStore,
+        options.resolver,
+        options.finalizedPlanReader || createFinalizedPlanReader(),
     );
 }
 
 test('parallel non-overlapping jobs run immediately', async () => {
-    const service = new RestoreJobService(
-        new RestoreLockManager(),
-        new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]),
-        now,
-    );
+    const service = createService();
 
     const first = await service.createJob(baseRequest('plan-1', 'incident'), claims());
     const second = await service.createJob(baseRequest('plan-2', 'cmdb_ci'), claims());
@@ -138,17 +174,7 @@ test('parallel non-overlapping jobs run immediately', async () => {
 });
 
 test('queued job is promoted after overlapping running job completes', async () => {
-    const service = new RestoreJobService(
-        new RestoreLockManager(),
-        new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]),
-        now,
-    );
+    const service = createService();
 
     const running = await service.createJob(baseRequest('plan-1', 'incident'), claims());
     const queued = await service.createJob(baseRequest('plan-2', 'incident'), claims());
@@ -187,18 +213,9 @@ test(
     'createJob hydrates legacy lock state entries without source from job metadata',
     async () => {
         const stateStore = new InMemoryRestoreJobStateStore();
-        const service = new RestoreJobService(
-            new RestoreLockManager(),
-            new SourceRegistry([
-                {
-                    tenantId: 'tenant-acme',
-                    instanceId: 'sn-dev-01',
-                    source: 'sn://acme-dev.service-now.com',
-                },
-            ]),
-            now,
+        const service = createService({
             stateStore,
-        );
+        });
         const running = await service.createJob(
             baseRequest('plan-1', 'incident'),
             claims(),
@@ -241,17 +258,7 @@ test(
 );
 
 test('running job can pause and resume without releasing scope lock', async () => {
-    const service = new RestoreJobService(
-        new RestoreLockManager(),
-        new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]),
-        now,
-    );
+    const service = createService();
 
     const running = await service.createJob(baseRequest('plan-1', 'incident'), claims());
     const queued = await service.createJob(baseRequest('plan-2', 'incident'), claims());
@@ -301,17 +308,7 @@ test('running job can pause and resume without releasing scope lock', async () =
 });
 
 test('job lifecycle events emit normalized cross-service audit events', async () => {
-    const service = new RestoreJobService(
-        new RestoreLockManager(),
-        new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]),
-        now,
-    );
+    const service = createService();
 
     const running = await service.createJob(baseRequest('plan-1', 'incident'), claims());
     const queued = await service.createJob(baseRequest('plan-2', 'incident'), claims());
@@ -373,17 +370,7 @@ test('job lifecycle events emit normalized cross-service audit events', async ()
 });
 
 test('createJob rejects mismatched scope', async () => {
-    const service = new RestoreJobService(
-        new RestoreLockManager(),
-        new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]),
-        now,
-    );
+    const service = createService();
 
     const mismatchedClaims = claims();
     mismatchedClaims.tenant_id = 'tenant-wrong';
@@ -396,10 +383,149 @@ test('createJob rejects mismatched scope', async () => {
     assert.equal(result.success, false);
 });
 
+test('createJob rejects missing finalized plan before mutating state', async () => {
+    const stateStore = new InMemoryRestoreJobStateStore();
+    const beforeState = await stateStore.read();
+    const service = createService({
+        stateStore,
+        finalizedPlanReader: createFinalizedPlanReader({
+            defaultPlanHash: null,
+        }),
+    });
+    const result = await service.createJob(
+        baseRequest('plan-missing', 'incident'),
+        claims(),
+    );
+
+    assert.equal(result.success, false);
+
+    if (!result.success) {
+        assert.equal(result.statusCode, 409);
+        assert.equal(result.error, 'plan_missing');
+        assert.equal(result.reasonCode, 'blocked_plan_unavailable');
+        assert.equal(result.message, 'job plan is unavailable in plan store');
+    }
+
+    const afterState = await stateStore.read();
+
+    assert.deepEqual(afterState.jobs_by_id, beforeState.jobs_by_id);
+    assert.deepEqual(afterState.plans_by_id, beforeState.plans_by_id);
+    assert.deepEqual(afterState.lock_state, beforeState.lock_state);
+    assert.deepEqual(afterState.events_by_job_id, beforeState.events_by_job_id);
+});
+
+test('createJob rejects draft-only plan id (not finalized)', async () => {
+    const stateStore = new InMemoryRestoreJobStateStore();
+    const beforeState = await stateStore.read();
+    const service = createService({
+        stateStore,
+        finalizedPlanReader: createFinalizedPlanReader({
+            plansById: {
+                'plan-finalized': 'a'.repeat(64),
+            },
+            defaultPlanHash: null,
+        }),
+    });
+    const result = await service.createJob(
+        baseRequest('plan-draft-only', 'incident'),
+        claims(),
+    );
+
+    assert.equal(result.success, false);
+
+    if (!result.success) {
+        assert.equal(result.statusCode, 409);
+        assert.equal(result.error, 'plan_missing');
+        assert.equal(result.reasonCode, 'blocked_plan_unavailable');
+        assert.equal(result.message, 'job plan is unavailable in plan store');
+    }
+
+    const afterState = await stateStore.read();
+
+    assert.deepEqual(afterState.jobs_by_id, beforeState.jobs_by_id);
+    assert.deepEqual(afterState.plans_by_id, beforeState.plans_by_id);
+    assert.deepEqual(afterState.lock_state, beforeState.lock_state);
+    assert.deepEqual(afterState.events_by_job_id, beforeState.events_by_job_id);
+});
+
+test(
+    'createJob rejects finalized-plan hash mismatch deterministically '
+    + 'without side effects',
+    async () => {
+        const stateStore = new InMemoryRestoreJobStateStore();
+        const beforeState = await stateStore.read();
+        const service = createService({
+            stateStore,
+            finalizedPlanReader: createFinalizedPlanReader({
+                plansById: {
+                    'plan-finalized-mismatch': 'b'.repeat(64),
+                },
+                defaultPlanHash: null,
+            }),
+        });
+        const result = await service.createJob(
+            {
+                ...baseRequest('plan-finalized-mismatch', 'incident'),
+                plan_hash: 'a'.repeat(64),
+            },
+            claims(),
+        );
+
+        assert.equal(result.success, false);
+
+        if (!result.success) {
+            assert.equal(result.statusCode, 409);
+            assert.equal(result.error, 'plan_hash_mismatch');
+            assert.equal(result.reasonCode, 'blocked_plan_hash_mismatch');
+            assert.equal(
+                result.message,
+                'plan_id already exists with a different plan_hash',
+            );
+        }
+
+        const afterState = await stateStore.read();
+
+        assert.deepEqual(afterState.jobs_by_id, beforeState.jobs_by_id);
+        assert.deepEqual(afterState.plans_by_id, beforeState.plans_by_id);
+        assert.deepEqual(afterState.lock_state, beforeState.lock_state);
+        assert.deepEqual(
+            afterState.events_by_job_id,
+            beforeState.events_by_job_id,
+        );
+    },
+);
+
+test('createJob succeeds when finalized plan exists', async () => {
+    const service = createService({
+        finalizedPlanReader: createFinalizedPlanReader({
+            plansById: {
+                'plan-finalized': 'a'.repeat(64),
+            },
+            defaultPlanHash: null,
+        }),
+    });
+    const result = await service.createJob(
+        baseRequest('plan-finalized', 'incident'),
+        claims(),
+    );
+
+    assert.equal(result.success, true);
+
+    if (!result.success) {
+        return;
+    }
+
+    assert.equal(result.job.plan_id, 'plan-finalized');
+    assert.equal(result.job.plan_hash, 'a'.repeat(64));
+    assert.equal(result.job.status, 'running');
+});
+
 test('createJob rejects missing ACP mapping', async () => {
-    const service = createService(createResolver(async () => ({
-        status: 'not_found',
-    })));
+    const service = createService({
+        resolver: createResolver(async () => ({
+            status: 'not_found',
+        })),
+    });
     const result = await service.createJob(
         baseRequest('plan-missing-mapping', 'incident'),
         claims(),
@@ -416,11 +542,13 @@ test('createJob rejects missing ACP mapping', async () => {
 });
 
 test('createJob rejects ACP mapping when service is not allowed', async () => {
-    const service = createService(createResolver(async () =>
-        createResolveResult({
-            allowedServices: ['reg'],
-            serviceAllowed: false,
-        })));
+    const service = createService({
+        resolver: createResolver(async () =>
+            createResolveResult({
+                allowedServices: ['reg'],
+                serviceAllowed: false,
+            })),
+    });
     const result = await service.createJob(
         baseRequest('plan-service-not-allowed', 'incident'),
         claims(),
@@ -437,10 +565,12 @@ test('createJob rejects ACP mapping when service is not allowed', async () => {
 });
 
 test('createJob rejects ACP outages explicitly', async () => {
-    const service = createService(createResolver(async () => ({
-        status: 'outage',
-        message: 'ACP unavailable',
-    })));
+    const service = createService({
+        resolver: createResolver(async () => ({
+            status: 'outage',
+            message: 'ACP unavailable',
+        })),
+    });
     const result = await service.createJob(
         baseRequest('plan-acp-outage', 'incident'),
         claims(),
@@ -457,17 +587,7 @@ test('createJob rejects ACP outages explicitly', async () => {
 });
 
 test('getJob returns null for unknown job', async () => {
-    const service = new RestoreJobService(
-        new RestoreLockManager(),
-        new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]),
-        now,
-    );
+    const service = createService();
 
     const job = await service.getJob('nonexistent');
 
@@ -475,17 +595,7 @@ test('getJob returns null for unknown job', async () => {
 });
 
 test('completeJob rejects non-terminal status', async () => {
-    const service = new RestoreJobService(
-        new RestoreLockManager(),
-        new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]),
-        now,
-    );
+    const service = createService();
 
     const created = await service.createJob(
         baseRequest('plan-1', 'incident'),
@@ -507,17 +617,7 @@ test('completeJob rejects non-terminal status', async () => {
 });
 
 test('completeJob rejects completion for already-terminal job', async () => {
-    const service = new RestoreJobService(
-        new RestoreLockManager(),
-        new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]),
-        now,
-    );
+    const service = createService();
 
     const created = await service.createJob(
         baseRequest('plan-1', 'incident'),
@@ -543,17 +643,7 @@ test('completeJob rejects completion for already-terminal job', async () => {
 });
 
 test('reconcileQueueLocks dry-run detects stale non-terminal jobs', async () => {
-    const service = new RestoreJobService(
-        new RestoreLockManager(),
-        new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]),
-        now,
-    );
+    const service = createService();
 
     const running = await service.createJob(
         baseRequest('plan-1', 'incident'),
@@ -609,17 +699,9 @@ test(
     async () => {
         let nowMillis = Date.parse('2026-02-16T12:00:00.000Z');
         const dynamicNow = (): Date => new Date(nowMillis);
-        const service = new RestoreJobService(
-            new RestoreLockManager(),
-            new SourceRegistry([
-                {
-                    tenantId: 'tenant-acme',
-                    instanceId: 'sn-dev-01',
-                    source: 'sn://acme-dev.service-now.com',
-                },
-            ]),
-            dynamicNow,
-        );
+        const service = createService({
+            nowFn: dynamicNow,
+        });
 
         const running = await service.createJob(
             baseRequest('plan-1', 'incident'),
@@ -712,17 +794,9 @@ test(
     async () => {
         let nowMillis = Date.parse('2026-02-16T12:00:00.000Z');
         const dynamicNow = (): Date => new Date(nowMillis);
-        const service = new RestoreJobService(
-            new RestoreLockManager(),
-            new SourceRegistry([
-                {
-                    tenantId: 'tenant-acme',
-                    instanceId: 'sn-dev-01',
-                    source: 'sn://acme-dev.service-now.com',
-                },
-            ]),
-            dynamicNow,
-        );
+        const service = createService({
+            nowFn: dynamicNow,
+        });
 
         const running = await service.createJob(
             baseRequest('plan-1', 'incident'),
@@ -777,17 +851,9 @@ test(
 test('reconcileQueueLocks does not force active jobs that are not stale', async () => {
     let nowMillis = Date.parse('2026-02-16T12:00:00.000Z');
     const dynamicNow = (): Date => new Date(nowMillis);
-    const service = new RestoreJobService(
-        new RestoreLockManager(),
-        new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]),
-        dynamicNow,
-    );
+    const service = createService({
+        nowFn: dynamicNow,
+    });
     const running = await service.createJob(
         baseRequest('plan-1', 'incident'),
         claims(),
@@ -834,17 +900,9 @@ test('reconcileQueueLocks does not force active jobs that are not stale', async 
 test('reconcileQueueLocks force-stales stale queued jobs when not preserved', async () => {
     let nowMillis = Date.parse('2026-02-16T12:00:00.000Z');
     const dynamicNow = (): Date => new Date(nowMillis);
-    const service = new RestoreJobService(
-        new RestoreLockManager(),
-        new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]),
-        dynamicNow,
-    );
+    const service = createService({
+        nowFn: dynamicNow,
+    });
 
     const running = await service.createJob(
         baseRequest('plan-1', 'incident'),
@@ -897,17 +955,9 @@ test(
     async () => {
         let nowMillis = Date.parse('2026-02-16T12:00:00.000Z');
         const dynamicNow = (): Date => new Date(nowMillis);
-        const service = new RestoreJobService(
-            new RestoreLockManager(),
-            new SourceRegistry([
-                {
-                    tenantId: 'tenant-acme',
-                    instanceId: 'sn-dev-01',
-                    source: 'sn://acme-dev.service-now.com',
-                },
-            ]),
-            dynamicNow,
-        );
+        const service = createService({
+            nowFn: dynamicNow,
+        });
 
         const running = await service.createJob(
             baseRequest('plan-1', 'incident'),
@@ -984,9 +1034,8 @@ test(
 test('reconcileQueueLocks scope limits forced stale transitions', async () => {
     const sourceB = 'sn://acme-qa.service-now.com';
     const instanceB = 'sn-dev-02';
-    const service = new RestoreJobService(
-        new RestoreLockManager(),
-        new SourceRegistry([
+    const service = createService({
+        sourceRegistry: new SourceRegistry([
             {
                 tenantId: 'tenant-acme',
                 instanceId: 'sn-dev-01',
@@ -998,8 +1047,7 @@ test('reconcileQueueLocks scope limits forced stale transitions', async () => {
                 source: sourceB,
             },
         ]),
-        now,
-    );
+    });
     const scopedRunning = await service.createJob(
         baseRequest('plan-1', 'incident'),
         claims(),
@@ -1067,18 +1115,9 @@ test('reconcileQueueLocks scope limits forced stale transitions', async () => {
 
 test('reconcileQueueLocks reports lock membership mismatch anomalies', async () => {
     const stateStore = new InMemoryRestoreJobStateStore();
-    const service = new RestoreJobService(
-        new RestoreLockManager(),
-        new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]),
-        now,
+    const service = createService({
         stateStore,
-    );
+    });
 
     const running = await service.createJob(
         baseRequest('plan-1', 'incident'),
@@ -1122,18 +1161,9 @@ test(
     'reconcileQueueLocks flags queued missing blocker and cleans orphaned lock',
     async () => {
         const stateStore = new InMemoryRestoreJobStateStore();
-        const service = new RestoreJobService(
-            new RestoreLockManager(),
-            new SourceRegistry([
-                {
-                    tenantId: 'tenant-acme',
-                    instanceId: 'sn-dev-01',
-                    source: 'sn://acme-dev.service-now.com',
-                },
-            ]),
-            now,
+        const service = createService({
             stateStore,
-        );
+        });
         const running = await service.createJob(
             baseRequest('plan-1', 'incident'),
             claims(),
@@ -1217,17 +1247,7 @@ test(
 test(
     'reconcileQueueLocks keeps queued job when real blocker is still active',
     async () => {
-        const service = new RestoreJobService(
-            new RestoreLockManager(),
-            new SourceRegistry([
-                {
-                    tenantId: 'tenant-acme',
-                    instanceId: 'sn-dev-01',
-                    source: 'sn://acme-dev.service-now.com',
-                },
-            ]),
-            now,
-        );
+        const service = createService();
         const running = await service.createJob(
             baseRequest('plan-1', 'incident'),
             claims(),
@@ -1269,17 +1289,7 @@ test(
 );
 
 test('listJobEvents returns empty for unknown job', async () => {
-    const service = new RestoreJobService(
-        new RestoreLockManager(),
-        new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]),
-        now,
-    );
+    const service = createService();
 
     const events = await service.listJobEvents(
         'nonexistent',

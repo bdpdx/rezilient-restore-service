@@ -28,6 +28,7 @@ const RESTORE_REASON_CODES = [
     'blocked_freshness_unknown',
     'blocked_auth_control_plane_outage',
     'blocked_plan_hash_mismatch',
+    'blocked_plan_unavailable',
     'blocked_evidence_not_ready',
     'blocked_resume_precondition_mismatch',
     'blocked_resume_checkpoint_missing',

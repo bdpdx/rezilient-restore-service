@@ -331,13 +331,6 @@ function createService(
         expectedIssuer: 'rez-auth-control-plane',
         now,
     });
-    const jobs = new RestoreJobService(
-        new RestoreLockManager(),
-        sourceRegistry,
-        now,
-        options?.stateStores?.jobs,
-        options?.sourceMappingResolver,
-    );
     const restoreIndexReader = options?.restoreIndexReader
         || new InMemoryRestoreIndexStateReader();
     const artifactBodyReader = new InMemoryRestoreArtifactBodyReader();
@@ -430,6 +423,27 @@ function createService(
         ),
         {
             allowLegacyRowsCompat: true,
+        },
+    );
+    const jobs = new RestoreJobService(
+        new RestoreLockManager(),
+        sourceRegistry,
+        now,
+        options?.stateStores?.jobs,
+        options?.sourceMappingResolver,
+        {
+            async getFinalizedPlan(planId: string) {
+                const plan = await plans.getPlan(planId);
+
+                if (!plan) {
+                    return null;
+                }
+
+                return {
+                    plan_id: plan.plan.plan_id,
+                    plan_hash: plan.plan.plan_hash,
+                };
+            },
         },
     );
     const execute = new RestoreExecutionService(
@@ -632,13 +646,19 @@ function assertNotScopedNotFound(
     );
 }
 
-function createJobPayload(source: string): Record<string, unknown> {
+function createJobPayload(
+    source: string,
+    overrides?: {
+        planId?: string;
+        planHash?: string;
+    },
+): Record<string, unknown> {
     return {
         tenant_id: 'tenant-acme',
         instance_id: 'sn-dev-01',
         source,
-        plan_id: 'plan-1',
-        plan_hash: 'a'.repeat(64),
+        plan_id: overrides?.planId || 'plan-1',
+        plan_hash: overrides?.planHash || 'a'.repeat(64),
         lock_scope_tables: ['incident'],
         required_capabilities: ['restore_execute'],
         requested_by: 'operator@example.com',
@@ -993,24 +1013,168 @@ async function listJobEvents(
     return eventsResponse.body.events as Array<Record<string, unknown>>;
 }
 
-test('valid scoped token and ACP mapping can create restore job', async () => {
+test(
+    'valid scoped token and ACP mapping can create restore job for '
+        + 'finalized plan',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const server = createService(signingKey, {
+            sourceMappingResolver: createResolver(createResolveResult()),
+        });
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+        const planId = 'plan-http-finalized-success';
+
+        try {
+            const dryRun = await postJson(
+                baseUrl,
+                '/v1/plans/dry-run',
+                token,
+                createDryRunPayload(planId),
+            );
+
+            assert.equal(dryRun.status, 201);
+            assert.equal(dryRun.body.reconciliation_state, 'finalized');
+            const dryRunPlan = dryRun.body.plan as Record<string, unknown>;
+            const planHash = dryRunPlan.plan_hash as string;
+
+            assert.equal(typeof planHash, 'string');
+
+            const response = await postJson(
+                baseUrl,
+                '/v1/jobs',
+                token,
+                createJobPayload(
+                    'sn://acme-dev.service-now.com',
+                    {
+                        planId,
+                        planHash,
+                    },
+                ),
+            );
+
+            assert.equal(response.status, 201);
+            const job = response.body.job as Record<string, unknown>;
+            assert.equal(job.plan_id, planId);
+            assert.equal(job.plan_hash, planHash);
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
+
+test(
+    'POST /v1/jobs rejects missing finalized plan at create time',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const server = createService(signingKey);
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+
+        try {
+            const response = await postJson(
+                baseUrl,
+                '/v1/jobs',
+                token,
+                createJobPayload(
+                    'sn://acme-dev.service-now.com',
+                    {
+                        planId: 'missing-finalized-plan',
+                    },
+                ),
+            );
+
+            assert.equal(response.status, 409);
+            assert.equal(response.body.error, 'plan_missing');
+            assert.equal(
+                response.body.reason_code,
+                'blocked_plan_unavailable',
+            );
+            assert.equal(
+                response.body.message,
+                'job plan is unavailable in plan store',
+            );
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
+
+test('POST /v1/jobs rejects draft-only plan ids', async () => {
     const signingKey = 'test-signing-key';
+    const artifactKey = 'rez/restore/event=evt-draft-only-01.artifact.json';
+    const manifestKey = 'rez/restore/event=evt-draft-only-01.manifest.json';
     const server = createService(signingKey, {
         sourceMappingResolver: createResolver(createResolveResult()),
+        indexedEventCandidates: [{
+            artifactKey,
+            eventId: 'evt-draft-only-01',
+            eventTime: '2026-02-16T11:59:00.000Z',
+            manifestKey,
+            offset: '100',
+            partition: 1,
+            recordSysId: 'rec-01',
+            sysModCount: 2,
+            sysUpdatedOn: '2026-02-16 11:59:00',
+            table: 'incident',
+            topic: 'rez.cdc',
+        }],
+        artifactBodies: [{
+            artifactKey,
+            body: {
+                __op: 'U',
+                __schema_version: 3,
+                __type: 'cdc.write',
+                row_enc: {
+                    alg: 'AES-256-GCM',
+                    ciphertext: 'cipher-draft-only-01',
+                },
+            },
+            manifestKey,
+        }],
     });
     const baseUrl = await listen(server);
     const token = createToken(signingKey);
+    const planId = 'plan-http-draft-only';
 
     try {
+        const draft = await postJson(
+            baseUrl,
+            '/v1/plans/dry-run',
+            token,
+            createScopeDrivenDryRunPayload(planId),
+        );
+
+        assert.equal(draft.status, 202);
+        assert.equal(draft.body.reconciliation_state, 'draft');
+        const draftPlan = draft.body.plan as Record<string, unknown>;
+        const draftHash = draftPlan.plan_hash as string;
+
+        assert.equal(typeof draftHash, 'string');
+
         const response = await postJson(
             baseUrl,
             '/v1/jobs',
             token,
-            createJobPayload('sn://acme-dev.service-now.com'),
+            createJobPayload(
+                'sn://acme-dev.service-now.com',
+                {
+                    planId,
+                    planHash: draftHash,
+                },
+            ),
         );
 
-        assert.equal(response.status, 201);
-        assert.equal(typeof response.body.job, 'object');
+        assert.equal(response.status, 409);
+        assert.equal(response.body.error, 'plan_missing');
+        assert.equal(
+            response.body.reason_code,
+            'blocked_plan_unavailable',
+        );
+        assert.equal(
+            response.body.message,
+            'job plan is unavailable in plan store',
+        );
     } finally {
         await closeServer(server);
     }

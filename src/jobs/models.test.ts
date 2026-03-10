@@ -162,6 +162,7 @@ describe('reason codes', () => {
             'blocked_freshness_unknown',
             'blocked_auth_control_plane_outage',
             'blocked_plan_hash_mismatch',
+            'blocked_plan_unavailable',
             'blocked_evidence_not_ready',
             'blocked_resume_precondition_mismatch',
             'blocked_resume_checkpoint_missing',
@@ -185,6 +186,6 @@ describe('reason codes', () => {
             reasonCodes.length,
             'all reason codes must be unique',
         );
-        assert.ok(reasonCodes.length >= 28);
+        assert.ok(reasonCodes.length >= 29);
     });
 });

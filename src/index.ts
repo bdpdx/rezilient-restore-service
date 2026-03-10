@@ -77,13 +77,6 @@ async function main(): Promise<void> {
             staleAfterSeconds: env.restoreIndexStaleAfterSeconds,
         },
     );
-    const jobs = new RestoreJobService(
-        lockManager,
-        undefined,
-        undefined,
-        jobStateStore,
-        acpSourceMappingProvider,
-    );
     const artifactBodyReader = env.objectStoreBucket && env.objectStoreRegion
         ? createS3RestoreArtifactBodyReader({
             accessKeyId: env.objectStoreAccessKeyId,
@@ -102,6 +95,27 @@ async function main(): Promise<void> {
         restoreIndexStateReader,
         acpSourceMappingProvider,
         new RestoreRowMaterializationService(artifactBodyReader),
+    );
+    const jobs = new RestoreJobService(
+        lockManager,
+        undefined,
+        undefined,
+        jobStateStore,
+        acpSourceMappingProvider,
+        {
+            async getFinalizedPlan(planId: string) {
+                const plan = await plans.getPlan(planId);
+
+                if (!plan) {
+                    return null;
+                }
+
+                return {
+                    plan_id: plan.plan.plan_id,
+                    plan_hash: plan.plan.plan_hash,
+                };
+            },
+        },
     );
     const execute = new RestoreExecutionService(
         jobs,

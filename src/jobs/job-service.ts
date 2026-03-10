@@ -244,6 +244,23 @@ export interface QueueReconcileResult {
     };
 }
 
+export interface FinalizedRestorePlanRecord {
+    plan_id: string;
+    plan_hash: string;
+}
+
+export interface RestoreFinalizedPlanReader {
+    getFinalizedPlan(
+        planId: string,
+    ): Promise<FinalizedRestorePlanRecord | null>;
+}
+
+const EMPTY_FINALIZED_PLAN_READER: RestoreFinalizedPlanReader = {
+    async getFinalizedPlan(): Promise<FinalizedRestorePlanRecord | null> {
+        return null;
+    },
+};
+
 interface QueueRebuildResult {
     lockState: RestoreLockManagerState;
     decisionsByJobId: Map<string, LockDecision>;
@@ -373,22 +390,23 @@ export class RestoreJobService {
         private readonly stateStore: RestoreJobStateStore =
             new InMemoryRestoreJobStateStore(),
         sourceMappingResolver?: SourceMappingResolver,
+        private readonly finalizedPlanReader: RestoreFinalizedPlanReader =
+            EMPTY_FINALIZED_PLAN_READER,
     ) {
         if (sourceMappingResolver) {
             this.sourceMappingResolver = sourceMappingResolver;
-            return;
-        }
+        } else {
+            if (!sourceRegistry) {
+                throw new Error(
+                    'sourceMappingResolver is required when sourceRegistry '
+                    + 'is not provided',
+                );
+            }
 
-        if (!sourceRegistry) {
-            throw new Error(
-                'sourceMappingResolver is required when sourceRegistry '
-                + 'is not provided',
+            this.sourceMappingResolver = createSourceRegistryBackedResolver(
+                sourceRegistry,
             );
         }
-
-        this.sourceMappingResolver = createSourceRegistryBackedResolver(
-            sourceRegistry,
-        );
     }
 
     async createJob(
@@ -424,10 +442,50 @@ export class RestoreJobService {
             };
         }
 
+        let finalizedPlan: FinalizedRestorePlanRecord | null;
+
+        try {
+            finalizedPlan = await this.finalizedPlanReader.getFinalizedPlan(
+                request.plan_id,
+            );
+        } catch (error: unknown) {
+            return {
+                success: false,
+                statusCode: 503,
+                error: 'plan_store_unavailable',
+                message:
+                    'finalized plan lookup failed: '
+                    + String((error as Error)?.message || error),
+            };
+        }
+
+        if (!finalizedPlan) {
+            return {
+                success: false,
+                statusCode: 409,
+                error: 'plan_missing',
+                reasonCode: 'blocked_plan_unavailable',
+                message: 'job plan is unavailable in plan store',
+            };
+        }
+
+        if (finalizedPlan.plan_hash !== request.plan_hash) {
+            return {
+                success: false,
+                statusCode: 409,
+                error: 'plan_hash_mismatch',
+                reasonCode: 'blocked_plan_hash_mismatch',
+                message: 'plan_id already exists with a different plan_hash',
+            };
+        }
+
         return this.mutateState((state) => {
             const existingPlan = state.plans_by_id[request.plan_id];
 
-            if (existingPlan && existingPlan.plan_hash !== request.plan_hash) {
+            if (
+                existingPlan
+                && existingPlan.plan_hash !== finalizedPlan.plan_hash
+            ) {
                 return {
                     success: false,
                     statusCode: 409,
@@ -444,7 +502,7 @@ export class RestoreJobService {
                 const plan: RestorePlanMetadataRecord = {
                     contract_version: RESTORE_CONTRACT_VERSION,
                     plan_id: request.plan_id,
-                    plan_hash: request.plan_hash,
+                    plan_hash: finalizedPlan.plan_hash,
                     tenant_id: request.tenant_id,
                     instance_id: request.instance_id,
                     source: request.source,
@@ -477,7 +535,7 @@ export class RestoreJobService {
                 instance_id: request.instance_id,
                 source: request.source,
                 plan_id: request.plan_id,
-                plan_hash: request.plan_hash,
+                plan_hash: finalizedPlan.plan_hash,
                 status: jobStatus,
                 status_reason_code: lockDecision.reasonCode,
                 lock_scope_tables: normalizedTables,
