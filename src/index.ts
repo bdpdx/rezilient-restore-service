@@ -113,6 +113,10 @@ async function main(): Promise<void> {
                 return {
                     plan_id: plan.plan.plan_id,
                     plan_hash: plan.plan.plan_hash,
+                    gate: {
+                        executability: plan.gate.executability,
+                        reason_code: plan.gate.reason_code,
+                    },
                 };
             },
         },

@@ -14,6 +14,7 @@ import {
 import { SourceRegistry } from '../registry/source-registry';
 import { RestoreLockManager } from '../locks/lock-manager';
 import { InMemoryRestoreJobStateStore } from './job-state-store';
+import type { RestoreReasonCode } from './models';
 
 const FIXED_NOW = new Date('2026-02-16T12:00:00.000Z');
 
@@ -49,38 +50,99 @@ function baseRequest(planId: string, table: string) {
     };
 }
 
+function countQueueLifecycleEvents(
+    eventsByJobId: Record<string, Array<{ event_type: string }>>,
+): Record<'job_created' | 'job_started' | 'job_queued', number> {
+    const counts = {
+        job_created: 0,
+        job_started: 0,
+        job_queued: 0,
+    };
+
+    for (const events of Object.values(eventsByJobId)) {
+        for (const event of events) {
+            if (event.event_type === 'job_created') {
+                counts.job_created += 1;
+            } else if (event.event_type === 'job_started') {
+                counts.job_started += 1;
+            } else if (event.event_type === 'job_queued') {
+                counts.job_queued += 1;
+            }
+        }
+    }
+
+    return counts;
+}
+
 interface FinalizedPlanReaderOptions {
-    plansById?: Record<string, string>;
-    defaultPlanHash?: string | null;
+    plansById?: Record<string, string | {
+        plan_hash: string;
+        executability?: 'executable' | 'preview_only' | 'blocked';
+        reason_code?: RestoreReasonCode;
+    }>;
+    defaultPlan?: string | {
+        plan_hash: string;
+        executability?: 'executable' | 'preview_only' | 'blocked';
+        reason_code?: RestoreReasonCode;
+    } | null;
 }
 
 function createFinalizedPlanReader(
     options: FinalizedPlanReaderOptions = {},
 ): RestoreFinalizedPlanReader {
-    const planHashesById = new Map(Object.entries(options.plansById || {}));
-    const defaultPlanHash = options.defaultPlanHash === undefined
+    const plansById = new Map(Object.entries(options.plansById || {}));
+    const defaultPlan = options.defaultPlan === undefined
         ? 'a'.repeat(64)
-        : options.defaultPlanHash;
+        : options.defaultPlan;
+
+    function normalizePlan(
+        planId: string,
+        input: string | {
+            plan_hash: string;
+            executability?: 'executable' | 'preview_only' | 'blocked';
+            reason_code?: RestoreReasonCode;
+        },
+    ) {
+        if (typeof input === 'string') {
+            return {
+                plan_id: planId,
+                plan_hash: input,
+                gate: {
+                    executability: 'executable' as const,
+                    reason_code: 'none' as const,
+                },
+            };
+        }
+
+        const executability = input.executability || 'executable';
+
+        return {
+            plan_id: planId,
+            plan_hash: input.plan_hash,
+            gate: {
+                executability,
+                reason_code: input.reason_code || (
+                    executability === 'executable'
+                        ? 'none'
+                        : 'blocked_freshness_stale'
+                ),
+            },
+        };
+    }
 
     return {
         async getFinalizedPlan(planId: string) {
-            const planHash = planHashesById.get(planId);
+            const plan = plansById.get(planId);
 
-            if (planHash) {
-                return {
-                    plan_id: planId,
-                    plan_hash: planHash,
-                };
+            if (plan) {
+                return normalizePlan(planId, plan);
             }
 
-            if (defaultPlanHash === null) {
+            if (defaultPlan === null) {
                 return null;
             }
 
-            return {
-                plan_id: planId,
-                plan_hash: defaultPlanHash,
-            };
+            return normalizePlan(planId, defaultPlan);
         },
     };
 }
@@ -389,7 +451,7 @@ test('createJob rejects missing finalized plan before mutating state', async () 
     const service = createService({
         stateStore,
         finalizedPlanReader: createFinalizedPlanReader({
-            defaultPlanHash: null,
+            defaultPlan: null,
         }),
     });
     const result = await service.createJob(
@@ -423,7 +485,7 @@ test('createJob rejects draft-only plan id (not finalized)', async () => {
             plansById: {
                 'plan-finalized': 'a'.repeat(64),
             },
-            defaultPlanHash: null,
+            defaultPlan: null,
         }),
     });
     const result = await service.createJob(
@@ -460,7 +522,7 @@ test(
                 plansById: {
                     'plan-finalized-mismatch': 'b'.repeat(64),
                 },
-                defaultPlanHash: null,
+                defaultPlan: null,
             }),
         });
         const result = await service.createJob(
@@ -495,13 +557,138 @@ test(
     },
 );
 
+test(
+    'createJob rejection for preview-only plan preserves existing '
+    + 'jobs/locks/events',
+    async () => {
+        const stateStore = new InMemoryRestoreJobStateStore();
+        const service = createService({
+            stateStore,
+            finalizedPlanReader: createFinalizedPlanReader({
+                plansById: {
+                    'plan-running': 'a'.repeat(64),
+                    'plan-queued': 'a'.repeat(64),
+                    'plan-preview-only': {
+                        plan_hash: 'a'.repeat(64),
+                        executability: 'preview_only',
+                        reason_code: 'blocked_freshness_stale',
+                    },
+                },
+                defaultPlan: null,
+            }),
+        });
+        const running = await service.createJob(
+            baseRequest('plan-running', 'incident'),
+            claims(),
+        );
+        const queued = await service.createJob(
+            baseRequest('plan-queued', 'incident'),
+            claims(),
+        );
+
+        assert.equal(running.success, true);
+        assert.equal(queued.success, true);
+
+        if (!running.success || !queued.success) {
+            return;
+        }
+
+        const beforeState = await stateStore.read();
+        const beforeLifecycleCounts = countQueueLifecycleEvents(
+            beforeState.events_by_job_id,
+        );
+        const beforeJobIds = Object.keys(beforeState.jobs_by_id).sort();
+        const result = await service.createJob(
+            baseRequest('plan-preview-only', 'incident'),
+            claims(),
+        );
+
+        assert.equal(result.success, false);
+
+        if (!result.success) {
+            assert.equal(result.statusCode, 409);
+            assert.equal(result.error, 'plan_not_executable');
+            assert.equal(result.reasonCode, 'blocked_freshness_stale');
+            assert.equal(
+                result.message,
+                'dry-run plan gate is not executable',
+            );
+        }
+
+        const afterState = await stateStore.read();
+        const afterLifecycleCounts = countQueueLifecycleEvents(
+            afterState.events_by_job_id,
+        );
+
+        assert.deepEqual(afterState.jobs_by_id, beforeState.jobs_by_id);
+        assert.deepEqual(afterState.plans_by_id, beforeState.plans_by_id);
+        assert.deepEqual(afterState.lock_state, beforeState.lock_state);
+        assert.deepEqual(
+            afterState.events_by_job_id,
+            beforeState.events_by_job_id,
+        );
+        assert.deepEqual(afterLifecycleCounts, beforeLifecycleCounts);
+        assert.deepEqual(
+            Object.keys(afterState.jobs_by_id).sort(),
+            beforeJobIds,
+        );
+    },
+);
+
+test(
+    'createJob rejects finalized preview-only plan before mutating state',
+    async () => {
+        const stateStore = new InMemoryRestoreJobStateStore();
+        const beforeState = await stateStore.read();
+        const service = createService({
+            stateStore,
+            finalizedPlanReader: createFinalizedPlanReader({
+                plansById: {
+                    'plan-preview-only': {
+                        plan_hash: 'a'.repeat(64),
+                        executability: 'preview_only',
+                        reason_code: 'blocked_freshness_stale',
+                    },
+                },
+                defaultPlan: null,
+            }),
+        });
+        const result = await service.createJob(
+            baseRequest('plan-preview-only', 'incident'),
+            claims(),
+        );
+
+        assert.equal(result.success, false);
+
+        if (!result.success) {
+            assert.equal(result.statusCode, 409);
+            assert.equal(result.error, 'plan_not_executable');
+            assert.equal(result.reasonCode, 'blocked_freshness_stale');
+            assert.equal(
+                result.message,
+                'dry-run plan gate is not executable',
+            );
+        }
+
+        const afterState = await stateStore.read();
+
+        assert.deepEqual(afterState.jobs_by_id, beforeState.jobs_by_id);
+        assert.deepEqual(afterState.plans_by_id, beforeState.plans_by_id);
+        assert.deepEqual(afterState.lock_state, beforeState.lock_state);
+        assert.deepEqual(
+            afterState.events_by_job_id,
+            beforeState.events_by_job_id,
+        );
+    },
+);
+
 test('createJob succeeds when finalized plan exists', async () => {
     const service = createService({
         finalizedPlanReader: createFinalizedPlanReader({
             plansById: {
                 'plan-finalized': 'a'.repeat(64),
             },
-            defaultPlanHash: null,
+            defaultPlan: null,
         }),
     });
     const result = await service.createJob(
@@ -528,7 +715,7 @@ test('createJob sanitizes caller approval metadata before persisting it', async 
             plansById: {
                 'plan-finalized': 'a'.repeat(64),
             },
-            defaultPlanHash: null,
+            defaultPlan: null,
         }),
     });
     const result = await service.createJob(

@@ -529,6 +529,10 @@ async function buildFixture(options?: {
                 return {
                     plan_id: plan.plan.plan_id,
                     plan_hash: plan.plan.plan_hash,
+                    gate: {
+                        executability: plan.gate.executability,
+                        reason_code: plan.gate.reason_code,
+                    },
                 };
             },
         },
@@ -648,6 +652,10 @@ async function buildScopeDrivenFixture(): Promise<{
                 return {
                     plan_id: plan.plan.plan_id,
                     plan_hash: plan.plan.plan_hash,
+                    gate: {
+                        executability: plan.gate.executability,
+                        reason_code: plan.gate.reason_code,
+                    },
                 };
             },
         },
@@ -1694,6 +1702,10 @@ test('executeJob rejects when job not in running state', async () => {
                 return {
                     plan_id: plan.plan.plan_id,
                     plan_hash: plan.plan.plan_hash,
+                    gate: {
+                        executability: plan.gate.executability,
+                        reason_code: plan.gate.reason_code,
+                    },
                 };
             },
         },
@@ -1788,6 +1800,10 @@ test('executeJob rejects when plan not found', async () => {
                 return {
                     plan_id: plan.plan.plan_id,
                     plan_hash: plan.plan.plan_hash,
+                    gate: {
+                        executability: plan.gate.executability,
+                        reason_code: plan.gate.reason_code,
+                    },
                 };
             },
         },

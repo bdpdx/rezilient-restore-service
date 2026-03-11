@@ -247,6 +247,10 @@ export interface QueueReconcileResult {
 export interface FinalizedRestorePlanRecord {
     plan_id: string;
     plan_hash: string;
+    gate: {
+        executability: 'executable' | 'preview_only' | 'blocked';
+        reason_code: RestoreReasonCode;
+    };
 }
 
 export interface RestoreFinalizedPlanReader {
@@ -476,6 +480,16 @@ export class RestoreJobService {
                 error: 'plan_hash_mismatch',
                 reasonCode: 'blocked_plan_hash_mismatch',
                 message: 'plan_id already exists with a different plan_hash',
+            };
+        }
+
+        if (finalizedPlan.gate.executability !== 'executable') {
+            return {
+                success: false,
+                statusCode: 409,
+                error: 'plan_not_executable',
+                reasonCode: finalizedPlan.gate.reason_code,
+                message: 'dry-run plan gate is not executable',
             };
         }
 

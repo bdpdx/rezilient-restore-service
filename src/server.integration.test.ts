@@ -29,6 +29,7 @@ import {
     RestoreExecutionStateStore,
 } from './execute/execute-state-store';
 import {
+    InMemoryRestoreJobStateStore,
     PostgresRestoreJobStateStore,
     RestoreJobStateStore,
 } from './jobs/job-state-store';
@@ -486,6 +487,10 @@ function createService(
                 return {
                     plan_id: plan.plan.plan_id,
                     plan_hash: plan.plan.plan_hash,
+                    gate: {
+                        executability: plan.gate.executability,
+                        reason_code: plan.gate.reason_code,
+                    },
                 };
             },
         },
@@ -1296,6 +1301,109 @@ test('POST /v1/jobs rejects draft-only plan ids', async () => {
         await closeServer(server);
     }
 });
+
+test(
+    'POST /v1/jobs rejects finalized preview-only plans at create time',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const staleAuthoritative = {
+            ...createWatermark(),
+            coverage_end: '2026-02-16T11:55:00.000Z',
+            indexed_through_time: '2026-02-16T11:55:00.000Z',
+        };
+        const jobsStore = new InMemoryRestoreJobStateStore();
+        const server = createService(signingKey, {
+            authoritativeWatermarks: [staleAuthoritative],
+            stateStores: {
+                jobs: jobsStore,
+            },
+        });
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+        const planId = 'plan-http-preview-only';
+
+        try {
+            const dryRun = await postJson(
+                baseUrl,
+                '/v1/plans/dry-run',
+                token,
+                createDryRunPayload(planId),
+            );
+
+            assert.equal(dryRun.status, 202);
+            assert.equal(dryRun.body.reconciliation_state, 'draft');
+            const targetReconciliationRecords =
+                dryRun.body.target_reconciliation_records as Array<
+                    Record<string, unknown>
+                >;
+
+            const finalize = await postJson(
+                baseUrl,
+                `/v1/plans/${encodeURIComponent(planId)}`
+                    + '/target-reconciliation/finalize',
+                token,
+                {
+                    finalized_by: 'sn-worker',
+                    reconciled_records: targetReconciliationRecords.map(
+                        (record) => ({
+                            table: record.table,
+                            record_sys_id: record.record_sys_id,
+                            target_state: 'exists',
+                        }),
+                    ),
+                },
+            );
+
+            assert.equal(finalize.status, 201);
+            const finalizeGate = finalize.body.gate as Record<string, unknown>;
+
+            assert.equal(finalizeGate.executability, 'preview_only');
+            assert.equal(
+                finalizeGate.reason_code,
+                'blocked_freshness_stale',
+            );
+
+            const finalizedPlan = finalize.body.plan as Record<string, unknown>;
+            const planHash = finalizedPlan.plan_hash as string;
+
+            assert.equal(typeof planHash, 'string');
+
+            const response = await postJson(
+                baseUrl,
+                '/v1/jobs',
+                token,
+                createJobPayload(
+                    'sn://acme-dev.service-now.com',
+                    {
+                        planId,
+                        planHash,
+                    },
+                ),
+            );
+
+            assert.equal(response.status, 409);
+            assert.equal(response.body.error, 'plan_not_executable');
+            assert.equal(
+                response.body.reason_code,
+                'blocked_freshness_stale',
+            );
+            assert.equal(
+                response.body.message,
+                'dry-run plan gate is not executable',
+            );
+
+            const jobState = await jobsStore.read();
+
+            assert.deepEqual(jobState.jobs_by_id, {});
+            assert.deepEqual(jobState.plans_by_id, {});
+            assert.deepEqual(jobState.events_by_job_id, {});
+            assert.deepEqual(jobState.lock_state.running_jobs, []);
+            assert.deepEqual(jobState.lock_state.queued_jobs, []);
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
 
 test('ACP missing mapping fails closed on job create', async () => {
     const signingKey = 'test-signing-key';
@@ -4710,16 +4818,16 @@ test('admin ops endpoints expose queue, freshness, and evidence summaries', asyn
             token,
             'admin-plan-queue-01',
         );
-        restoreIndexReader.upsertWatermark(RestoreWatermarkSchema.parse({
-            ...createWatermark(),
-            coverage_end: '2026-02-16T11:55:00.000Z',
-            indexed_through_time: '2026-02-16T11:55:00.000Z',
-        }));
         const secondPlan = await createPlanAndJob(
             baseUrl,
             token,
             'admin-plan-queue-02',
         );
+        restoreIndexReader.upsertWatermark(RestoreWatermarkSchema.parse({
+            ...createWatermark(),
+            coverage_end: '2026-02-16T11:55:00.000Z',
+            indexed_through_time: '2026-02-16T11:55:00.000Z',
+        }));
 
         const queue = await getAdminJson(
             baseUrl,
