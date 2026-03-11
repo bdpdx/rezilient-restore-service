@@ -6,14 +6,21 @@ import { PostgresRestoreJobStateStore } from './jobs/job-state-store';
 import { RestoreJobService } from './jobs/job-service';
 import { RestoreLockManager } from './locks/lock-manager';
 import { PostgresRestorePlanStateStore } from './plans/plan-state-store';
+import {
+    InMemoryRestoreArtifactBodyReader,
+    RestoreRowMaterializationService,
+} from './plans/materialization-service';
 import { RestorePlanService } from './plans/plan-service';
+import { NoopRestoreTargetStateLookup } from './plans/target-reconciliation';
 import { SourceRegistry } from './registry/source-registry';
 import { InMemoryRestoreIndexStateReader } from './restore-index/state-reader';
 
 type Fixture = {
+    artifactReader: InMemoryRestoreArtifactBodyReader;
     close: () => Promise<void>;
     jobs: RestoreJobService;
     plans: RestorePlanService;
+    restoreIndexReader: InMemoryRestoreIndexStateReader;
 };
 
 function now(): Date {
@@ -35,7 +42,10 @@ function claims() {
     };
 }
 
-function createDryRunRequest(planId: string): Record<string, unknown> {
+function createScopeDrivenDryRunRequest(
+    planId: string,
+    rowId: string,
+): Record<string, unknown> {
     return {
         tenant_id: 'tenant-acme',
         instance_id: 'sn-dev-01',
@@ -62,7 +72,7 @@ function createDryRunRequest(planId: string): Record<string, unknown> {
         scope: {
             mode: 'record',
             tables: ['incident'],
-            encoded_query: 'active=true',
+            record_sys_ids: [`rec-${rowId}`],
         },
         execution_options: {
             missing_row_mode: 'existing_only',
@@ -70,67 +80,9 @@ function createDryRunRequest(planId: string): Record<string, unknown> {
             schema_compatibility_mode: 'compatible_only',
             workflow_mode: 'suppressed_default',
         },
-        rows: [
-            {
-                row_id: `row-${planId}`,
-                table: 'incident',
-                record_sys_id: `rec-${planId}`,
-                action: 'update',
-                precondition_hash: 'a'.repeat(64),
-                metadata: {
-                    allowlist_version: 'rrs.metadata.allowlist.v1',
-                    metadata: {
-                        tenant_id: 'tenant-acme',
-                        instance_id: 'sn-dev-01',
-                        source: 'sn://acme-dev.service-now.com',
-                        table: 'incident',
-                        record_sys_id: `rec-${planId}`,
-                        event_id: `evt-${planId}`,
-                        event_type: 'cdc.write',
-                        operation: 'U',
-                        schema_version: 3,
-                        sys_updated_on: '2026-02-18 15:29:59',
-                        sys_mod_count: 2,
-                        __time: '2026-02-18T15:29:59.000Z',
-                        topic: 'rez.cdc',
-                        partition: 1,
-                        offset: '42',
-                    },
-                },
-                values: {
-                    diff_enc: {
-                        alg: 'AES-256-CBC',
-                        module: 'x_rezrp_rezilient.encrypter',
-                        format: 'kmf',
-                        compression: 'none',
-                        ciphertext: `cipher-${planId}`,
-                    },
-                },
-            },
-        ],
         conflicts: [],
         delete_candidates: [],
         media_candidates: [],
-        watermarks: [
-            {
-                contract_version: 'restore.contracts.v1',
-                tenant_id: 'tenant-acme',
-                instance_id: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-                topic: 'rez.cdc',
-                partition: 1,
-                generation_id: 'gen-01',
-                indexed_through_offset: '100',
-                indexed_through_time: '2026-02-18T15:29:59.000Z',
-                coverage_start: '2026-02-18T00:00:00.000Z',
-                coverage_end: '2026-02-18T15:29:59.000Z',
-                freshness: 'fresh',
-                executability: 'executable',
-                reason_code: 'none',
-                measured_at: '2026-02-18T15:30:00.000Z',
-            },
-        ],
-        pit_candidates: [],
     };
 }
 
@@ -182,15 +134,8 @@ function createFixture(
             source: 'sn://acme-dev.service-now.com',
         },
     ]);
-    const jobs = new RestoreJobService(
-        new RestoreLockManager(),
-        sourceRegistry,
-        now,
-        new PostgresRestoreJobStateStore('postgres://unused', {
-            pool: pool as any,
-        }),
-    );
     const restoreIndexReader = new InMemoryRestoreIndexStateReader();
+    const artifactReader = new InMemoryRestoreArtifactBodyReader();
 
     restoreIndexReader.upsertWatermark(RestoreWatermarkSchema.parse(
         createAuthoritativeWatermark(),
@@ -202,14 +147,149 @@ function createFixture(
             pool: pool as any,
         }),
         restoreIndexReader,
+        undefined,
+        new RestoreRowMaterializationService(
+            artifactReader,
+            new NoopRestoreTargetStateLookup(),
+        ),
+    );
+    const jobs = new RestoreJobService(
+        new RestoreLockManager(),
+        sourceRegistry,
+        now,
+        new PostgresRestoreJobStateStore('postgres://unused', {
+            pool: pool as any,
+        }),
+        undefined,
+        {
+            async getFinalizedPlan(planId: string) {
+                const plan = await plans.getPlan(planId);
+
+                if (!plan) {
+                    return null;
+                }
+
+                return {
+                    plan_hash: plan.plan.plan_hash,
+                    plan_id: plan.plan.plan_id,
+                };
+            },
+        },
     );
 
     return {
+        artifactReader,
         close: async () => {
             await pool.end();
         },
         jobs,
         plans,
+        restoreIndexReader,
+    };
+}
+
+function seedScopeMaterializationCandidate(input: {
+    artifactReader: InMemoryRestoreArtifactBodyReader;
+    indexReader: InMemoryRestoreIndexStateReader;
+    offset: string;
+    rowId: string;
+}): void {
+    const artifactKey = `rez/restore/event=evt-${input.rowId}.artifact.json`;
+    const manifestKey = `rez/restore/event=evt-${input.rowId}.manifest.json`;
+
+    input.indexReader.upsertIndexedEventCandidate({
+        artifactKey,
+        eventId: `evt-${input.rowId}`,
+        eventTime: '2026-02-18T15:29:59.000Z',
+        instanceId: 'sn-dev-01',
+        manifestKey,
+        offset: input.offset,
+        partition: 1,
+        recordSysId: `rec-${input.rowId}`,
+        source: 'sn://acme-dev.service-now.com',
+        sysModCount: 2,
+        sysUpdatedOn: '2026-02-18 15:29:59',
+        table: 'incident',
+        tenantId: 'tenant-acme',
+        topic: 'rez.cdc',
+    });
+    input.artifactReader.setArtifactBody({
+        artifactKey,
+        body: {
+            __op: 'U',
+            __schema_version: 3,
+            __type: 'cdc.write',
+            row_enc: {
+                alg: 'AES-256-CBC',
+                module: 'x_rezrp_rezilient.encrypter',
+                format: 'kmf',
+                compression: 'none',
+                ciphertext: `cipher-${input.rowId}`,
+            },
+        },
+        manifestKey,
+    });
+}
+
+async function createPlanAndJob(
+    fixture: Fixture,
+    planId: string,
+    offset: string,
+): Promise<{
+    jobId: string;
+    planHash: string;
+}> {
+    seedScopeMaterializationCandidate({
+        artifactReader: fixture.artifactReader,
+        indexReader: fixture.restoreIndexReader,
+        offset,
+        rowId: planId,
+    });
+
+    const dryRun = await fixture.plans.createDryRunPlan(
+        createScopeDrivenDryRunRequest(planId, planId),
+        claims(),
+    );
+
+    assert.equal(dryRun.success, true);
+    if (!dryRun.success) {
+        throw new Error('failed to create dry-run plan fixture');
+    }
+    assert.equal(dryRun.reconciliation_state, 'draft');
+
+    const finalized = await fixture.plans.finalizeTargetReconciliation(
+        planId,
+        {
+            finalized_by: 'sn-worker',
+            reconciled_records: [
+                {
+                    table: 'incident',
+                    record_sys_id: `rec-${planId}`,
+                    target_state: 'exists' as const,
+                },
+            ],
+        },
+        claims(),
+    );
+
+    assert.equal(finalized.success, true);
+    if (!finalized.success) {
+        throw new Error('failed to finalize dry-run plan fixture');
+    }
+
+    const job = await fixture.jobs.createJob(
+        createJobRequest(planId, finalized.record.plan.plan_hash),
+        claims(),
+    );
+
+    assert.equal(job.success, true);
+    if (!job.success) {
+        throw new Error('failed to create restore job fixture');
+    }
+
+    return {
+        jobId: job.job.job_id,
+        planHash: finalized.record.plan.plan_hash,
     };
 }
 
@@ -220,41 +300,23 @@ test('durable core state survives restart for plans/jobs/events/locks', async ()
     let restarted: Fixture | null = null;
 
     try {
-        const dryRun = await first.plans.createDryRunPlan(
-            createDryRunRequest('plan-stage10-restart'),
-            claims(),
+        const running = await createPlanAndJob(
+            first,
+            'plan-stage10-restart',
+            '101',
         );
-
-        assert.equal(dryRun.success, true);
-        if (!dryRun.success) {
-            return;
-        }
-
-        const running = await first.jobs.createJob(
-            createJobRequest(
-                'plan-stage10-restart',
-                dryRun.record.plan.plan_hash,
-            ),
-            claims(),
+        const queued = await createPlanAndJob(
+            first,
+            'plan-stage10-queued',
+            '102',
         );
-        const queued = await first.jobs.createJob(
-            createJobRequest(
-                'plan-stage10-queued',
-                'b'.repeat(64),
-            ),
-            claims(),
-        );
-
-        assert.equal(running.success, true);
-        assert.equal(queued.success, true);
-        if (!running.success || !queued.success) {
-            return;
-        }
 
         restarted = createFixture(db);
-        const planAfterRestart = await restarted.plans.getPlan('plan-stage10-restart');
-        const runningAfterRestart = await restarted.jobs.getJob(running.job.job_id);
-        const queuedAfterRestart = await restarted.jobs.getJob(queued.job.job_id);
+        const planAfterRestart = await restarted.plans.getPlan(
+            'plan-stage10-restart',
+        );
+        const runningAfterRestart = await restarted.jobs.getJob(running.jobId);
+        const queuedAfterRestart = await restarted.jobs.getJob(queued.jobId);
 
         assert.notEqual(planAfterRestart, null);
         assert.notEqual(runningAfterRestart, null);
@@ -271,8 +333,8 @@ test('durable core state survives restart for plans/jobs/events/locks', async ()
         assert.equal(runningAfterRestart?.status, 'running');
         assert.equal(queuedAfterRestart?.status, 'queued');
 
-        const runningEvents = await restarted.jobs.listJobEvents(running.job.job_id);
-        const queuedEvents = await restarted.jobs.listJobEvents(queued.job.job_id);
+        const runningEvents = await restarted.jobs.listJobEvents(running.jobId);
+        const queuedEvents = await restarted.jobs.listJobEvents(queued.jobId);
 
         assert.equal(runningEvents.length >= 2, true);
         assert.equal(queuedEvents.length >= 2, true);
@@ -281,14 +343,14 @@ test('durable core state survives restart for plans/jobs/events/locks', async ()
 
         assert.deepEqual(
             lockSnapshot.running.map((entry) => entry.jobId),
-            [running.job.job_id],
+            [running.jobId],
         );
         assert.deepEqual(
             lockSnapshot.queued.map((entry) => entry.jobId),
-            [queued.job.job_id],
+            [queued.jobId],
         );
 
-        const completion = await restarted.jobs.completeJob(running.job.job_id, {
+        const completion = await restarted.jobs.completeJob(running.jobId, {
             status: 'completed',
         });
 
@@ -297,8 +359,8 @@ test('durable core state survives restart for plans/jobs/events/locks', async ()
             return;
         }
 
-        assert.deepEqual(completion.promoted_job_ids, [queued.job.job_id]);
-        const promoted = await restarted.jobs.getJob(queued.job.job_id);
+        assert.deepEqual(completion.promoted_job_ids, [queued.jobId]);
+        const promoted = await restarted.jobs.getJob(queued.jobId);
 
         assert.equal(promoted?.status, 'running');
     } finally {
@@ -318,32 +380,20 @@ test('lock queue preserves FIFO promotion order across restart', async () => {
     let restartedTwice: Fixture | null = null;
 
     try {
-        const firstJob = await first.jobs.createJob(
-            createJobRequest('plan-fair-01', 'c'.repeat(64)),
-            claims(),
-        );
-        const secondJob = await first.jobs.createJob(
-            createJobRequest('plan-fair-02', 'd'.repeat(64)),
-            claims(),
-        );
-        const thirdJob = await first.jobs.createJob(
-            createJobRequest('plan-fair-03', 'e'.repeat(64)),
-            claims(),
-        );
+        const firstJob = await createPlanAndJob(first, 'plan-fair-01', '201');
+        const secondJob = await createPlanAndJob(first, 'plan-fair-02', '202');
+        const thirdJob = await createPlanAndJob(first, 'plan-fair-03', '203');
 
-        assert.equal(firstJob.success, true);
-        assert.equal(secondJob.success, true);
-        assert.equal(thirdJob.success, true);
-        if (!firstJob.success || !secondJob.success || !thirdJob.success) {
-            return;
-        }
+        const firstJobRecord = await first.jobs.getJob(firstJob.jobId);
+        const secondJobRecord = await first.jobs.getJob(secondJob.jobId);
+        const thirdJobRecord = await first.jobs.getJob(thirdJob.jobId);
 
-        assert.equal(firstJob.job.status, 'running');
-        assert.equal(secondJob.job.status, 'queued');
-        assert.equal(thirdJob.job.status, 'queued');
+        assert.equal(firstJobRecord?.status, 'running');
+        assert.equal(secondJobRecord?.status, 'queued');
+        assert.equal(thirdJobRecord?.status, 'queued');
 
         restartedOnce = createFixture(db);
-        const firstCompletion = await restartedOnce.jobs.completeJob(firstJob.job.job_id, {
+        const firstCompletion = await restartedOnce.jobs.completeJob(firstJob.jobId, {
             status: 'completed',
         });
 
@@ -352,10 +402,10 @@ test('lock queue preserves FIFO promotion order across restart', async () => {
             return;
         }
 
-        assert.deepEqual(firstCompletion.promoted_job_ids, [secondJob.job.job_id]);
+        assert.deepEqual(firstCompletion.promoted_job_ids, [secondJob.jobId]);
 
         restartedTwice = createFixture(db);
-        const secondCompletion = await restartedTwice.jobs.completeJob(secondJob.job.job_id, {
+        const secondCompletion = await restartedTwice.jobs.completeJob(secondJob.jobId, {
             status: 'completed',
         });
 
@@ -364,8 +414,8 @@ test('lock queue preserves FIFO promotion order across restart', async () => {
             return;
         }
 
-        assert.deepEqual(secondCompletion.promoted_job_ids, [thirdJob.job.job_id]);
-        const thirdAfterPromotion = await restartedTwice.jobs.getJob(thirdJob.job.job_id);
+        assert.deepEqual(secondCompletion.promoted_job_ids, [thirdJob.jobId]);
+        const thirdAfterPromotion = await restartedTwice.jobs.getJob(thirdJob.jobId);
 
         assert.equal(thirdAfterPromotion?.status, 'running');
     } finally {

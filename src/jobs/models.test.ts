@@ -130,15 +130,45 @@ describe('normalizeIsoWithMillis', () => {
 describe('buildApprovalPlaceholder', () => {
     test('returns correct structure', () => {
         const result = buildApprovalPlaceholder();
-        assert.equal(result.approval_required, false);
-        assert.equal(
-            result.approval_state,
-            'placeholder_not_enforced',
-        );
-        assert.equal(
-            result.approval_placeholder_mode,
-            'mvp_not_enforced',
-        );
+        assert.deepEqual(result, {
+            approval_required: false,
+            approval_state: 'placeholder_not_enforced',
+            approval_decision: 'placeholder',
+            approval_decision_reason:
+                'approval enforcement is not configured in this stage',
+            approval_revalidation_result: 'not_applicable',
+            approval_placeholder_mode: 'mvp_not_enforced',
+        });
+    });
+
+    test('sanitizes caller-supplied approval metadata', () => {
+        const result = buildApprovalPlaceholder({
+            approval_required: true,
+            approval_state: 'approved',
+            approval_policy_id: 'policy-1',
+            approval_requested_at: '2026-02-16T10:00:00.000Z',
+            approval_requested_by: 'requester@example.com',
+            approval_decided_at: '2026-02-16T11:00:00.000Z',
+            approval_decided_by: 'approver@example.com',
+            approval_decision: 'approve',
+            approval_decision_reason: 'approved externally',
+            approval_external_ref: 'ticket-123',
+            approval_snapshot_hash: 'a'.repeat(64),
+            approval_valid_until: '2026-02-17T12:00:00.000Z',
+            approval_revalidated_at: '2026-02-16T11:30:00.000Z',
+            approval_revalidation_result: 'valid',
+            approval_placeholder_mode: 'mvp_not_enforced',
+        });
+
+        assert.deepEqual(result, {
+            approval_required: false,
+            approval_state: 'placeholder_not_enforced',
+            approval_decision: 'placeholder',
+            approval_decision_reason:
+                'caller-supplied approval metadata is unverified',
+            approval_revalidation_result: 'not_applicable',
+            approval_placeholder_mode: 'mvp_not_enforced',
+        });
     });
 });
 

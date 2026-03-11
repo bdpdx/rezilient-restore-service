@@ -13,7 +13,10 @@ import {
     RestoreJobRecord,
 } from '../jobs/models';
 import { RestoreJobService } from '../jobs/job-service';
-import { RestoreDryRunPlanRecord } from '../plans/models';
+import {
+    buildApprovalPlaceholder,
+    RestoreDryRunPlanRecord,
+} from '../plans/models';
 import { RestorePlanService } from '../plans/plan-service';
 import {
     InMemoryRestoreEvidenceStateStore,
@@ -281,11 +284,15 @@ export class RestoreEvidenceService {
         const events = await this.jobs.listJobEvents(jobId);
         const generatedAt = normalizeIsoWithMillis(this.now());
         const evidenceId = buildEvidenceId(job, execution.completed_at);
+        const approval = buildApprovalPlaceholder(plan.plan.approval);
         const artifacts = [
             toArtifactRecord({
                 artifact_id: 'plan.json',
                 payload: {
-                    plan: plan.plan,
+                    plan: {
+                        ...plan.plan,
+                        approval,
+                    },
                     plan_hash_input: plan.plan_hash_input,
                     gate: plan.gate,
                     delete_candidates: plan.delete_candidates,
@@ -351,7 +358,7 @@ export class RestoreEvidenceService {
                 worm_enabled: this.config.immutable_storage.worm_enabled,
                 retention_class: this.config.immutable_storage.retention_class,
             },
-            approval: plan.plan.approval,
+            approval,
         };
         const reportHash = toSha256Hex(
             canonicalJsonStringify(withoutUndefined(reportHashInput)),

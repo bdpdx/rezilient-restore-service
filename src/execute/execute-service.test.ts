@@ -1,14 +1,33 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { RestoreWatermark as RestoreWatermarkSchema } from '@rezilient/types';
+import {
+    computeRestorePlanHash,
+    PLAN_HASH_ALGORITHM,
+    PLAN_HASH_INPUT_VERSION,
+    RESTORE_CONTRACT_VERSION,
+    RESTORE_METADATA_ALLOWLIST_VERSION,
+    RestorePlan as RestorePlanSchema,
+    RestoreWatermark as RestoreWatermarkSchema,
+} from '@rezilient/types';
 import { RestoreJobService } from '../jobs/job-service';
 import { RestoreLockManager } from '../locks/lock-manager';
+import {
+    buildApprovalPlaceholder,
+    buildPlanHashInput,
+    type CreateDryRunPlanRequest,
+    type RestoreDryRunPlanRecord,
+} from '../plans/models';
 import { RestorePlanService } from '../plans/plan-service';
+import { InMemoryRestorePlanStateStore } from '../plans/plan-state-store';
 import {
     InMemoryRestoreArtifactBodyReader,
     RestoreRowMaterializationService,
 } from '../plans/materialization-service';
-import { NoopRestoreTargetStateLookup } from '../plans/target-reconciliation';
+import {
+    InMemoryRestoreTargetStateLookup,
+    NoopRestoreTargetStateLookup,
+    type RestoreTargetStateLookup,
+} from '../plans/target-reconciliation';
 import { SourceRegistry } from '../registry/source-registry';
 import { InMemoryRestoreIndexStateReader } from '../restore-index/state-reader';
 import { RestoreExecutionService } from './execute-service';
@@ -26,9 +45,6 @@ import type {
 import { NoopRestoreTargetWriter } from './models';
 
 const FIXED_NOW = new Date('2026-02-16T12:00:00.000Z');
-const LEGACY_ROWS_COMPAT_OPTIONS = {
-    allowLegacyRowsCompat: true,
-} as const;
 
 function now(): Date {
     return new Date(FIXED_NOW.getTime());
@@ -219,73 +235,6 @@ function createMediaCandidate(
     return candidate;
 }
 
-function createDryRunPayload(
-    planId: string,
-    rows: ReturnType<typeof createRow>[],
-    conflicts?: Record<string, unknown>[],
-    mediaCandidates?: Record<string, unknown>[],
-) {
-    return {
-        tenant_id: 'tenant-acme',
-        instance_id: 'sn-dev-01',
-        source: 'sn://acme-dev.service-now.com',
-        plan_id: planId,
-        requested_by: 'operator@example.com',
-        pit: {
-            restore_time: '2026-02-16T12:00:00.000Z',
-            restore_timezone: 'UTC',
-            pit_algorithm_version:
-                'pit.v1.sys_updated_on-sys_mod_count-__time-event_id',
-            tie_breaker: [
-                'sys_updated_on',
-                'sys_mod_count',
-                '__time',
-                'event_id',
-            ],
-            tie_breaker_fallback: [
-                'sys_updated_on',
-                '__time',
-                'event_id',
-            ],
-        },
-        scope: {
-            mode: 'record',
-            tables: ['incident'],
-            encoded_query: 'active=true',
-        },
-        execution_options: {
-            missing_row_mode: 'existing_only',
-            conflict_policy: 'review_required',
-            schema_compatibility_mode: 'compatible_only',
-            workflow_mode: 'suppressed_default',
-        },
-        rows,
-        conflicts: conflicts || [],
-        delete_candidates: [],
-        media_candidates: mediaCandidates || [],
-        watermarks: [
-            {
-                contract_version: 'restore.contracts.v1',
-                tenant_id: 'tenant-acme',
-                instance_id: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-                topic: 'rez.cdc',
-                partition: 1,
-                generation_id: 'gen-01',
-                indexed_through_offset: '100',
-                indexed_through_time: '2026-02-16T12:00:00.000Z',
-                coverage_start: '2026-02-16T00:00:00.000Z',
-                coverage_end: '2026-02-16T12:00:00.000Z',
-                freshness: 'fresh',
-                executability: 'executable',
-                reason_code: 'none',
-                measured_at: '2026-02-16T12:00:00.000Z',
-            },
-        ],
-        pit_candidates: [],
-    };
-}
-
 function createScopeDrivenDryRunPayload(
     planId: string,
     scopeOverrides?: Record<string, unknown>,
@@ -395,6 +344,134 @@ function createAuthoritativeWatermark(): Record<string, unknown> {
     };
 }
 
+function buildActionCounts(
+    rows: ReturnType<typeof createRow>[],
+    conflicts: Record<string, unknown>[],
+    mediaCandidates: Record<string, unknown>[],
+) {
+    const counts = {
+        update: 0,
+        insert: 0,
+        delete: 0,
+        skip: 0,
+        conflict: conflicts.length,
+        attachment_apply: 0,
+        attachment_skip: 0,
+    };
+
+    for (const row of rows) {
+        counts[row.action] += 1;
+    }
+
+    for (const candidate of mediaCandidates) {
+        if (candidate.decision === 'include') {
+            counts.attachment_apply += 1;
+        } else if (candidate.decision === 'exclude') {
+            counts.attachment_skip += 1;
+        }
+    }
+
+    return counts;
+}
+
+function buildFinalizedPlanRecord(
+    planId: string,
+    rows: ReturnType<typeof createRow>[],
+    conflicts: Record<string, unknown>[] = [],
+    mediaCandidates: Record<string, unknown>[] = [],
+): RestoreDryRunPlanRecord {
+    const request: CreateDryRunPlanRequest = {
+        input_mode: 'scope_driven',
+        tenant_id: 'tenant-acme',
+        instance_id: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        plan_id: planId,
+        requested_by: 'operator@example.com',
+        pit: {
+            restore_time: '2026-02-16T12:00:00.000Z',
+            restore_timezone: 'UTC',
+            pit_algorithm_version:
+                'pit.v1.sys_updated_on-sys_mod_count-__time-event_id',
+            tie_breaker: [
+                'sys_updated_on',
+                'sys_mod_count',
+                '__time',
+                'event_id',
+            ],
+            tie_breaker_fallback: [
+                'sys_updated_on',
+                '__time',
+                'event_id',
+            ],
+        },
+        scope: {
+            mode: 'record',
+            tables: ['incident'],
+            record_sys_ids: rows.map((row) => row.record_sys_id),
+        },
+        execution_options: {
+            missing_row_mode: 'existing_only',
+            conflict_policy: 'review_required',
+            schema_compatibility_mode: 'compatible_only',
+            workflow_mode: 'suppressed_default',
+        },
+        rows: rows as CreateDryRunPlanRequest['rows'],
+        conflicts: conflicts as CreateDryRunPlanRequest['conflicts'],
+        delete_candidates: [],
+        media_candidates:
+            mediaCandidates as CreateDryRunPlanRequest['media_candidates'],
+        watermarks: [{
+            topic: 'rez.cdc',
+            partition: 1,
+        }],
+        pit_candidates: [],
+        approval: buildApprovalPlaceholder(),
+    };
+    const actionCounts = buildActionCounts(rows, conflicts, mediaCandidates);
+    const planHashInput = buildPlanHashInput(request, actionCounts);
+    const planHashData = computeRestorePlanHash(planHashInput);
+    const watermark = RestoreWatermarkSchema.parse(
+        createAuthoritativeWatermark(),
+    );
+
+    return {
+        tenant_id: request.tenant_id,
+        instance_id: request.instance_id,
+        source: request.source,
+        plan: RestorePlanSchema.parse({
+            contract_version: RESTORE_CONTRACT_VERSION,
+            plan_id: request.plan_id,
+            plan_hash: planHashData.plan_hash,
+            plan_hash_algorithm: PLAN_HASH_ALGORITHM,
+            plan_hash_input_version: PLAN_HASH_INPUT_VERSION,
+            generated_at: '2026-02-16T12:00:00.000Z',
+            pit: request.pit,
+            scope: request.scope,
+            execution_options: request.execution_options,
+            action_counts: actionCounts,
+            conflicts: request.conflicts,
+            approval: buildApprovalPlaceholder(),
+            metadata_allowlist_version: RESTORE_METADATA_ALLOWLIST_VERSION,
+        }),
+        plan_hash_input: planHashInput,
+        gate: {
+            executability: 'executable',
+            reason_code: 'none',
+            unresolved_delete_candidates: 0,
+            unresolved_media_candidates: 0,
+            unresolved_hard_block_conflicts: 0,
+            stale_partition_count: 0,
+            unknown_partition_count: 0,
+        },
+        delete_candidates: [],
+        media_candidates:
+            JSON.parse(JSON.stringify(mediaCandidates)) as
+            RestoreDryRunPlanRecord['media_candidates'],
+        pit_resolutions: [],
+        watermarks: [watermark],
+    };
+}
+
 async function buildFixture(options?: {
     executeConfig?: {
         defaultChunkSize?: number;
@@ -411,6 +488,7 @@ async function buildFixture(options?: {
     requiredCapabilities?: string[];
     targetWriter?: RestoreTargetWriter;
     stateStore?: RestoreExecutionStateStore;
+    targetStateLookup?: RestoreTargetStateLookup;
 }) {
     const registry = new SourceRegistry([
         {
@@ -419,6 +497,7 @@ async function buildFixture(options?: {
             source: 'sn://acme-dev.service-now.com',
         },
     ]);
+    const planState = new InMemoryRestorePlanStateStore();
     const restoreIndexReader = new InMemoryRestoreIndexStateReader();
 
     restoreIndexReader.upsertWatermark(RestoreWatermarkSchema.parse(
@@ -428,16 +507,31 @@ async function buildFixture(options?: {
     const plans = new RestorePlanService(
         registry,
         now,
-        undefined,
+        planState,
         restoreIndexReader,
         undefined,
         undefined,
-        LEGACY_ROWS_COMPAT_OPTIONS,
     );
     const jobs = new RestoreJobService(
         new RestoreLockManager(),
         registry,
         now,
+        undefined,
+        undefined,
+        {
+            async getFinalizedPlan(planId: string) {
+                const plan = await plans.getPlan(planId);
+
+                if (!plan) {
+                    return null;
+                }
+
+                return {
+                    plan_id: plan.plan.plan_id,
+                    plan_hash: plan.plan.plan_hash,
+                };
+            },
+        },
     );
     const execute = new RestoreExecutionService(
         jobs,
@@ -446,33 +540,29 @@ async function buildFixture(options?: {
         now,
         options?.stateStore,
         options?.targetWriter || new NoopRestoreTargetWriter(),
+        options?.targetStateLookup || new NoopRestoreTargetStateLookup(),
     );
     const planRows = options?.rows || [
         createRow('row-01'),
         createRow('row-02'),
     ];
-    const plan = await plans.createDryRunPlan(
-        createDryRunPayload(
-            'plan-1',
-            planRows,
-            undefined,
-            options?.mediaCandidates,
-        ),
-        claims(),
+    const plan = buildFinalizedPlanRecord(
+        'plan-1',
+        planRows,
+        [],
+        options?.mediaCandidates || [],
     );
-
-    assert.equal(plan.success, true);
-    if (!plan.success) {
-        throw new Error('failed to create dry-run plan fixture');
-    }
+    await planState.mutate((state) => {
+        state.plans_by_id[plan.plan.plan_id] = plan;
+    });
 
     const job = await jobs.createJob(
         {
             tenant_id: 'tenant-acme',
             instance_id: 'sn-dev-01',
             source: 'sn://acme-dev.service-now.com',
-            plan_id: plan.record.plan.plan_id,
-            plan_hash: plan.record.plan.plan_hash,
+            plan_id: plan.plan.plan_id,
+            plan_hash: plan.plan.plan_hash,
             lock_scope_tables: ['incident'],
             required_capabilities: options?.requiredCapabilities || [
                 'restore_execute',
@@ -496,6 +586,11 @@ async function buildFixture(options?: {
 async function buildScopeDrivenFixture(): Promise<{
     execute: RestoreExecutionService;
     jobId: string;
+    materializedRows: Array<{
+        action: 'delete' | 'insert' | 'skip' | 'update';
+        record_sys_id: string;
+    }>;
+    targetWriter: RecordingTargetWriter;
 }> {
     const registry = new SourceRegistry([
         {
@@ -540,23 +635,67 @@ async function buildScopeDrivenFixture(): Promise<{
         new RestoreLockManager(),
         registry,
         now,
+        undefined,
+        undefined,
+        {
+            async getFinalizedPlan(planId: string) {
+                const plan = await plans.getPlan(planId);
+
+                if (!plan) {
+                    return null;
+                }
+
+                return {
+                    plan_id: plan.plan.plan_id,
+                    plan_hash: plan.plan.plan_hash,
+                };
+            },
+        },
     );
+    const targetWriter = new RecordingTargetWriter();
     const execute = new RestoreExecutionService(
         jobs,
         plans,
         undefined,
         now,
         undefined,
-        new NoopRestoreTargetWriter(),
+        targetWriter,
+        new NoopRestoreTargetStateLookup(),
     );
-    const plan = await plans.createDryRunPlan(
+    const draft = await plans.createDryRunPlan(
         createScopeDrivenDryRunPayload('plan-scope-exec'),
         claims(),
     );
 
-    assert.equal(plan.success, true);
-    if (!plan.success) {
+    assert.equal(draft.success, true);
+    if (!draft.success) {
         throw new Error('failed to create scope-driven dry-run plan fixture');
+    }
+    assert.equal(draft.reconciliation_state, 'draft');
+
+    const finalized = await plans.finalizeTargetReconciliation(
+        'plan-scope-exec',
+        {
+            finalized_by: 'sn-worker',
+            reconciled_records: [
+                {
+                    table: 'incident',
+                    record_sys_id: 'rec-scope-delete',
+                    target_state: 'exists',
+                },
+                {
+                    table: 'incident',
+                    record_sys_id: 'rec-scope-update',
+                    target_state: 'exists',
+                },
+            ],
+        },
+        claims(),
+    );
+
+    assert.equal(finalized.success, true);
+    if (!finalized.success) {
+        throw new Error('failed to finalize scope-driven dry-run fixture');
     }
 
     const job = await jobs.createJob(
@@ -564,10 +703,10 @@ async function buildScopeDrivenFixture(): Promise<{
             tenant_id: 'tenant-acme',
             instance_id: 'sn-dev-01',
             source: 'sn://acme-dev.service-now.com',
-            plan_id: plan.record.plan.plan_id,
-            plan_hash: plan.record.plan.plan_hash,
+            plan_id: finalized.record.plan.plan_id,
+            plan_hash: finalized.record.plan.plan_hash,
             lock_scope_tables: ['incident'],
-            required_capabilities: ['restore_execute'],
+            required_capabilities: ['restore_delete', 'restore_execute'],
             requested_by: 'operator@example.com',
         },
         claims(),
@@ -581,6 +720,11 @@ async function buildScopeDrivenFixture(): Promise<{
     return {
         execute,
         jobId: job.job.job_id,
+        materializedRows: finalized.record.plan_hash_input.rows.map((row) => ({
+            action: row.action,
+            record_sys_id: row.record_sys_id,
+        })),
+        targetWriter,
     };
 }
 
@@ -592,18 +736,28 @@ test(
             fixture.jobId,
             {
                 operator_id: 'operator@example.com',
-                operator_capabilities: ['restore_execute'],
+                operator_capabilities: ['restore_delete', 'restore_execute'],
             },
             claims(),
         );
 
-        assert.equal(result.success, false);
-        if (result.success) {
+        assert.equal(result.success, true);
+        if (!result.success) {
             return;
         }
 
-        assert.equal(result.statusCode, 409);
-        assert.match(result.message, /plan/i);
+        assert.equal(result.statusCode, 200);
+        assert.equal(result.record.status, 'completed');
+        assert.equal(result.record.summary.applied_rows, 2);
+
+        for (const row of fixture.materializedRows) {
+            assert.equal(
+                fixture.targetWriter.appliedActionsByRecord.get(
+                    row.record_sys_id,
+                ),
+                row.action,
+            );
+        }
     },
 );
 
@@ -1388,6 +1542,97 @@ test('duplicate resume attempts are idempotent after completion', async () => {
     assert.equal(third.record.resume_attempt_count, 2);
 });
 
+test('resume fails when persisted checkpoint_id does not match row cursor', async () => {
+    const stateStore = new InMemoryRestoreExecutionStateStore();
+    const fixture = await buildFixture({
+        executeConfig: {
+            maxChunksPerAttempt: 1,
+        },
+        stateStore,
+    });
+    const first = await fixture.execute.executeJob(
+        fixture.jobId,
+        {
+            operator_id: 'operator@example.com',
+            operator_capabilities: ['restore_execute'],
+            chunk_size: 1,
+        },
+        claims(),
+    );
+
+    assert.equal(first.success, true);
+    if (!first.success) {
+        return;
+    }
+
+    await stateStore.mutate((state) => {
+        const record = state.records_by_job_id[fixture.jobId];
+
+        if (!record) {
+            throw new Error('missing execution record in test fixture');
+        }
+
+        record.checkpoint.checkpoint_id = 'chk_tampered';
+    });
+
+    const resumed = await fixture.execute.resumeJob(
+        fixture.jobId,
+        {
+            operator_id: 'operator@example.com',
+            operator_capabilities: ['restore_execute'],
+            expected_plan_checksum: first.record.plan_checksum,
+            expected_precondition_checksum: first.record.precondition_checksum,
+        },
+        claims(),
+    );
+
+    assert.equal(resumed.success, false);
+    if (resumed.success) {
+        return;
+    }
+
+    assert.equal(resumed.statusCode, 409);
+    assert.equal(resumed.error, 'resume_checkpoint_mismatch');
+    assert.equal(
+        resumed.reasonCode,
+        'blocked_resume_precondition_mismatch',
+    );
+    assert.match(resumed.message, /checkpoint_id/i);
+});
+
+test('execute blocks when execute-time target revalidation detects drift', async () => {
+    const targetStateLookup = new InMemoryRestoreTargetStateLookup();
+
+    targetStateLookup.setTargetRecordState({
+        record_sys_id: 'rec-row-01',
+        state: 'missing',
+        table: 'incident',
+    });
+
+    const fixture = await buildFixture({
+        rows: [createRow('row-01', 'update')],
+        targetStateLookup,
+    });
+    const result = await fixture.execute.executeJob(
+        fixture.jobId,
+        {
+            operator_id: 'operator@example.com',
+            operator_capabilities: ['restore_execute'],
+        },
+        claims(),
+    );
+
+    assert.equal(result.success, false);
+    if (result.success) {
+        return;
+    }
+
+    assert.equal(result.statusCode, 409);
+    assert.equal(result.error, 'target_revalidation_failed');
+    assert.equal(result.reasonCode, 'blocked_reference_conflict');
+    assert.match(result.message, /target revalidation/i);
+});
+
 test('rollback journal includes authoritative entries and SN mirror linkage', async () => {
     const fixture = await buildFixture({
         executeConfig: {
@@ -1424,16 +1669,34 @@ test('rollback journal includes authoritative entries and SN mirror linkage', as
 test('executeJob rejects when job not in running state', async () => {
     const fixture = await buildFixture();
 
+    const sourceRegistry = new SourceRegistry([
+        {
+            tenantId: 'tenant-acme',
+            instanceId: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+        },
+    ]);
+    const planState = new InMemoryRestorePlanStateStore();
     const jobService = new RestoreJobService(
         new RestoreLockManager(),
-        new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]),
+        sourceRegistry,
         now,
+        undefined,
+        undefined,
+        {
+            async getFinalizedPlan(planId: string) {
+                const plan = await plans.getPlan(planId);
+
+                if (!plan) {
+                    return null;
+                }
+
+                return {
+                    plan_id: plan.plan.plan_id,
+                    plan_hash: plan.plan.plan_hash,
+                };
+            },
+        },
     );
     const restoreIndexReader =
         new InMemoryRestoreIndexStateReader();
@@ -1443,37 +1706,26 @@ test('executeJob rejects when job not in running state', async () => {
         ),
     );
     const plans = new RestorePlanService(
-        new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]),
+        sourceRegistry,
         now,
-        undefined,
+        planState,
         restoreIndexReader,
         undefined,
         undefined,
-        LEGACY_ROWS_COMPAT_OPTIONS,
     );
-    const plan = await plans.createDryRunPlan(
-        createDryRunPayload('plan-paused', [
-            createRow('row-01'),
-        ]),
-        claims(),
-    );
-    assert.equal(plan.success, true);
-    if (!plan.success) {
-        return;
-    }
+    const plan = buildFinalizedPlanRecord('plan-paused', [
+        createRow('row-01'),
+    ]);
+    await planState.mutate((state) => {
+        state.plans_by_id[plan.plan.plan_id] = plan;
+    });
     const job = await jobService.createJob(
         {
             tenant_id: 'tenant-acme',
             instance_id: 'sn-dev-01',
             source: 'sn://acme-dev.service-now.com',
-            plan_id: plan.record.plan.plan_id,
-            plan_hash: plan.record.plan.plan_hash,
+            plan_id: plan.plan.plan_id,
+            plan_hash: plan.plan.plan_hash,
             lock_scope_tables: ['incident'],
             required_capabilities: ['restore_execute'],
             requested_by: 'operator@example.com',
@@ -1523,7 +1775,24 @@ test('executeJob rejects when plan not found', async () => {
         new RestoreLockManager(),
         registry,
         now,
+        undefined,
+        undefined,
+        {
+            async getFinalizedPlan(planId: string) {
+                const plan = await planService.getPlan(planId);
+
+                if (!plan) {
+                    return null;
+                }
+
+                return {
+                    plan_id: plan.plan.plan_id,
+                    plan_hash: plan.plan.plan_hash,
+                };
+            },
+        },
     );
+    const planState = new InMemoryRestorePlanStateStore();
     const restoreIndexReader =
         new InMemoryRestoreIndexStateReader();
     restoreIndexReader.upsertWatermark(
@@ -1534,29 +1803,24 @@ test('executeJob rejects when plan not found', async () => {
     const planService = new RestorePlanService(
         registry,
         now,
-        undefined,
+        planState,
         restoreIndexReader,
         undefined,
         undefined,
-        LEGACY_ROWS_COMPAT_OPTIONS,
     );
-    const plan = await planService.createDryRunPlan(
-        createDryRunPayload('plan-exec-missing', [
-            createRow('row-01'),
-        ]),
-        claims(),
-    );
-    assert.equal(plan.success, true);
-    if (!plan.success) {
-        return;
-    }
+    const plan = buildFinalizedPlanRecord('plan-exec-missing', [
+        createRow('row-01'),
+    ]);
+    await planState.mutate((state) => {
+        state.plans_by_id[plan.plan.plan_id] = plan;
+    });
     const job = await jobService.createJob(
         {
             tenant_id: 'tenant-acme',
             instance_id: 'sn-dev-01',
             source: 'sn://acme-dev.service-now.com',
-            plan_id: plan.record.plan.plan_id,
-            plan_hash: plan.record.plan.plan_hash,
+            plan_id: plan.plan.plan_id,
+            plan_hash: plan.plan.plan_hash,
             lock_scope_tables: ['incident'],
             required_capabilities: ['restore_execute'],
             requested_by: 'operator@example.com',
@@ -1644,6 +1908,38 @@ test('getCheckpoint returns null for unknown job', async () => {
     );
 
     assert.equal(result, null);
+});
+
+test('claim blocks when execute-time target revalidation fails', async () => {
+    const targetStateLookup = new InMemoryRestoreTargetStateLookup();
+
+    targetStateLookup.setTargetRecordState({
+        record_sys_id: 'rec-row-01',
+        state: 'missing',
+        table: 'incident',
+    });
+
+    const fixture = await buildFixture({
+        rows: [createRow('row-01', 'update')],
+        targetStateLookup,
+    });
+    const claim = await fixture.execute.claimBatch(
+        fixture.jobId,
+        {
+            operator_id: 'sn-worker',
+            max_rows: 1,
+        },
+        claims(),
+    );
+
+    assert.equal(claim.success, false);
+    if (claim.success) {
+        return;
+    }
+
+    assert.equal(claim.statusCode, 409);
+    assert.equal(claim.error, 'target_revalidation_failed');
+    assert.equal(claim.reasonCode, 'blocked_reference_conflict');
 });
 
 test(

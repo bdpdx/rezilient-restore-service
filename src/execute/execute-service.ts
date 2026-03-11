@@ -14,6 +14,14 @@ import { RestoreJobService } from '../jobs/job-service';
 import { RestoreDryRunPlanRecord } from '../plans/models';
 import { RestorePlanService } from '../plans/plan-service';
 import {
+    buildTargetStateLookupKey,
+    FailClosedRestoreTargetStateLookup,
+    reconcileSourceOperationWithTargetState,
+    type RestoreSourceOperation,
+    type RestoreTargetRecordState,
+    type RestoreTargetStateLookup,
+} from '../plans/target-reconciliation';
+import {
     InMemoryRestoreExecutionStateStore,
     RestoreExecutionStateStore,
 } from './execute-state-store';
@@ -206,6 +214,52 @@ function buildCommitFailure(
         reasonCode,
         message,
     };
+}
+
+function readSourceOperationFromRow(
+    row: RestorePlanHashRowInput,
+): RestoreSourceOperation | null {
+    const metadataContainer = (
+        row.metadata &&
+        typeof row.metadata === 'object'
+    )
+        ? row.metadata as {
+            metadata?: Record<string, unknown>;
+        }
+        : undefined;
+    const metadata = metadataContainer?.metadata;
+    const operation = metadata?.operation;
+
+    if (operation === 'D' || operation === 'I' || operation === 'U') {
+        return operation;
+    }
+
+    if (row.action === 'delete') {
+        return 'D';
+    }
+
+    if (row.action === 'insert') {
+        return 'I';
+    }
+
+    if (row.action === 'update') {
+        return 'U';
+    }
+
+    return null;
+}
+
+function isCheckpointIdValid(
+    record: RestoreExecutionRecord,
+): boolean {
+    const expectedCheckpointId = buildCheckpointId(
+        record.job_id,
+        record.plan_hash,
+        record.checkpoint.next_chunk_index,
+        record.checkpoint.next_row_index || 0,
+    );
+
+    return expectedCheckpointId === record.checkpoint.checkpoint_id;
 }
 
 function ensureScopeMatch(
@@ -646,6 +700,8 @@ export class RestoreExecutionService {
             new InMemoryRestoreExecutionStateStore(),
         private readonly targetWriter: RestoreTargetWriter =
             new FailClosedRestoreTargetWriter(),
+        private readonly targetStateLookup: RestoreTargetStateLookup =
+            new FailClosedRestoreTargetStateLookup(),
     ) {
         this.config = {
             ...DEFAULT_EXECUTE_CONFIG,
@@ -772,6 +828,21 @@ export class RestoreExecutionService {
             );
         }
 
+        const executeRevalidation = await this.revalidateExecuteTimeTargetStates({
+            job,
+            rows: plan.plan_hash_input.rows,
+        });
+
+        if (!executeRevalidation.ok) {
+            return buildFailure(
+                executeRevalidation.statusCode || 409,
+                executeRevalidation.error || 'target_revalidation_failed',
+                executeRevalidation.message ||
+                    'execute-time target revalidation failed',
+                executeRevalidation.reasonCode,
+            );
+        }
+
         const chunkSize = request.chunk_size || this.config.defaultChunkSize;
         const chunks = chunkRows(plan.plan_hash_input.rows, chunkSize);
         const startedAt = normalizeIsoWithMillis(this.now());
@@ -860,6 +931,19 @@ export class RestoreExecutionService {
                 'job_not_paused',
                 'job must be paused before resume',
                 'blocked_resume_checkpoint_missing',
+            );
+        }
+
+        const checkpointIntegrity = this.validateCheckpointIntegrity(existing);
+
+        if (!checkpointIntegrity.ok) {
+            return buildFailure(
+                checkpointIntegrity.failure?.statusCode || 409,
+                checkpointIntegrity.failure?.error ||
+                    'resume_checkpoint_mismatch',
+                checkpointIntegrity.failure?.message ||
+                    'checkpoint validation failed',
+                checkpointIntegrity.failure?.reasonCode,
             );
         }
 
@@ -989,6 +1073,21 @@ export class RestoreExecutionService {
             );
         }
 
+        const resumeRevalidation = await this.revalidateExecuteTimeTargetStates({
+            job,
+            rows: plan.plan_hash_input.rows,
+        });
+
+        if (!resumeRevalidation.ok) {
+            return buildFailure(
+                resumeRevalidation.statusCode || 409,
+                resumeRevalidation.error || 'target_revalidation_failed',
+                resumeRevalidation.message ||
+                    'execute-time target revalidation failed',
+                resumeRevalidation.reasonCode,
+            );
+        }
+
         const resume = await this.jobs.resumePausedJob(jobId);
 
         if (!resume.success) {
@@ -1111,6 +1210,19 @@ export class RestoreExecutionService {
             await this.persistExecutionDelta(job.job_id, record, [], []);
         }
 
+        const checkpointIntegrity = this.validateCheckpointIntegrity(record);
+
+        if (!checkpointIntegrity.ok) {
+            return buildClaimFailure(
+                checkpointIntegrity.failure?.statusCode || 409,
+                checkpointIntegrity.failure?.error ||
+                    'resume_checkpoint_mismatch',
+                checkpointIntegrity.failure?.message ||
+                    'checkpoint validation failed',
+                checkpointIntegrity.failure?.reasonCode,
+            );
+        }
+
         if (record.status === 'completed' || record.status === 'failed') {
             const response: ExecuteBatchClaimResponse = {
                 accepted: false,
@@ -1223,6 +1335,41 @@ export class RestoreExecutionService {
             };
         }
 
+        const rowsById = new Map(
+            plan.plan_hash_input.rows.map((row) => [row.row_id, row]),
+        );
+        const selectedPlanRows: RestorePlanHashRowInput[] = [];
+
+        for (const claimRow of selection.rows) {
+            const row = rowsById.get(claimRow.row_id);
+
+            if (!row) {
+                return buildClaimFailure(
+                    500,
+                    'claim_plan_mismatch',
+                    'claimed row is missing from persisted plan',
+                    'failed_internal_error',
+                );
+            }
+
+            selectedPlanRows.push(row);
+        }
+
+        const claimRevalidation = await this.revalidateExecuteTimeTargetStates({
+            job,
+            rows: selectedPlanRows,
+        });
+
+        if (!claimRevalidation.ok) {
+            return buildClaimFailure(
+                claimRevalidation.statusCode || 409,
+                claimRevalidation.error || 'target_revalidation_failed',
+                claimRevalidation.message ||
+                    'execute-time target revalidation failed',
+                claimRevalidation.reasonCode,
+            );
+        }
+
         const claimedAt = normalizeIsoWithMillis(this.now());
         const claimId = buildClaimId(
             job.job_id,
@@ -1273,9 +1420,6 @@ export class RestoreExecutionService {
             );
         }
 
-        const rowsById = new Map(
-            plan.plan_hash_input.rows.map((row) => [row.row_id, row]),
-        );
         const claimedRows: ExecuteBatchClaimedRow[] = [];
 
         for (const claimRow of selection.rows) {
@@ -1722,6 +1866,153 @@ export class RestoreExecutionService {
         return {
             journal_entries: cloneJournalEntries(journalEntries || []),
             sn_mirror_entries: cloneMirrorEntries(mirrorEntries || []),
+        };
+    }
+
+    private validateCheckpointIntegrity(
+        record: RestoreExecutionRecord,
+    ): {
+        ok: boolean;
+        failure?: {
+            statusCode: number;
+            error: string;
+            message: string;
+            reasonCode?: RestoreReasonCode;
+        };
+    } {
+        if (isCheckpointIdValid(record)) {
+            return {
+                ok: true,
+            };
+        }
+
+        return {
+            ok: false,
+            failure: {
+                statusCode: 409,
+                error: 'resume_checkpoint_mismatch',
+                message:
+                    'checkpoint_id does not match deterministic resume state',
+                reasonCode: 'blocked_resume_precondition_mismatch',
+            },
+        };
+    }
+
+    private async revalidateExecuteTimeTargetStates(input: {
+        job: RestoreJobRecord;
+        rows: RestorePlanHashRowInput[];
+    }): Promise<{
+        ok: boolean;
+        statusCode?: number;
+        error?: string;
+        reasonCode?: RestoreReasonCode;
+        message?: string;
+    }> {
+        const rowsToRevalidate = input.rows.filter((row) => {
+            return row.action !== 'skip';
+        });
+
+        if (rowsToRevalidate.length === 0) {
+            return {
+                ok: true,
+            };
+        }
+
+        const uniqueRecords = new Map<
+            string,
+            {
+                record_sys_id: string;
+                table: string;
+            }
+        >();
+
+        for (const row of rowsToRevalidate) {
+            const key = buildTargetStateLookupKey({
+                record_sys_id: row.record_sys_id,
+                table: row.table,
+            });
+
+            if (uniqueRecords.has(key)) {
+                continue;
+            }
+
+            uniqueRecords.set(key, {
+                record_sys_id: row.record_sys_id,
+                table: row.table,
+            });
+        }
+
+        let targetStatesByKey: Map<string, RestoreTargetRecordState>;
+
+        try {
+            targetStatesByKey = await this.targetStateLookup.lookupTargetState({
+                instance_id: input.job.instance_id,
+                records: Array.from(uniqueRecords.values()),
+                source: input.job.source,
+                tenant_id: input.job.tenant_id,
+            });
+        } catch (error: unknown) {
+            return {
+                ok: false,
+                statusCode: 503,
+                error: 'target_revalidation_unavailable',
+                reasonCode: 'failed_internal_error',
+                message:
+                    'execute-time target revalidation is unavailable: '
+                    + String((error as Error)?.message || error),
+            };
+        }
+
+        for (const row of rowsToRevalidate) {
+            const key = buildTargetStateLookupKey({
+                record_sys_id: row.record_sys_id,
+                table: row.table,
+            });
+            const targetState = targetStatesByKey.get(key);
+
+            if (!targetState) {
+                continue;
+            }
+
+            const sourceOperation = readSourceOperationFromRow(row);
+
+            if (!sourceOperation) {
+                continue;
+            }
+
+            const reconciliation = reconcileSourceOperationWithTargetState({
+                source_operation: sourceOperation,
+                target_state: targetState,
+            });
+
+            if (reconciliation.decision === 'block') {
+                return {
+                    ok: false,
+                    statusCode: 409,
+                    error: 'target_revalidation_failed',
+                    reasonCode: 'blocked_reference_conflict',
+                    message:
+                        'execute-time target revalidation blocked row '
+                        + `${row.row_id}: ${reconciliation.blocking_reason}`,
+                };
+            }
+
+            if (reconciliation.plan_action !== row.action) {
+                return {
+                    ok: false,
+                    statusCode: 409,
+                    error: 'target_revalidation_failed',
+                    reasonCode: 'blocked_reference_conflict',
+                    message:
+                        'execute-time target revalidation changed row '
+                        + `${row.row_id} action from ${row.action} to `
+                        + `${reconciliation.plan_action}`,
+                };
+            }
+        }
+
+        return {
+            ok: true,
         };
     }
 

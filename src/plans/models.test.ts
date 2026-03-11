@@ -138,48 +138,6 @@ function buildValidDryRunRequest(
     };
 }
 
-function buildLegacyDryRunRequest(
-    overrides: Record<string, unknown> = {},
-) {
-    return {
-        tenant_id: 'tenant-acme',
-        instance_id: 'sn-dev-01',
-        source: 'sn://acme-dev.service-now.com',
-        plan_id: 'plan-01',
-        requested_by: 'operator-1',
-        pit: {
-            restore_time: '2026-02-16T12:00:00.123Z',
-            restore_timezone: 'UTC',
-            pit_algorithm_version: PIT_ALGORITHM_VERSION,
-            tie_breaker: [
-                'sys_updated_on',
-                'sys_mod_count',
-                '__time',
-                'event_id',
-            ],
-            tie_breaker_fallback: [
-                'sys_updated_on',
-                '__time',
-                'event_id',
-            ],
-        },
-        scope: {
-            mode: 'table',
-            tables: ['x_app.ticket'],
-        },
-        execution_options: {
-            missing_row_mode: 'existing_only',
-            conflict_policy: 'review_required',
-            schema_compatibility_mode: 'compatible_only',
-            workflow_mode: 'suppressed_default',
-        },
-        rows: [buildValidRow()],
-        watermarks: [buildValidWatermark()],
-        pit_candidates: [],
-        ...overrides,
-    };
-}
-
 describe('parseCreateDryRunPlanRequest', () => {
     test('accepts valid minimal request', () => {
         const result = parseCreateDryRunPlanRequest(
@@ -209,16 +167,23 @@ describe('parseCreateDryRunPlanRequest', () => {
         assert.deepEqual(result.data.watermarks, []);
     });
 
-    test('accepts legacy request shape through temporary adapter path', () => {
+    test('accepts compatibility adapter row material in scope-driven mode', () => {
         const result = parseCreateDryRunPlanRequest(
-            buildLegacyDryRunRequest(),
-            { allowLegacyRowsCompat: true },
+            buildValidDryRunRequest({
+                rows: [buildValidRow()],
+                watermarks: [buildValidWatermark()],
+            }),
         );
 
         assert.equal(result.success, true);
         if (result.success) {
-            assert.equal(result.data.input_mode, 'legacy_rows');
-            assert.equal(result.data.rows.length, 1);
+            assert.equal(result.data.input_mode, 'scope_driven');
+            assert.equal(result.data.rows.length, 0);
+            assert.deepEqual(result.data.watermarks, [{
+                topic: 'rez.cdc',
+                partition: 0,
+            }]);
+            assert.deepEqual(result.data.pit_candidates, []);
         }
     });
 
@@ -403,7 +368,7 @@ describe('parseCreateDryRunPlanRequest', () => {
         }]);
     });
 
-    test('accepts mixed legacy and hint watermark entries', () => {
+    test('accepts mixed compatibility-adapter and hint watermark entries', () => {
         const result = parseCreateDryRunPlanRequest(
             buildValidDryRunRequest({
                 watermarks: [
@@ -485,23 +450,33 @@ describe('buildApprovalPlaceholder', () => {
                 'mvp_not_enforced' as const,
         };
         const result = buildApprovalPlaceholder(input);
-        assert.equal(result.approval_required, true);
-        assert.equal(result.approval_state, 'approved');
+        assert.equal(result.approval_required, false);
+        assert.equal(result.approval_state, 'placeholder_not_enforced');
+        assert.equal(
+            result.approval_decision_reason,
+            'caller-supplied approval metadata is unverified',
+        );
     });
 });
 
 describe('buildPlanHashInput', () => {
     function buildParsedRequest(): CreateDryRunPlanRequest {
-        const raw = buildLegacyDryRunRequest();
         const result = parseCreateDryRunPlanRequest(
-            raw,
-            { allowLegacyRowsCompat: true },
+            buildValidDryRunRequest({
+                rows: [buildValidRow()],
+                watermarks: [buildValidWatermark()],
+            }),
         );
         assert.equal(result.success, true);
         if (!result.success) {
             throw new Error('unreachable');
         }
-        return result.data;
+        return {
+            ...result.data,
+            rows: [
+                buildValidRow() as CreateDryRunPlanRequest['rows'][number],
+            ],
+        };
     }
 
     test('produces deterministic output', () => {
@@ -535,21 +510,28 @@ describe('buildPlanHashInput', () => {
             buildPlanHashInput(request1, counts),
         );
 
-        const raw2 = buildLegacyDryRunRequest({
+        const raw2 = buildValidDryRunRequest({
             rows: [
                 buildValidRow({ row_id: 'row-02' }),
             ],
+            watermarks: [buildValidWatermark()],
         });
         const result2 = parseCreateDryRunPlanRequest(
             raw2,
-            { allowLegacyRowsCompat: true },
         );
         assert.equal(result2.success, true);
         if (!result2.success) {
             throw new Error('unreachable');
         }
         const hash2 = JSON.stringify(
-            buildPlanHashInput(result2.data, counts),
+            buildPlanHashInput({
+                ...result2.data,
+                rows: [
+                    buildValidRow({
+                        row_id: 'row-02',
+                    }) as CreateDryRunPlanRequest['rows'][number],
+                ],
+            }, counts),
         );
 
         assert.notEqual(hash1, hash2);

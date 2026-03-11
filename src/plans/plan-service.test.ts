@@ -26,9 +26,6 @@ import type { FinalizeTargetReconciliationRequest } from './models';
 const PIT_ALGORITHM_VERSION =
     'pit.v1.sys_updated_on-sys_mod_count-__time-event_id';
 const NOW = new Date('2026-02-18T15:30:00.000Z');
-const LEGACY_ROWS_COMPAT_OPTIONS = {
-    allowLegacyRowsCompat: true,
-} as const;
 
 function fixedNow(): Date {
     return new Date(NOW);
@@ -105,42 +102,14 @@ function buildDryRunRequest(
     planId = 'plan-01',
     overrides: Record<string, unknown> = {},
 ) {
-    return {
-        tenant_id: 'tenant-acme',
-        instance_id: 'sn-dev-01',
-        source: 'sn://acme-dev.service-now.com',
-        plan_id: planId,
-        requested_by: 'operator@example.com',
-        pit: {
-            restore_time: '2026-02-18T15:30:00.000Z',
-            restore_timezone: 'UTC',
-            pit_algorithm_version: PIT_ALGORITHM_VERSION,
-            tie_breaker: [
-                'sys_updated_on',
-                'sys_mod_count',
-                '__time',
-                'event_id',
-            ],
-            tie_breaker_fallback: [
-                'sys_updated_on',
-                '__time',
-                'event_id',
-            ],
-        },
+    return buildScopeDrivenDryRunRequest(planId, {
         scope: {
-            mode: 'table',
+            mode: 'record',
             tables: ['x_app.ticket'],
+            record_sys_ids: ['rec-01'],
         },
-        execution_options: {
-            missing_row_mode: 'existing_only',
-            conflict_policy: 'review_required',
-            schema_compatibility_mode: 'compatible_only',
-            workflow_mode: 'suppressed_default',
-        },
-        rows: [buildRow()],
-        watermarks: [buildWatermark()],
         ...overrides,
-    };
+    });
 }
 
 function buildScopeDrivenDryRunRequest(
@@ -322,17 +291,31 @@ function createFixture(options?: {
         },
     ]);
     const indexReader = new InMemoryRestoreIndexStateReader();
+    const artifactReader = new InMemoryRestoreArtifactBodyReader();
     indexReader.upsertWatermark(
         RestoreWatermarkSchema.parse(buildWatermark()),
     );
+    seedScopeMaterializationRecord({
+        artifactReader,
+        eventId: 'evt-default-scope',
+        eventTime: '2026-02-18T15:29:00.000Z',
+        indexReader,
+        offset: '100',
+        partition: 0,
+        recordSysId: 'rec-01',
+        sysModCount: 2,
+        sysUpdatedOn: '2026-02-18 15:29:00',
+        table: 'x_app.ticket',
+    });
     const service = new RestorePlanService(
         registry,
         fixedNow,
         new InMemoryRestorePlanStateStore(),
         indexReader,
         createResolver(options?.resolveHandler),
-        undefined,
-        LEGACY_ROWS_COMPAT_OPTIONS,
+        new RestoreRowMaterializationService(
+            artifactReader,
+        ),
     );
     return { service, indexReader };
 }
@@ -374,6 +357,36 @@ function createScopeDrivenFixture(options?: {
     };
 }
 
+async function createFinalizedDefaultPlan(
+    service: RestorePlanService,
+    planId: string,
+): Promise<void> {
+    const draft = await service.createDryRunPlan(
+        buildDryRunRequest(planId),
+        claims(),
+    );
+
+    assert.equal(draft.success, true);
+    if (!draft.success) {
+        throw new Error('failed to create draft plan fixture');
+    }
+
+    const finalized = await service.finalizeTargetReconciliation(
+        planId,
+        buildFinalizeRequest([{
+            table: 'x_app.ticket',
+            record_sys_id: 'rec-01',
+            target_state: 'exists',
+        }]),
+        claims(),
+    );
+
+    assert.equal(finalized.success, true);
+    if (!finalized.success) {
+        throw new Error('failed to finalize plan fixture');
+    }
+}
+
 describe('RestorePlanService', () => {
     test('createDryRunPlan succeeds with executable gate', async () => {
         const { service } = createFixture();
@@ -393,6 +406,51 @@ describe('RestorePlanService', () => {
             );
         }
     });
+
+    test(
+        'createDryRunPlan stores caller approval metadata as an unverified '
+        + 'placeholder',
+        async () => {
+            const { service } = createFixture();
+            const result = await service.createDryRunPlan(
+                buildDryRunRequest('plan-approval-unverified', {
+                    approval: {
+                        approval_required: true,
+                        approval_state: 'approved',
+                        approval_decided_by: 'manager@example.com',
+                        approval_decision: 'approve',
+                        approval_placeholder_mode: 'mvp_not_enforced',
+                    },
+                }),
+                claims(),
+            );
+
+            assert.equal(result.success, true);
+            if (!result.success) {
+                return;
+            }
+
+            assert.equal(
+                result.record.plan.approval.approval_state,
+                'placeholder_not_enforced',
+            );
+            assert.equal(result.record.plan.approval.approval_required, false);
+            assert.equal(
+                result.record.plan.approval.approval_decision,
+                'placeholder',
+            );
+            assert.match(
+                String(
+                    result.record.plan.approval.approval_decision_reason || '',
+                ),
+                /unverified/i,
+            );
+            assert.equal(
+                result.record.plan.approval.approval_decided_by,
+                undefined,
+            );
+        },
+    );
 
     test(
         'createDryRunPlan returns draft reconciliation request for scope-driven '
@@ -974,270 +1032,8 @@ describe('RestorePlanService', () => {
         }
     });
 
-    test(
-        'createDryRunPlan derives non-zero partition from authoritative '
-        + 'source watermarks when rows omit partition metadata',
-        async () => {
-            const registry = new SourceRegistry([
-                {
-                    tenantId: 'tenant-acme',
-                    instanceId: 'sn-dev-01',
-                    source: 'sn://acme-dev.service-now.com',
-                },
-            ]);
-            const indexReader =
-                new InMemoryRestoreIndexStateReader();
-            indexReader.upsertWatermark(
-                RestoreWatermarkSchema.parse(
-                    buildWatermark({
-                        partition: 7,
-                    }),
-                ),
-            );
-            const service = new RestorePlanService(
-                registry,
-                fixedNow,
-                new InMemoryRestorePlanStateStore(),
-                indexReader,
-                undefined,
-                undefined,
-                LEGACY_ROWS_COMPAT_OPTIONS,
-            );
-            const result = await service.createDryRunPlan(
-                buildDryRunRequest('plan-derived-non-zero', {
-                    watermarks: [buildWatermarkHint()],
-                }),
-                claims(),
-            );
-            assert.equal(result.success, true);
-            if (result.success) {
-                assert.equal(
-                    result.record.gate.executability,
-                    'executable',
-                );
-                assert.equal(
-                    result.record.gate.reason_code,
-                    'none',
-                );
-                assert.equal(result.record.watermarks.length, 1);
-                assert.equal(result.record.watermarks[0].partition, 7);
-            }
-        },
-    );
-
-    test(
-        'createDryRunPlan uses explicit partition hint fallback when source '
-        + 'watermarks are absent',
-        async () => {
-            const registry = new SourceRegistry([
-                {
-                    tenantId: 'tenant-acme',
-                    instanceId: 'sn-dev-01',
-                    source: 'sn://acme-dev.service-now.com',
-                },
-            ]);
-            const indexReader =
-                new InMemoryRestoreIndexStateReader();
-            const service = new RestorePlanService(
-                registry,
-                fixedNow,
-                new InMemoryRestorePlanStateStore(),
-                indexReader,
-                undefined,
-                undefined,
-                LEGACY_ROWS_COMPAT_OPTIONS,
-            );
-            const result = await service.createDryRunPlan(
-                buildDryRunRequest('plan-unknown', {
-                    watermarks: [buildWatermarkHint({
-                        partition: 99,
-                    })],
-                }),
-                claims(),
-            );
-            assert.equal(result.success, true);
-            if (result.success) {
-                assert.equal(
-                    result.record.gate.executability,
-                    'blocked',
-                );
-                assert.equal(
-                    result.record.gate.reason_code,
-                    'blocked_freshness_unknown',
-                );
-                assert.equal(
-                    result.record.gate.freshness_unknown_detail,
-                    'partition_not_indexed',
-                );
-                assert.equal(result.record.watermarks.length, 1);
-                assert.equal(result.record.watermarks[0].topic, 'rez.cdc');
-                assert.equal(result.record.watermarks[0].partition, 99);
-            }
-        },
-    );
-
-    test(
-        'createDryRunPlan remains fail-closed when authoritative source '
-        + 'watermarks are absent and rows omit partition metadata',
-        async () => {
-            const registry = new SourceRegistry([
-                {
-                    tenantId: 'tenant-acme',
-                    instanceId: 'sn-dev-01',
-                    source: 'sn://acme-dev.service-now.com',
-                },
-            ]);
-            const indexReader =
-                new InMemoryRestoreIndexStateReader();
-            const service = new RestorePlanService(
-                registry,
-                fixedNow,
-                new InMemoryRestorePlanStateStore(),
-                indexReader,
-                undefined,
-                undefined,
-                LEGACY_ROWS_COMPAT_OPTIONS,
-            );
-            const result = await service.createDryRunPlan(
-                buildDryRunRequest('plan-derived-missing-authoritative', {
-                    watermarks: [buildWatermarkHint()],
-                }),
-                claims(),
-            );
-            assert.equal(result.success, true);
-            if (result.success) {
-                assert.equal(
-                    result.record.gate.executability,
-                    'blocked',
-                );
-                assert.equal(
-                    result.record.gate.reason_code,
-                    'blocked_freshness_unknown',
-                );
-                assert.equal(
-                    result.record.gate.freshness_unknown_detail,
-                    'no_indexed_coverage',
-                );
-                assert.equal(result.record.watermarks.length, 0);
-            }
-        },
-    );
-
-    test(
-        'createDryRunPlan surfaces invalid_authoritative_timestamp detail '
-        + 'for unknown freshness from malformed authoritative timestamps',
-        async () => {
-            const registry = new SourceRegistry([
-                {
-                    tenantId: 'tenant-acme',
-                    instanceId: 'sn-dev-01',
-                    source: 'sn://acme-dev.service-now.com',
-                },
-            ]);
-            const malformedTimestampReader: RestoreIndexStateReader = {
-                async listWatermarksForSource() {
-                    return [
-                        buildWatermark({
-                            indexed_through_time: 'not-a-timestamp',
-                            freshness: 'unknown',
-                            executability: 'blocked',
-                            reason_code: 'blocked_freshness_unknown',
-                        }) as RestoreWatermark,
-                    ];
-                },
-                async readWatermarksForPartitions() {
-                    return [];
-                },
-            };
-            const service = new RestorePlanService(
-                registry,
-                fixedNow,
-                new InMemoryRestorePlanStateStore(),
-                malformedTimestampReader,
-                undefined,
-                undefined,
-                LEGACY_ROWS_COMPAT_OPTIONS,
-            );
-            const result = await service.createDryRunPlan(
-                buildDryRunRequest('plan-invalid-authoritative-timestamp', {
-                    watermarks: [buildWatermarkHint()],
-                }),
-                claims(),
-            );
-
-            assert.equal(result.success, true);
-            if (result.success) {
-                assert.equal(result.record.gate.executability, 'blocked');
-                assert.equal(
-                    result.record.gate.reason_code,
-                    'blocked_freshness_unknown',
-                );
-                assert.equal(
-                    result.record.gate.freshness_unknown_detail,
-                    'invalid_authoritative_timestamp',
-                );
-            }
-        },
-    );
-
-    test(
-        'createDryRunPlan returns restore_index_unavailable detail '
-        + 'when authoritative reads fail',
-        async () => {
-            const registry = new SourceRegistry([
-                {
-                    tenantId: 'tenant-acme',
-                    instanceId: 'sn-dev-01',
-                    source: 'sn://acme-dev.service-now.com',
-                },
-            ]);
-            const failingReader: RestoreIndexStateReader = {
-                async listWatermarksForSource() {
-                    throw new Error('reader unavailable');
-                },
-                async readWatermarksForPartitions() {
-                    throw new Error('reader unavailable');
-                },
-            };
-            const service = new RestorePlanService(
-                registry,
-                fixedNow,
-                new InMemoryRestorePlanStateStore(),
-                failingReader,
-                undefined,
-                undefined,
-                LEGACY_ROWS_COMPAT_OPTIONS,
-            );
-            const result = await service.createDryRunPlan(
-                buildDryRunRequest('plan-index-unavailable', {
-                    watermarks: [buildWatermarkHint()],
-                }),
-                claims(),
-            );
-
-            assert.equal(result.success, false);
-            if (!result.success) {
-                assert.equal(result.statusCode, 503);
-                assert.equal(result.error, 'restore_index_unavailable');
-                assert.equal(result.reasonCode, 'blocked_freshness_unknown');
-                assert.equal(
-                    result.freshnessUnknownDetail,
-                    'restore_index_unavailable',
-                );
-            }
-        },
-    );
-
     test('createDryRunPlan returns preview_only for stale partitions', async () => {
-        const registry = new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]);
-        const indexReader =
-            new InMemoryRestoreIndexStateReader();
+        const { service, indexReader } = createFixture();
         indexReader.upsertWatermark(
             RestoreWatermarkSchema.parse(
                 buildWatermark({
@@ -1248,15 +1044,6 @@ describe('RestorePlanService', () => {
                     reason_code: 'blocked_freshness_stale',
                 }),
             ),
-        );
-        const service = new RestorePlanService(
-            registry,
-            fixedNow,
-            new InMemoryRestorePlanStateStore(),
-            indexReader,
-            undefined,
-            undefined,
-            LEGACY_ROWS_COMPAT_OPTIONS,
         );
         const result = await service.createDryRunPlan(
             buildDryRunRequest('plan-stale'),
@@ -1386,10 +1173,7 @@ describe('RestorePlanService', () => {
 
     test('createDryRunPlan persists plan to state store', async () => {
         const { service } = createFixture();
-        await service.createDryRunPlan(
-            buildDryRunRequest('plan-persist'),
-            claims(),
-        );
+        await createFinalizedDefaultPlan(service, 'plan-persist');
         const plan = await service.getPlan('plan-persist');
         assert.ok(plan);
         assert.equal(plan.plan.plan_id, 'plan-persist');
@@ -1420,10 +1204,7 @@ describe('RestorePlanService', () => {
 
     test('getPlan returns plan by ID', async () => {
         const { service } = createFixture();
-        await service.createDryRunPlan(
-            buildDryRunRequest('plan-get'),
-            claims(),
-        );
+        await createFinalizedDefaultPlan(service, 'plan-get');
         const plan = await service.getPlan('plan-get');
         assert.ok(plan);
         assert.equal(plan.plan.plan_id, 'plan-get');
@@ -1437,18 +1218,9 @@ describe('RestorePlanService', () => {
 
     test('listPlans returns all plans sorted by generation time', async () => {
         const { service } = createFixture();
-        await service.createDryRunPlan(
-            buildDryRunRequest('plan-a'),
-            claims(),
-        );
-        await service.createDryRunPlan(
-            buildDryRunRequest('plan-b'),
-            claims(),
-        );
-        await service.createDryRunPlan(
-            buildDryRunRequest('plan-c'),
-            claims(),
-        );
+        await createFinalizedDefaultPlan(service, 'plan-a');
+        await createFinalizedDefaultPlan(service, 'plan-b');
+        await createFinalizedDefaultPlan(service, 'plan-c');
         const plans = await service.listPlans();
         assert.equal(plans.length, 3);
     });
@@ -1460,17 +1232,9 @@ describe('RestorePlanService', () => {
     });
 
     test('freshness summary aggregates partition states correctly', async () => {
-        const registry = new SourceRegistry([
-            {
-                tenantId: 'tenant-acme',
-                instanceId: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-            },
-        ]);
-        const indexReader =
-            new InMemoryRestoreIndexStateReader();
+        const fixture = createScopeDrivenFixture();
 
-        indexReader.upsertWatermark(
+        fixture.indexReader.upsertWatermark(
             RestoreWatermarkSchema.parse(buildWatermark({
                 partition: 0,
                 freshness: 'fresh',
@@ -1478,7 +1242,7 @@ describe('RestorePlanService', () => {
                 reason_code: 'none',
             })),
         );
-        indexReader.upsertWatermark(
+        fixture.indexReader.upsertWatermark(
             RestoreWatermarkSchema.parse(buildWatermark({
                 partition: 1,
                 indexed_through_time:
@@ -1488,28 +1252,37 @@ describe('RestorePlanService', () => {
                 reason_code: 'blocked_freshness_stale',
             })),
         );
-        const service = new RestorePlanService(
-            registry,
-            fixedNow,
-            new InMemoryRestorePlanStateStore(),
-            indexReader,
-            undefined,
-            undefined,
-            LEGACY_ROWS_COMPAT_OPTIONS,
-        );
-        const result = await service.createDryRunPlan(
-            buildDryRunRequest('plan-mixed', {
-                watermarks: [
-                    buildWatermark({ partition: 0 }),
-                    buildWatermark({
-                        partition: 1,
-                        indexed_through_time:
-                            '2026-02-18T15:27:00.000Z',
-                        freshness: 'stale',
-                        executability: 'preview_only',
-                        reason_code: 'blocked_freshness_stale',
-                    }),
-                ],
+        seedScopeMaterializationRecord({
+            artifactReader: fixture.artifactReader,
+            eventId: 'evt-default-scope-01',
+            eventTime: '2026-02-18T15:29:00.000Z',
+            indexReader: fixture.indexReader,
+            offset: '100',
+            partition: 0,
+            recordSysId: 'rec-01',
+            sysModCount: 2,
+            sysUpdatedOn: '2026-02-18 15:29:00',
+            table: 'x_app.ticket',
+        });
+        seedScopeMaterializationRecord({
+            artifactReader: fixture.artifactReader,
+            eventId: 'evt-default-scope-02',
+            eventTime: '2026-02-18T15:29:10.000Z',
+            indexReader: fixture.indexReader,
+            offset: '101',
+            partition: 1,
+            recordSysId: 'rec-02',
+            sysModCount: 2,
+            sysUpdatedOn: '2026-02-18 15:29:10',
+            table: 'x_app.ticket',
+        });
+        const result = await fixture.service.createDryRunPlan(
+            buildScopeDrivenDryRunRequest('plan-mixed', {
+                scope: {
+                    mode: 'record',
+                    tables: ['x_app.ticket'],
+                    record_sys_ids: ['rec-01', 'rec-02'],
+                },
             }),
             claims(),
         );

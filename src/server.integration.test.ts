@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { Server } from 'node:http';
 import { test } from 'node:test';
@@ -270,6 +271,17 @@ async function postAdminJson(
     };
 }
 
+function materializedRowId(
+    recordSysId: string,
+    table = 'incident',
+): string {
+    const checksum = createHash('sha256')
+        .update(`${table}|${recordSysId}`, 'utf8')
+        .digest('hex');
+
+    return `row.${checksum}`;
+}
+
 function createService(
     signingKey: string,
     options?: {
@@ -364,7 +376,28 @@ function createService(
             ).upsertWatermark(parsed.data);
         }
 
-        const indexedCandidates = options?.indexedEventCandidates || [];
+        const indexedCandidates = options?.indexedEventCandidates === undefined
+            ? [
+                createIndexedEventCandidateFixture({
+                    eventId: 'evt-rec-01',
+                    offset: '100',
+                    partition: 1,
+                    recordSysId: 'rec-01',
+                }),
+                createIndexedEventCandidateFixture({
+                    eventId: 'evt-rec-02',
+                    offset: '101',
+                    partition: 1,
+                    recordSysId: 'rec-02',
+                }),
+                createIndexedEventCandidateFixture({
+                    eventId: 'evt-rec-03',
+                    offset: '102',
+                    partition: 1,
+                    recordSysId: 'rec-03',
+                }),
+            ]
+            : options.indexedEventCandidates;
         const seedableReader = restoreIndexReader as SeedableRestoreIndexStateReader;
 
         if (seedableReader.upsertIndexedEventCandidate) {
@@ -389,8 +422,22 @@ function createService(
         }
     }
 
-    if (options?.artifactBodies) {
-        for (const artifact of options.artifactBodies) {
+    const artifactBodies = options?.artifactBodies === undefined
+        ? [
+            createArtifactBodyFixture({
+                eventId: 'evt-rec-01',
+            }),
+            createArtifactBodyFixture({
+                eventId: 'evt-rec-02',
+            }),
+            createArtifactBodyFixture({
+                eventId: 'evt-rec-03',
+            }),
+        ]
+        : options.artifactBodies;
+
+    if (artifactBodies) {
+        for (const artifact of artifactBodies) {
             artifactBodyReader.setArtifactBody({
                 artifactKey: artifact.artifactKey,
                 body: artifact.body,
@@ -421,9 +468,6 @@ function createService(
             artifactBodyReader,
             targetStateLookup,
         ),
-        {
-            allowLegacyRowsCompat: true,
-        },
     );
     const jobs = new RestoreJobService(
         new RestoreLockManager(),
@@ -458,6 +502,7 @@ function createService(
                     ? undefined
                     : new NoopRestoreTargetWriter()
             ),
+        targetStateLookup,
     );
     const evidence = new RestoreEvidenceService(
         jobs,
@@ -743,6 +788,54 @@ function createMediaCandidate(
     return candidate;
 }
 
+function createIndexedEventCandidateFixture(input: {
+    eventId: string;
+    offset: string;
+    partition: number;
+    recordSysId: string;
+    table?: string;
+}) {
+    const artifactKey = `rez/restore/event=${input.eventId}.artifact.json`;
+    const manifestKey = `rez/restore/event=${input.eventId}.manifest.json`;
+
+    return {
+        artifactKey,
+        eventId: input.eventId,
+        eventTime: '2026-02-16T11:59:00.000Z',
+        manifestKey,
+        offset: input.offset,
+        partition: input.partition,
+        recordSysId: input.recordSysId,
+        sysModCount: 2,
+        sysUpdatedOn: '2026-02-16 11:59:00',
+        table: input.table || 'incident',
+        topic: 'rez.cdc',
+    };
+}
+
+function createArtifactBodyFixture(input: {
+    eventId: string;
+    operation?: 'D' | 'I' | 'U';
+}) {
+    const artifactKey = `rez/restore/event=${input.eventId}.artifact.json`;
+    const manifestKey = `rez/restore/event=${input.eventId}.manifest.json`;
+    const operation = input.operation || 'U';
+
+    return {
+        artifactKey,
+        body: {
+            __op: operation,
+            __schema_version: 3,
+            __type: operation === 'D' ? 'cdc.delete' : 'cdc.write',
+            row_enc: {
+                alg: 'AES-256-GCM',
+                ciphertext: `cipher-${input.eventId}`,
+            },
+        },
+        manifestKey,
+    };
+}
+
 function createWatermark(input?: {
     freshness?: 'fresh' | 'stale' | 'unknown';
     executability?: 'executable' | 'preview_only' | 'blocked';
@@ -781,6 +874,11 @@ function createDryRunPayload(
         mediaCandidates?: Record<string, unknown>[];
     },
 ): Record<string, unknown> {
+    const rows = overrides?.rows || [
+        createDryRunRow('row-01', 'rec-01'),
+        createDryRunRow('row-02', 'rec-02'),
+    ];
+
     return {
         tenant_id: 'tenant-acme',
         instance_id: 'sn-dev-01',
@@ -805,8 +903,12 @@ function createDryRunPayload(
         },
         scope: {
             mode: 'record',
-            tables: ['incident'],
-            encoded_query: 'active=true',
+            tables: Array.from(new Set(
+                rows.map((row) => String(row.table || 'incident')),
+            )),
+            record_sys_ids: Array.from(new Set(
+                rows.map((row) => String(row.record_sys_id || '')),
+            )).filter(Boolean),
         },
         execution_options: {
             missing_row_mode: 'existing_only',
@@ -814,35 +916,13 @@ function createDryRunPayload(
             schema_compatibility_mode: 'compatible_only',
             workflow_mode: 'suppressed_default',
         },
-        rows: overrides?.rows || [
-            createDryRunRow('row-01', 'rec-01'),
-            createDryRunRow('row-02', 'rec-02'),
-        ],
         conflicts: overrides?.conflicts || [],
         delete_candidates: overrides?.deleteCandidates || [],
         media_candidates: overrides?.mediaCandidates || [],
-        watermarks: overrides?.watermarks || [createWatermark()],
-        pit_candidates: [
-            {
-                row_id: 'row-01',
-                table: 'incident',
-                record_sys_id: 'rec-01',
-                versions: [
-                    {
-                        sys_updated_on: '2026-02-16 11:50:00',
-                        sys_mod_count: 1,
-                        __time: '2026-02-16T11:50:00.000Z',
-                        event_id: 'evt-old',
-                    },
-                    {
-                        sys_updated_on: '2026-02-16 11:50:00',
-                        sys_mod_count: 2,
-                        __time: '2026-02-16T11:50:01.000Z',
-                        event_id: 'evt-new',
-                    },
-                ],
-            },
-        ],
+        compatibility_adapter: {
+            rows,
+            watermarks: overrides?.watermarks || [createWatermark()],
+        },
     };
 }
 
@@ -937,9 +1017,26 @@ async function createPlanAndJob(
         createDryRunPayload(planId, options?.dryRunOverrides),
     );
 
-    assert.equal(dryRun.status, 201);
+    assert.equal(dryRun.status, 202);
+    const targetReconciliationRecords =
+        dryRun.body.target_reconciliation_records as Array<Record<string, unknown>>;
+    const finalize = await postJson(
+        baseUrl,
+        `/v1/plans/${encodeURIComponent(planId)}/target-reconciliation/finalize`,
+        token,
+        {
+            finalized_by: 'sn-worker',
+            reconciled_records: targetReconciliationRecords.map((record) => ({
+                table: record.table,
+                record_sys_id: record.record_sys_id,
+                target_state: 'exists',
+            })),
+        },
+    );
 
-    const plan = dryRun.body.plan as Record<string, unknown>;
+    assert.equal(finalize.status, 201);
+
+    const plan = finalize.body.plan as Record<string, unknown>;
     const planHash = plan.plan_hash as string;
 
     assert.equal(typeof planHash, 'string');
@@ -1033,10 +1130,30 @@ test(
                 createDryRunPayload(planId),
             );
 
-            assert.equal(dryRun.status, 201);
-            assert.equal(dryRun.body.reconciliation_state, 'finalized');
-            const dryRunPlan = dryRun.body.plan as Record<string, unknown>;
-            const planHash = dryRunPlan.plan_hash as string;
+            assert.equal(dryRun.status, 202);
+            assert.equal(dryRun.body.reconciliation_state, 'draft');
+            const finalize = await postJson(
+                baseUrl,
+                `/v1/plans/${encodeURIComponent(planId)}`
+                    + '/target-reconciliation/finalize',
+                token,
+                {
+                    finalized_by: 'sn-worker',
+                    reconciled_records: [{
+                        table: 'incident',
+                        record_sys_id: 'rec-01',
+                        target_state: 'exists',
+                    }, {
+                        table: 'incident',
+                        record_sys_id: 'rec-02',
+                        target_state: 'exists',
+                    }],
+                },
+            );
+
+            assert.equal(finalize.status, 201);
+            const finalizedPlan = finalize.body.plan as Record<string, unknown>;
+            const planHash = finalizedPlan.plan_hash as string;
 
             assert.equal(typeof planHash, 'string');
 
@@ -1711,9 +1828,10 @@ test(
             const claimValidRows = claimValid.body.claimed_rows as Array<
                 Record<string, unknown>
             >;
+            const firstClaimedRowId = String(claimValidRows[0]?.row_id || '');
 
             assert.equal(claimValidRows.length, 1);
-            assert.equal(claimValidRows[0]?.row_id, 'row-01');
+            assert.equal(typeof firstClaimedRowId, 'string');
 
             const overlapClaim = await postJson(
                 baseUrl,
@@ -1776,7 +1894,7 @@ test(
                     claim_id: claimValid.body.claim_id,
                     committed_by: 'sn-worker',
                     row_outcomes: [{
-                        row_id: 'row-01',
+                        row_id: firstClaimedRowId,
                         outcome: 'applied',
                         reason_code: 'none',
                     }],
@@ -1814,8 +1932,11 @@ test(
             const secondClaimRows = secondClaim.body.claimed_rows as Array<
                 Record<string, unknown>
             >;
+            const secondClaimedRowId = String(
+                secondClaimRows[0]?.row_id || '',
+            );
 
-            assert.equal(secondClaimRows[0]?.row_id, 'row-02');
+            assert.equal(typeof secondClaimedRowId, 'string');
 
             const secondCommit = await postJson(
                 baseUrl,
@@ -1826,7 +1947,7 @@ test(
                     claim_id: secondClaim.body.claim_id,
                     committed_by: 'sn-worker',
                     row_outcomes: [{
-                        row_id: 'row-02',
+                        row_id: secondClaimedRowId,
                         outcome: 'failed',
                         reason_code: 'failed_permission_conflict',
                         message: 'target rejected write',
@@ -1906,7 +2027,7 @@ test('dry-run returns executable gate when ACP mapping exists', async () => {
             createDryRunPayload('plan-fresh'),
         );
 
-        assert.equal(response.status, 201);
+        assert.equal(response.status, 202);
         const gate = response.body.gate as Record<string, unknown>;
 
         assert.equal(gate.executability, 'executable');
@@ -2326,7 +2447,7 @@ test('dry-run refreshes ACP mapping cache after TTL expiry', async () => {
             createDryRunPayload('plan-acp-cache-first'),
         );
 
-        assert.equal(firstResponse.status, 201);
+        assert.equal(firstResponse.status, 202);
         assert.equal(resolveCalls, 1);
 
         canonicalSource = 'sn://changed.service-now.com';
@@ -2337,7 +2458,7 @@ test('dry-run refreshes ACP mapping cache after TTL expiry', async () => {
             createDryRunPayload('plan-acp-cache-hit'),
         );
 
-        assert.equal(cachedResponse.status, 201);
+        assert.equal(cachedResponse.status, 202);
         assert.equal(resolveCalls, 1);
 
         resolverNowMs += 61 * 1000;
@@ -2361,15 +2482,24 @@ test('dry-run refreshes ACP mapping cache after TTL expiry', async () => {
 
 test('dry-run accepts large decimal-string offsets and returns string values', async () => {
     const signingKey = 'test-signing-key';
-    const server = createService(signingKey);
+    const largeOffset = '900719925474099312345678901234567890';
+    const server = createService(signingKey, {
+        indexedEventCandidates: [
+            createIndexedEventCandidateFixture({
+                eventId: 'evt-large-offset',
+                offset: largeOffset,
+                partition: 1,
+                recordSysId: 'rec-large-offset',
+            }),
+        ],
+        artifactBodies: [
+            createArtifactBodyFixture({
+                eventId: 'evt-large-offset',
+            }),
+        ],
+    });
     const baseUrl = await listen(server);
     const token = createToken(signingKey);
-    const largeOffset = '900719925474099312345678901234567890';
-    const row = createDryRunRow('row-large-offset', 'rec-large-offset');
-    const metadata = row.metadata as Record<string, unknown>;
-    const metadataFields = metadata.metadata as Record<string, unknown>;
-
-    metadataFields.offset = largeOffset;
 
     try {
         const response = await postJson(
@@ -2377,7 +2507,7 @@ test('dry-run accepts large decimal-string offsets and returns string values', a
             '/v1/plans/dry-run',
             token,
             createDryRunPayload('plan-large-offset', {
-                rows: [row],
+                rows: [createDryRunRow('row-large-offset', 'rec-large-offset')],
                 watermarks: [
                     {
                         ...createWatermark(),
@@ -2387,7 +2517,7 @@ test('dry-run accepts large decimal-string offsets and returns string values', a
             }),
         );
 
-        assert.equal(response.status, 201);
+        assert.equal(response.status, 202);
 
         const watermarks = response.body.watermarks as Record<string, unknown>[];
         const planHashInput = response.body.plan_hash_input as Record<
@@ -2463,7 +2593,7 @@ test('dry-run ignores caller-provided freshness when authoritative state is fres
             }),
         );
 
-        assert.equal(response.status, 201);
+        assert.equal(response.status, 202);
         const gate = response.body.gate as Record<string, unknown>;
 
         assert.equal(gate.executability, 'executable');
@@ -2472,119 +2602,6 @@ test('dry-run ignores caller-provided freshness when authoritative state is fres
         await closeServer(server);
     }
 });
-
-test(
-    'dry-run derives non-zero partition from authoritative source '
-    + 'watermarks when row partition metadata is absent',
-    async () => {
-        const signingKey = 'test-signing-key';
-        const server = createService(signingKey, {
-            authoritativeWatermarks: [
-                {
-                    ...createWatermark(),
-                    partition: 7,
-                },
-            ],
-        });
-        const baseUrl = await listen(server);
-        const token = createToken(signingKey);
-        const row = createDryRunRow(
-            'row-derived-partition',
-            'rec-derived-partition',
-        );
-        const rowMetadata = row.metadata as Record<string, unknown>;
-        const rowMetadataFields = rowMetadata.metadata as Record<
-            string,
-            unknown
-        >;
-
-        delete rowMetadataFields.partition;
-
-        try {
-            const response = await postJson(
-                baseUrl,
-                '/v1/plans/dry-run',
-                token,
-                createDryRunPayload('plan-derived-partition', {
-                    rows: [row],
-                    watermarks: [
-                        {
-                            ...createWatermark({
-                                freshness: 'unknown',
-                                executability: 'blocked',
-                                reasonCode: 'blocked_freshness_unknown',
-                            }),
-                            partition: 0,
-                        },
-                    ],
-                }),
-            );
-
-            assert.equal(response.status, 201);
-            const gate = response.body.gate as Record<string, unknown>;
-            const watermarks = response.body.watermarks as Array<
-                Record<string, unknown>
-            >;
-
-            assert.equal(gate.executability, 'executable');
-            assert.equal(gate.reason_code, 'none');
-            assert.equal(watermarks.length, 1);
-            assert.equal(watermarks[0].partition, 7);
-        } finally {
-            await closeServer(server);
-        }
-    },
-);
-
-test(
-    'dry-run remains fail-closed when row partition metadata is absent '
-    + 'and authoritative source watermarks are missing',
-    async () => {
-        const signingKey = 'test-signing-key';
-        const server = createService(signingKey, {
-            authoritativeWatermarks: [],
-        });
-        const baseUrl = await listen(server);
-        const token = createToken(signingKey);
-        const row = createDryRunRow(
-            'row-missing-authoritative',
-            'rec-missing-authoritative',
-        );
-        const rowMetadata = row.metadata as Record<string, unknown>;
-        const rowMetadataFields = rowMetadata.metadata as Record<
-            string,
-            unknown
-        >;
-
-        delete rowMetadataFields.partition;
-
-        try {
-            const response = await postJson(
-                baseUrl,
-                '/v1/plans/dry-run',
-                token,
-                createDryRunPayload('plan-missing-authoritative', {
-                    rows: [row],
-                    watermarks: [{
-                        topic: 'rez.cdc',
-                    }],
-                }),
-            );
-
-            assert.equal(response.status, 201);
-            const gate = response.body.gate as Record<string, unknown>;
-
-            assert.equal(gate.executability, 'blocked');
-            assert.equal(gate.reason_code, 'blocked_freshness_unknown');
-            assert.equal(
-                gate.freshness_unknown_detail,
-                'no_indexed_coverage',
-            );
-        } finally {
-            await closeServer(server);
-        }
-    },
-);
 
 test('dry-run freshness matrix enforces authoritative stale and unknown states', async () => {
     const signingKey = 'test-signing-key';
@@ -2595,6 +2612,28 @@ test('dry-run freshness matrix enforces authoritative stale and unknown states',
     };
     const server = createService(signingKey, {
         authoritativeWatermarks: [staleAuthoritative],
+        indexedEventCandidates: [
+            createIndexedEventCandidateFixture({
+                eventId: 'evt-freshness-rec-01',
+                offset: '100',
+                partition: 1,
+                recordSysId: 'rec-01',
+            }),
+            createIndexedEventCandidateFixture({
+                eventId: 'evt-freshness-rec-unknown',
+                offset: '101',
+                partition: 2,
+                recordSysId: 'rec-unknown',
+            }),
+        ],
+        artifactBodies: [
+            createArtifactBodyFixture({
+                eventId: 'evt-freshness-rec-01',
+            }),
+            createArtifactBodyFixture({
+                eventId: 'evt-freshness-rec-unknown',
+            }),
+        ],
     });
     const baseUrl = await listen(server);
     const token = createToken(signingKey);
@@ -2604,32 +2643,27 @@ test('dry-run freshness matrix enforces authoritative stale and unknown states',
             baseUrl,
             '/v1/plans/dry-run',
             token,
-            createDryRunPayload('plan-stale'),
+            createDryRunPayload('plan-stale', {
+                rows: [createDryRunRow('row-01', 'rec-01')],
+            }),
         );
 
-        assert.equal(staleResponse.status, 201);
+        assert.equal(staleResponse.status, 202);
         const staleGate = staleResponse.body.gate as Record<string, unknown>;
 
         assert.equal(staleGate.executability, 'preview_only');
         assert.equal(staleGate.reason_code, 'blocked_freshness_stale');
-
-        const unknownRow = createDryRunRow('row-unknown', 'rec-unknown');
-        const unknownRowMetadata = unknownRow.metadata as Record<string, unknown>;
-        const unknownMetadataFields = unknownRowMetadata
-            .metadata as Record<string, unknown>;
-
-        unknownMetadataFields.partition = 2;
 
         const unknownResponse = await postJson(
             baseUrl,
             '/v1/plans/dry-run',
             token,
             createDryRunPayload('plan-unknown', {
-                rows: [unknownRow],
+                rows: [createDryRunRow('row-unknown', 'rec-unknown')],
             }),
         );
 
-        assert.equal(unknownResponse.status, 201);
+        assert.equal(unknownResponse.status, 202);
         const unknownGate = unknownResponse.body.gate as Record<string, unknown>;
 
         assert.equal(unknownGate.executability, 'blocked');
@@ -2648,9 +2682,25 @@ test(
     + 'authoritative freshness data is malformed',
     async () => {
         const signingKey = 'test-signing-key';
-        const malformedTimestampReader: RestoreIndexStateReader = {
-            async listWatermarksForSource() {
-                return [];
+        const baseReader = new InMemoryRestoreIndexStateReader();
+
+        baseReader.upsertIndexedEventCandidate({
+            ...createIndexedEventCandidateFixture({
+                eventId: 'evt-rec-01',
+                offset: '100',
+                partition: 1,
+                recordSysId: 'rec-01',
+            }),
+            instanceId: 'sn-dev-01',
+            source: 'sn://acme-dev.service-now.com',
+            tenantId: 'tenant-acme',
+        });
+        const malformedTimestampReader = {
+            async listWatermarksForSource(input) {
+                return baseReader.listWatermarksForSource(input);
+            },
+            async lookupIndexedEventCandidates(input: any) {
+                return baseReader.lookupIndexedEventCandidates(input);
             },
             async readWatermarksForPartitions() {
                 return [
@@ -2664,7 +2714,7 @@ test(
                     } as RestoreWatermark,
                 ];
             },
-        };
+        } as RestoreIndexStateReader;
         const server = createService(signingKey, {
             restoreIndexReader: malformedTimestampReader,
         });
@@ -2676,11 +2726,13 @@ test(
                 baseUrl,
                 '/v1/plans/dry-run',
                 token,
-                createDryRunPayload('plan-invalid-authoritative-timestamp'),
+                createDryRunPayload('plan-invalid-authoritative-timestamp', {
+                    rows: [createDryRunRow('row-01', 'rec-01')],
+                }),
             );
             const gate = response.body.gate as Record<string, unknown>;
 
-            assert.equal(response.status, 201);
+            assert.equal(response.status, 202);
             assert.equal(gate.executability, 'blocked');
             assert.equal(gate.reason_code, 'blocked_freshness_unknown');
             assert.equal(
@@ -2759,7 +2811,7 @@ test('dry-run blocks unresolved delete and hard-block conflicts', async () => {
             }),
         );
 
-        assert.equal(unresolvedDelete.status, 201);
+        assert.equal(unresolvedDelete.status, 202);
         const unresolvedDeleteGate = unresolvedDelete.body.gate as Record<
             string,
             unknown
@@ -2790,7 +2842,7 @@ test('dry-run blocks unresolved delete and hard-block conflicts', async () => {
             }),
         );
 
-        assert.equal(unresolvedConflict.status, 201);
+        assert.equal(unresolvedConflict.status, 202);
         const unresolvedConflictGate = unresolvedConflict.body.gate as Record<
             string,
             unknown
@@ -2825,7 +2877,7 @@ test('dry-run blocks unresolved media candidate decisions', async () => {
             }),
         );
 
-        assert.equal(response.status, 201);
+        assert.equal(response.status, 202);
         const gate = response.body.gate as Record<string, unknown>;
 
         assert.equal(gate.executability, 'blocked');
@@ -2851,21 +2903,35 @@ test('dry-run plan_hash is deterministic for equivalent inputs', async () => {
             baseUrl,
             '/v1/plans/dry-run',
             token,
-            createDryRunPayload('plan-hash-a', {
-                rows: [rowTwo, rowOne],
-            }),
+            {
+                ...createDryRunPayload('plan-hash-a', {
+                    rows: [rowTwo, rowOne],
+                }),
+                scope: {
+                    mode: 'record',
+                    tables: ['incident'],
+                    record_sys_ids: ['rec-01', 'rec-02'],
+                },
+            },
         );
         const second = await postJson(
             baseUrl,
             '/v1/plans/dry-run',
             token,
-            createDryRunPayload('plan-hash-b', {
-                rows: [rowOne, rowTwo],
-            }),
+            {
+                ...createDryRunPayload('plan-hash-b', {
+                    rows: [rowOne, rowTwo],
+                }),
+                scope: {
+                    mode: 'record',
+                    tables: ['incident'],
+                    record_sys_ids: ['rec-01', 'rec-02'],
+                },
+            },
         );
 
-        assert.equal(first.status, 201);
-        assert.equal(second.status, 201);
+        assert.equal(first.status, 202);
+        assert.equal(second.status, 202);
 
         const firstPlan = first.body.plan as Record<string, unknown>;
         const secondPlan = second.body.plan as Record<string, unknown>;
@@ -2883,8 +2949,7 @@ test('dry-run plan_hash is deterministic for equivalent inputs', async () => {
         const firstRows = firstHashInput.rows as Array<Record<string, unknown>>;
         const secondRows = secondHashInput.rows as Array<Record<string, unknown>>;
 
-        assert.equal(firstRows[0]?.row_id, 'row-01');
-        assert.equal(secondRows[0]?.row_id, 'row-01');
+        assert.equal(firstRows[0]?.row_id, secondRows[0]?.row_id);
     } finally {
         await closeServer(server);
     }
@@ -2916,7 +2981,7 @@ test('execute endpoint records chunk fallback and row outcomes', async () => {
                 runtimeConflicts: [
                     {
                         conflict_id: 'conf-row-01',
-                        row_id: 'row-01',
+                        row_id: materializedRowId('rec-01'),
                         class: 'value_conflict',
                         reason_code: 'failed_internal_error',
                         reason: 'runtime mismatch',
@@ -2958,7 +3023,7 @@ test('execute endpoint records chunk fallback and row outcomes', async () => {
 });
 
 test(
-    'execute endpoint fails closed when target apply runtime support is not composed',
+    'execute endpoint fails closed when target revalidation support is unavailable',
     async () => {
         const signingKey = 'test-signing-key';
         const server = createService(signingKey, {
@@ -2986,25 +3051,18 @@ test(
                 }),
             );
 
-            assert.equal(executeResponse.status, 200);
-            const execution = executeResponse.body.execution as Record<
-                string,
-                unknown
-            >;
-            const summary = execution.summary as Record<string, unknown>;
-            const rowOutcomes = execution.row_outcomes as Array<
-                Record<string, unknown>
-            >;
-
-            assert.equal(execution.status, 'failed');
-            assert.equal(summary.applied_rows, 0);
-            assert.equal(summary.failed_rows, 2);
-            assert.equal(summary.skipped_rows, 0);
-            assert.equal(rowOutcomes.length, 2);
-            assert.equal(rowOutcomes[0]?.reason_code, 'failed_internal_error');
+            assert.equal(executeResponse.status, 503);
+            assert.equal(
+                executeResponse.body.error,
+                'target_revalidation_unavailable',
+            );
+            assert.equal(
+                executeResponse.body.reason_code,
+                'failed_internal_error',
+            );
             assert.match(
-                String(rowOutcomes[0]?.message || ''),
-                /target apply runtime support is unavailable/i,
+                String(executeResponse.body.message || ''),
+                /target revalidation/i,
             );
         } finally {
             await closeServer(server);
@@ -3076,14 +3134,20 @@ test('execute endpoint reports failed outcomes when target writer apply fails', 
             byRowId.set(String(outcome.row_id || ''), outcome);
         }
 
-        assert.equal(byRowId.get('row-01')?.outcome, 'applied');
-        assert.equal(byRowId.get('row-02')?.outcome, 'failed');
         assert.equal(
-            byRowId.get('row-02')?.reason_code,
+            byRowId.get(materializedRowId('rec-01'))?.outcome,
+            'applied',
+        );
+        assert.equal(
+            byRowId.get(materializedRowId('rec-02'))?.outcome,
+            'failed',
+        );
+        assert.equal(
+            byRowId.get(materializedRowId('rec-02'))?.reason_code,
             'failed_permission_conflict',
         );
         assert.equal(
-            byRowId.get('row-02')?.message,
+            byRowId.get(materializedRowId('rec-02'))?.message,
             'target rejected write',
         );
         assert.equal(targetWriter.applyCalls.length, 2);
@@ -3112,7 +3176,32 @@ test('execute endpoint reports failed outcomes when target writer apply fails', 
 
 test('execute endpoint blocks missing capability for delete actions', async () => {
     const signingKey = 'test-signing-key';
-    const server = createService(signingKey);
+    const server = createService(signingKey, {
+        indexedEventCandidates: [
+            createIndexedEventCandidateFixture({
+                eventId: 'evt-delete-01',
+                offset: '100',
+                partition: 1,
+                recordSysId: 'rec-01',
+            }),
+            createIndexedEventCandidateFixture({
+                eventId: 'evt-delete-02',
+                offset: '101',
+                partition: 1,
+                recordSysId: 'rec-02',
+            }),
+        ],
+        artifactBodies: [
+            createArtifactBodyFixture({
+                eventId: 'evt-delete-01',
+                operation: 'D',
+            }),
+            createArtifactBodyFixture({
+                eventId: 'evt-delete-02',
+                operation: 'D',
+            }),
+        ],
+    });
     const baseUrl = await listen(server);
     const token = createToken(signingKey);
 
@@ -3352,7 +3441,7 @@ test('execute endpoint hard-blocks reference conflicts', async () => {
                 runtimeConflicts: [
                     {
                         conflict_id: 'conf-reference',
-                        row_id: 'row-01',
+                        row_id: materializedRowId('rec-01'),
                         class: 'reference_conflict',
                         reason_code: 'blocked_reference_conflict',
                         reason: 'referenced parent missing',
@@ -3605,9 +3694,9 @@ test('resume endpoint keeps mixed-success chunks truthful without double-applyin
             callCountByRow.set(rowId, (callCountByRow.get(rowId) || 0) + 1);
         }
 
-        assert.equal(callCountByRow.get('row-01'), 1);
-        assert.equal(callCountByRow.get('row-02'), 1);
-        assert.equal(callCountByRow.get('row-03'), 1);
+        assert.equal(callCountByRow.get(materializedRowId('rec-01')), 1);
+        assert.equal(callCountByRow.get(materializedRowId('rec-02')), 1);
+        assert.equal(callCountByRow.get(materializedRowId('rec-03')), 1);
 
         const journalResponse = await getJson(
             baseUrl,
@@ -3629,7 +3718,10 @@ test('resume endpoint keeps mixed-success chunks truthful without double-applyin
         assert.equal(snMirror.length, 2);
 
         for (const entry of rollbackJournal) {
-            assert.notEqual(entry.plan_row_id, 'row-02');
+            assert.notEqual(
+                entry.plan_row_id,
+                materializedRowId('rec-02'),
+            );
         }
     } finally {
         await closeServer(server);

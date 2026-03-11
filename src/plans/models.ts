@@ -452,15 +452,18 @@ export function parseCreateDryRunPlanRequest(
 export function buildApprovalPlaceholder(
     approval?: RestoreApprovalMetadata,
 ): RestoreApprovalMetadata {
-    if (approval) {
-        return approval;
-    }
-
-    return {
+    const placeholder: RestoreApprovalMetadata = {
         approval_required: false,
         approval_state: 'placeholder_not_enforced',
+        approval_decision: 'placeholder',
+        approval_decision_reason: approval
+            ? 'caller-supplied approval metadata is unverified'
+            : 'approval enforcement is not configured in this stage',
+        approval_revalidation_result: 'not_applicable',
         approval_placeholder_mode: 'mvp_not_enforced',
     };
+
+    return placeholder;
 }
 
 export function buildPlanHashInput(

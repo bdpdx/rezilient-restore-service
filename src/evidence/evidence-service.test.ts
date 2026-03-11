@@ -5,7 +5,12 @@ import { RestoreExecutionService } from '../execute/execute-service';
 import { NoopRestoreTargetWriter } from '../execute/models';
 import { RestoreJobService } from '../jobs/job-service';
 import { RestoreLockManager } from '../locks/lock-manager';
+import {
+    InMemoryRestoreArtifactBodyReader,
+    RestoreRowMaterializationService,
+} from '../plans/materialization-service';
 import { RestorePlanService } from '../plans/plan-service';
+import { NoopRestoreTargetStateLookup } from '../plans/target-reconciliation';
 import { SourceRegistry } from '../registry/source-registry';
 import { InMemoryRestoreIndexStateReader } from '../restore-index/state-reader';
 import {
@@ -33,45 +38,6 @@ function claims() {
         tenant_id: 'tenant-acme',
         instance_id: 'sn-dev-01',
         source: 'sn://acme-dev.service-now.com',
-    };
-}
-
-function createRow(rowId: string) {
-    return {
-        row_id: rowId,
-        table: 'incident',
-        record_sys_id: `rec-${rowId}`,
-        action: 'update' as const,
-        precondition_hash: 'a'.repeat(64),
-        metadata: {
-            allowlist_version: 'rrs.metadata.allowlist.v1',
-            metadata: {
-                tenant_id: 'tenant-acme',
-                instance_id: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-                table: 'incident',
-                record_sys_id: `rec-${rowId}`,
-                event_id: `evt-${rowId}`,
-                event_type: 'cdc.write',
-                operation: 'U',
-                schema_version: 3,
-                sys_updated_on: '2026-02-16 11:59:59',
-                sys_mod_count: 2,
-                __time: '2026-02-16T11:59:59.000Z',
-                topic: 'rez.cdc',
-                partition: 1,
-                offset: '100',
-            },
-        },
-        values: {
-            diff_enc: {
-                alg: 'AES-256-CBC',
-                module: 'x_rezrp_rezilient.encrypter',
-                format: 'kmf',
-                compression: 'none',
-                ciphertext: `cipher-${rowId}`,
-            },
-        },
     };
 }
 
@@ -111,7 +77,98 @@ function createEvidenceServiceConfig() {
     };
 }
 
-async function createFixture(): Promise<{
+function seedScopeMaterializationCandidate(input: {
+    artifactReader: InMemoryRestoreArtifactBodyReader;
+    indexReader: InMemoryRestoreIndexStateReader;
+    offset: string;
+    rowId: string;
+}): void {
+    const artifactKey = `rez/restore/event=evt-${input.rowId}.artifact.json`;
+    const manifestKey = `rez/restore/event=evt-${input.rowId}.manifest.json`;
+
+    input.indexReader.upsertIndexedEventCandidate({
+        artifactKey,
+        eventId: `evt-${input.rowId}`,
+        eventTime: '2026-02-16T11:59:59.000Z',
+        instanceId: 'sn-dev-01',
+        manifestKey,
+        offset: input.offset,
+        partition: 1,
+        recordSysId: `rec-${input.rowId}`,
+        source: 'sn://acme-dev.service-now.com',
+        sysModCount: 2,
+        sysUpdatedOn: '2026-02-16 11:59:59',
+        table: 'incident',
+        tenantId: 'tenant-acme',
+        topic: 'rez.cdc',
+    });
+    input.artifactReader.setArtifactBody({
+        artifactKey,
+        body: {
+            __op: 'U',
+            __schema_version: 3,
+            __type: 'cdc.write',
+            row_enc: {
+                alg: 'AES-256-CBC',
+                module: 'x_rezrp_rezilient.encrypter',
+                format: 'kmf',
+                compression: 'none',
+                ciphertext: `cipher-${input.rowId}`,
+            },
+        },
+        manifestKey,
+    });
+}
+
+function createScopeDrivenDryRunRequest(
+    planId: string,
+    rowIds: string[],
+    approval?: Record<string, unknown>,
+): Record<string, unknown> {
+    return {
+        tenant_id: 'tenant-acme',
+        instance_id: 'sn-dev-01',
+        source: 'sn://acme-dev.service-now.com',
+        plan_id: planId,
+        requested_by: 'operator@example.com',
+        pit: {
+            restore_time: '2026-02-16T12:00:00.000Z',
+            restore_timezone: 'UTC',
+            pit_algorithm_version:
+                'pit.v1.sys_updated_on-sys_mod_count-__time-event_id',
+            tie_breaker: [
+                'sys_updated_on',
+                'sys_mod_count',
+                '__time',
+                'event_id',
+            ],
+            tie_breaker_fallback: [
+                'sys_updated_on',
+                '__time',
+                'event_id',
+            ],
+        },
+        scope: {
+            mode: 'record',
+            tables: ['incident'],
+            record_sys_ids: rowIds.map((rowId) => `rec-${rowId}`),
+        },
+        execution_options: {
+            missing_row_mode: 'existing_only',
+            conflict_policy: 'review_required',
+            schema_compatibility_mode: 'compatible_only',
+            workflow_mode: 'suppressed_default',
+        },
+        conflicts: [],
+        delete_candidates: [],
+        media_candidates: [],
+        approval,
+    };
+}
+
+async function createFixture(options?: {
+    approval?: Record<string, unknown>;
+}): Promise<{
     jobs: RestoreJobService;
     plans: RestorePlanService;
     execute: RestoreExecutionService;
@@ -126,21 +183,52 @@ async function createFixture(): Promise<{
         },
     ]);
     const restoreIndexReader = new InMemoryRestoreIndexStateReader();
+    const artifactReader = new InMemoryRestoreArtifactBodyReader();
+    const rowIds = ['row-01', 'row-02'];
 
     restoreIndexReader.upsertWatermark(RestoreWatermarkSchema.parse(
         createAuthoritativeWatermark(),
     ));
+    for (let index = 0; index < rowIds.length; index += 1) {
+        seedScopeMaterializationCandidate({
+            artifactReader,
+            indexReader: restoreIndexReader,
+            offset: String(100 + index),
+            rowId: rowIds[index],
+        });
+    }
 
     const plans = new RestorePlanService(
         sourceRegistry,
         now,
         undefined,
         restoreIndexReader,
+        undefined,
+        new RestoreRowMaterializationService(
+            artifactReader,
+            new NoopRestoreTargetStateLookup(),
+        ),
     );
     const jobs = new RestoreJobService(
         new RestoreLockManager(),
         sourceRegistry,
         now,
+        undefined,
+        undefined,
+        {
+            async getFinalizedPlan(planId: string) {
+                const plan = await plans.getPlan(planId);
+
+                if (!plan) {
+                    return null;
+                }
+
+                return {
+                    plan_id: plan.plan.plan_id,
+                    plan_hash: plan.plan.plan_hash,
+                };
+            },
+        },
     );
     const execute = new RestoreExecutionService(
         jobs,
@@ -149,6 +237,7 @@ async function createFixture(): Promise<{
         now,
         undefined,
         new NoopRestoreTargetWriter(),
+        new NoopRestoreTargetStateLookup(),
     );
     const evidence = new RestoreEvidenceService(
         jobs,
@@ -158,65 +247,11 @@ async function createFixture(): Promise<{
         now,
     );
     const dryRun = await plans.createDryRunPlan(
-        {
-            tenant_id: 'tenant-acme',
-            instance_id: 'sn-dev-01',
-            source: 'sn://acme-dev.service-now.com',
-            plan_id: 'plan-evidence-1',
-            requested_by: 'operator@example.com',
-            pit: {
-                restore_time: '2026-02-16T12:00:00.000Z',
-                restore_timezone: 'UTC',
-                pit_algorithm_version:
-                    'pit.v1.sys_updated_on-sys_mod_count-__time-event_id',
-                tie_breaker: [
-                    'sys_updated_on',
-                    'sys_mod_count',
-                    '__time',
-                    'event_id',
-                ],
-                tie_breaker_fallback: [
-                    'sys_updated_on',
-                    '__time',
-                    'event_id',
-                ],
-            },
-            scope: {
-                mode: 'record',
-                tables: ['incident'],
-                encoded_query: 'active=true',
-            },
-            execution_options: {
-                missing_row_mode: 'existing_only',
-                conflict_policy: 'review_required',
-                schema_compatibility_mode: 'compatible_only',
-                workflow_mode: 'suppressed_default',
-            },
-            rows: [createRow('row-01'), createRow('row-02')],
-            conflicts: [],
-            delete_candidates: [],
-            media_candidates: [],
-            watermarks: [
-                {
-                    contract_version: 'restore.contracts.v1',
-                    tenant_id: 'tenant-acme',
-                    instance_id: 'sn-dev-01',
-                    source: 'sn://acme-dev.service-now.com',
-                    topic: 'rez.cdc',
-                    partition: 1,
-                    generation_id: 'gen-01',
-                    indexed_through_offset: '100',
-                    indexed_through_time: '2026-02-16T12:00:00.000Z',
-                    coverage_start: '2026-02-16T00:00:00.000Z',
-                    coverage_end: '2026-02-16T12:00:00.000Z',
-                    freshness: 'fresh',
-                    executability: 'executable',
-                    reason_code: 'none',
-                    measured_at: '2026-02-16T12:00:00.000Z',
-                },
-            ],
-            pit_candidates: [],
-        },
+        createScopeDrivenDryRunRequest(
+            'plan-evidence-1',
+            rowIds,
+            options?.approval,
+        ),
         claims(),
     );
 
@@ -224,14 +259,33 @@ async function createFixture(): Promise<{
     if (!dryRun.success) {
         throw new Error('failed to create dry-run fixture');
     }
+    assert.equal(dryRun.reconciliation_state, 'draft');
+
+    const finalized = await plans.finalizeTargetReconciliation(
+        'plan-evidence-1',
+        {
+            finalized_by: 'sn-worker',
+            reconciled_records: rowIds.map((rowId) => ({
+                table: 'incident',
+                record_sys_id: `rec-${rowId}`,
+                target_state: 'exists' as const,
+            })),
+        },
+        claims(),
+    );
+
+    assert.equal(finalized.success, true);
+    if (!finalized.success) {
+        throw new Error('failed to finalize dry-run fixture');
+    }
 
     const job = await jobs.createJob(
         {
             tenant_id: 'tenant-acme',
             instance_id: 'sn-dev-01',
             source: 'sn://acme-dev.service-now.com',
-            plan_id: dryRun.record.plan.plan_id,
-            plan_hash: dryRun.record.plan.plan_hash,
+            plan_id: finalized.record.plan.plan_id,
+            plan_hash: finalized.record.plan.plan_hash,
             lock_scope_tables: ['incident'],
             required_capabilities: ['restore_execute'],
             requested_by: 'operator@example.com',
@@ -305,6 +359,55 @@ test('evidence export is deterministic and includes signed verification status',
     assert.equal(
         second.record.evidence.report_hash,
         first.record.evidence.report_hash,
+    );
+});
+
+test('evidence export sanitizes caller approval metadata as unverified', async () => {
+    const fixture = await createFixture({
+        approval: {
+            approval_required: true,
+            approval_state: 'approved',
+            approval_decided_by: 'manager@example.com',
+            approval_decision: 'approve',
+            approval_placeholder_mode: 'mvp_not_enforced',
+        },
+    });
+    const exported = await fixture.evidence.exportEvidence(fixture.jobId);
+
+    assert.equal(exported.success, true);
+    if (!exported.success) {
+        return;
+    }
+
+    assert.equal(
+        exported.record.evidence.approval.approval_state,
+        'placeholder_not_enforced',
+    );
+    assert.equal(exported.record.evidence.approval.approval_required, false);
+    assert.equal(
+        exported.record.evidence.approval.approval_decision,
+        'placeholder',
+    );
+    assert.match(
+        String(
+            exported.record.evidence.approval.approval_decision_reason || '',
+        ),
+        /unverified/i,
+    );
+    assert.equal(
+        exported.record.evidence.approval.approval_decided_by,
+        undefined,
+    );
+
+    const planArtifact = exported.record.artifacts.find((artifact) => {
+        return artifact.artifact_id === 'plan.json';
+    });
+
+    assert.ok(planArtifact);
+    assert.match(String(planArtifact?.canonical_json || ''), /unverified/i);
+    assert.doesNotMatch(
+        String(planArtifact?.canonical_json || ''),
+        /manager@example.com/i,
     );
 });
 
@@ -515,6 +618,22 @@ test('exportEvidence returns failure when job not found', async () => {
         new RestoreLockManager(),
         sourceRegistry,
         now,
+        undefined,
+        undefined,
+        {
+            async getFinalizedPlan(planId: string) {
+                const plan = await plans.getPlan(planId);
+
+                if (!plan) {
+                    return null;
+                }
+
+                return {
+                    plan_id: plan.plan.plan_id,
+                    plan_hash: plan.plan.plan_hash,
+                };
+            },
+        },
     );
     const execute = new RestoreExecutionService(
         jobs,
@@ -523,6 +642,7 @@ test('exportEvidence returns failure when job not found', async () => {
         now,
         undefined,
         new NoopRestoreTargetWriter(),
+        new NoopRestoreTargetStateLookup(),
     );
     const evidence = new RestoreEvidenceService(
         jobs,
@@ -552,69 +672,79 @@ test('exportEvidence returns failure when plan not found', async () => {
     ]);
     const restoreIndexReader =
         new InMemoryRestoreIndexStateReader();
+    const artifactReader = new InMemoryRestoreArtifactBodyReader();
+    const rowIds = ['row-01'];
     restoreIndexReader.upsertWatermark(
         RestoreWatermarkSchema.parse(
             createAuthoritativeWatermark(),
         ),
     );
+    seedScopeMaterializationCandidate({
+        artifactReader,
+        indexReader: restoreIndexReader,
+        offset: '100',
+        rowId: rowIds[0],
+    });
     const planServiceForJob = new RestorePlanService(
         sourceRegistry,
         now,
         undefined,
         restoreIndexReader,
+        undefined,
+        new RestoreRowMaterializationService(
+            artifactReader,
+            new NoopRestoreTargetStateLookup(),
+        ),
     );
     const jobs = new RestoreJobService(
         new RestoreLockManager(),
         sourceRegistry,
         now,
+        undefined,
+        undefined,
+        {
+            async getFinalizedPlan(planId: string) {
+                const plan = await planServiceForJob.getPlan(planId);
+
+                if (!plan) {
+                    return null;
+                }
+
+                return {
+                    plan_id: plan.plan.plan_id,
+                    plan_hash: plan.plan.plan_hash,
+                };
+            },
+        },
     );
     const dryRun = await planServiceForJob.createDryRunPlan(
-        {
-            tenant_id: 'tenant-acme',
-            instance_id: 'sn-dev-01',
-            source: 'sn://acme-dev.service-now.com',
-            plan_id: 'plan-orphaned',
-            requested_by: 'operator@example.com',
-            pit: {
-                restore_time: '2026-02-16T12:00:00.000Z',
-                restore_timezone: 'UTC',
-                pit_algorithm_version:
-                    'pit.v1.sys_updated_on-sys_mod_count-__time-event_id',
-                tie_breaker: [
-                    'sys_updated_on',
-                    'sys_mod_count',
-                    '__time',
-                    'event_id',
-                ],
-                tie_breaker_fallback: [
-                    'sys_updated_on',
-                    '__time',
-                    'event_id',
-                ],
-            },
-            scope: {
-                mode: 'record',
-                tables: ['incident'],
-                encoded_query: 'active=true',
-            },
-            execution_options: {
-                missing_row_mode: 'existing_only',
-                conflict_policy: 'review_required',
-                schema_compatibility_mode:
-                    'compatible_only',
-                workflow_mode: 'suppressed_default',
-            },
-            rows: [createRow('row-01')],
-            conflicts: [],
-            delete_candidates: [],
-            media_candidates: [],
-            watermarks: [createAuthoritativeWatermark()],
-            pit_candidates: [],
-        },
+        createScopeDrivenDryRunRequest(
+            'plan-orphaned',
+            rowIds,
+        ),
         claims(),
     );
     assert.equal(dryRun.success, true);
     if (!dryRun.success) {
+        return;
+    }
+    assert.equal(dryRun.reconciliation_state, 'draft');
+
+    const finalized = await planServiceForJob.finalizeTargetReconciliation(
+        'plan-orphaned',
+        {
+            finalized_by: 'sn-worker',
+            reconciled_records: [{
+                table: 'incident',
+                record_sys_id: 'rec-row-01',
+                target_state: 'exists',
+            }],
+        },
+        claims(),
+    );
+
+    assert.equal(finalized.success, true);
+    if (!finalized.success) {
         return;
     }
 
@@ -623,8 +753,8 @@ test('exportEvidence returns failure when plan not found', async () => {
             tenant_id: 'tenant-acme',
             instance_id: 'sn-dev-01',
             source: 'sn://acme-dev.service-now.com',
-            plan_id: dryRun.record.plan.plan_id,
-            plan_hash: dryRun.record.plan.plan_hash,
+            plan_id: finalized.record.plan.plan_id,
+            plan_hash: finalized.record.plan.plan_hash,
             lock_scope_tables: ['incident'],
             required_capabilities: ['restore_execute'],
             requested_by: 'operator@example.com',
@@ -647,6 +777,7 @@ test('exportEvidence returns failure when plan not found', async () => {
         now,
         undefined,
         new NoopRestoreTargetWriter(),
+        new NoopRestoreTargetStateLookup(),
     );
     const evidence = new RestoreEvidenceService(
         jobs,

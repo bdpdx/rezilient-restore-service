@@ -248,13 +248,14 @@ export type CompleteRestoreJobRequest = z.infer<
 export function buildApprovalPlaceholder(
     approval?: RestoreApprovalMetadata,
 ): RestoreApprovalMetadata {
-    if (approval) {
-        return approval;
-    }
-
     return {
         approval_required: false,
         approval_state: 'placeholder_not_enforced',
+        approval_decision: 'placeholder',
+        approval_decision_reason: approval
+            ? 'caller-supplied approval metadata is unverified'
+            : 'approval enforcement is not configured in this stage',
+        approval_revalidation_result: 'not_applicable',
         approval_placeholder_mode: 'mvp_not_enforced',
     };
 }

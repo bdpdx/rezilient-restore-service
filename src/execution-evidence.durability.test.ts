@@ -19,7 +19,12 @@ import { PostgresRestoreJobStateStore } from './jobs/job-state-store';
 import { RestoreJobService } from './jobs/job-service';
 import { RestoreLockManager } from './locks/lock-manager';
 import { PostgresRestorePlanStateStore } from './plans/plan-state-store';
+import {
+    InMemoryRestoreArtifactBodyReader,
+    RestoreRowMaterializationService,
+} from './plans/materialization-service';
 import { RestorePlanService } from './plans/plan-service';
+import { NoopRestoreTargetStateLookup } from './plans/target-reconciliation';
 import { SourceRegistry } from './registry/source-registry';
 import { InMemoryRestoreIndexStateReader } from './restore-index/state-reader';
 import {
@@ -33,6 +38,8 @@ type Fixture = {
     plans: RestorePlanService;
     execute: RestoreExecutionService;
     evidence: RestoreEvidenceService;
+    artifactReader: InMemoryRestoreArtifactBodyReader;
+    restoreIndexReader: InMemoryRestoreIndexStateReader;
 };
 
 function now(): Date {
@@ -54,46 +61,7 @@ function claims() {
     };
 }
 
-function createRow(rowId: string): Record<string, unknown> {
-    return {
-        row_id: rowId,
-        table: 'incident',
-        record_sys_id: `rec-${rowId}`,
-        action: 'update',
-        precondition_hash: 'a'.repeat(64),
-        metadata: {
-            allowlist_version: 'rrs.metadata.allowlist.v1',
-            metadata: {
-                tenant_id: 'tenant-acme',
-                instance_id: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-                table: 'incident',
-                record_sys_id: `rec-${rowId}`,
-                event_id: `evt-${rowId}`,
-                event_type: 'cdc.write',
-                operation: 'U',
-                schema_version: 3,
-                sys_updated_on: '2026-02-18 17:59:59',
-                sys_mod_count: 2,
-                __time: '2026-02-18T17:59:59.000Z',
-                topic: 'rez.cdc',
-                partition: 1,
-                offset: '42',
-            },
-        },
-        values: {
-            diff_enc: {
-                alg: 'AES-256-CBC',
-                module: 'x_rezrp_rezilient.encrypter',
-                format: 'kmf',
-                compression: 'none',
-                ciphertext: `cipher-${rowId}`,
-            },
-        },
-    };
-}
-
-function createDryRunRequest(
+function createScopeDrivenDryRunRequest(
     planId: string,
     rowIds: string[],
 ): Record<string, unknown> {
@@ -123,7 +91,7 @@ function createDryRunRequest(
         scope: {
             mode: 'record',
             tables: ['incident'],
-            encoded_query: 'active=true',
+            record_sys_ids: rowIds.map((rowId) => `rec-${rowId}`),
         },
         execution_options: {
             missing_row_mode: 'existing_only',
@@ -131,30 +99,9 @@ function createDryRunRequest(
             schema_compatibility_mode: 'compatible_only',
             workflow_mode: 'suppressed_default',
         },
-        rows: rowIds.map((rowId) => createRow(rowId)),
         conflicts: [],
         delete_candidates: [],
         media_candidates: [],
-        watermarks: [
-            {
-                contract_version: 'restore.contracts.v1',
-                tenant_id: 'tenant-acme',
-                instance_id: 'sn-dev-01',
-                source: 'sn://acme-dev.service-now.com',
-                topic: 'rez.cdc',
-                partition: 1,
-                generation_id: 'gen-01',
-                indexed_through_offset: '100',
-                indexed_through_time: '2026-02-18T17:59:59.000Z',
-                coverage_start: '2026-02-18T00:00:00.000Z',
-                coverage_end: '2026-02-18T17:59:59.000Z',
-                freshness: 'fresh',
-                executability: 'executable',
-                reason_code: 'none',
-                measured_at: '2026-02-18T18:00:00.000Z',
-            },
-        ],
-        pit_candidates: [],
     };
 }
 
@@ -194,6 +141,49 @@ function createAuthoritativeWatermark(): Record<string, unknown> {
     };
 }
 
+function seedScopeMaterializationCandidate(input: {
+    artifactReader: InMemoryRestoreArtifactBodyReader;
+    indexReader: InMemoryRestoreIndexStateReader;
+    offset: string;
+    rowId: string;
+}): void {
+    const artifactKey = `rez/restore/event=evt-${input.rowId}.artifact.json`;
+    const manifestKey = `rez/restore/event=evt-${input.rowId}.manifest.json`;
+
+    input.indexReader.upsertIndexedEventCandidate({
+        artifactKey,
+        eventId: `evt-${input.rowId}`,
+        eventTime: '2026-02-18T17:59:59.000Z',
+        instanceId: 'sn-dev-01',
+        manifestKey,
+        offset: input.offset,
+        partition: 1,
+        recordSysId: `rec-${input.rowId}`,
+        source: 'sn://acme-dev.service-now.com',
+        sysModCount: 2,
+        sysUpdatedOn: '2026-02-18 17:59:59',
+        table: 'incident',
+        tenantId: 'tenant-acme',
+        topic: 'rez.cdc',
+    });
+    input.artifactReader.setArtifactBody({
+        artifactKey,
+        body: {
+            __op: 'U',
+            __schema_version: 3,
+            __type: 'cdc.write',
+            row_enc: {
+                alg: 'AES-256-CBC',
+                module: 'x_rezrp_rezilient.encrypter',
+                format: 'kmf',
+                compression: 'none',
+                ciphertext: `cipher-${input.rowId}`,
+            },
+        },
+        manifestKey,
+    });
+}
+
 function createFixture(
     db: ReturnType<typeof newDb>,
     maxChunksPerAttempt: number,
@@ -208,6 +198,7 @@ function createFixture(
         },
     ]);
     const restoreIndexReader = new InMemoryRestoreIndexStateReader();
+    const artifactReader = new InMemoryRestoreArtifactBodyReader();
 
     restoreIndexReader.upsertWatermark(RestoreWatermarkSchema.parse(
         createAuthoritativeWatermark(),
@@ -219,6 +210,11 @@ function createFixture(
             pool: pool as any,
         }),
         restoreIndexReader,
+        undefined,
+        new RestoreRowMaterializationService(
+            artifactReader,
+            new NoopRestoreTargetStateLookup(),
+        ),
     );
     const jobs = new RestoreJobService(
         new RestoreLockManager(),
@@ -227,6 +223,21 @@ function createFixture(
         new PostgresRestoreJobStateStore('postgres://unused', {
             pool: pool as any,
         }),
+        undefined,
+        {
+            async getFinalizedPlan(planId: string) {
+                const plan = await plans.getPlan(planId);
+
+                if (!plan) {
+                    return null;
+                }
+
+                return {
+                    plan_id: plan.plan.plan_id,
+                    plan_hash: plan.plan.plan_hash,
+                };
+            },
+        },
     );
     const execute = new RestoreExecutionService(
         jobs,
@@ -239,6 +250,7 @@ function createFixture(
             pool: pool as any,
         }),
         new NoopRestoreTargetWriter(),
+        new NoopRestoreTargetStateLookup(),
     );
     const evidence = new RestoreEvidenceService(
         jobs,
@@ -269,22 +281,30 @@ function createFixture(
         plans,
         execute,
         evidence,
+        artifactReader,
+        restoreIndexReader,
     };
 }
 
 async function createPlanAndJob(
-    fixture: {
-        jobs: RestoreJobService;
-        plans: RestorePlanService;
-    },
+    fixture: Fixture,
     planId: string,
     rowIds: string[],
 ): Promise<{
     jobId: string;
     planHash: string;
 }> {
+    for (let index = 0; index < rowIds.length; index += 1) {
+        seedScopeMaterializationCandidate({
+            artifactReader: fixture.artifactReader,
+            indexReader: fixture.restoreIndexReader,
+            offset: String(100 + index),
+            rowId: rowIds[index],
+        });
+    }
+
     const dryRun = await fixture.plans.createDryRunPlan(
-        createDryRunRequest(planId, rowIds),
+        createScopeDrivenDryRunRequest(planId, rowIds),
         claims(),
     );
 
@@ -292,9 +312,28 @@ async function createPlanAndJob(
     if (!dryRun.success) {
         throw new Error('failed to create dry-run plan fixture');
     }
+    assert.equal(dryRun.reconciliation_state, 'draft');
+
+    const finalized = await fixture.plans.finalizeTargetReconciliation(
+        planId,
+        {
+            finalized_by: 'sn-worker',
+            reconciled_records: rowIds.map((rowId) => ({
+                table: 'incident',
+                record_sys_id: `rec-${rowId}`,
+                target_state: 'exists' as const,
+            })),
+        },
+        claims(),
+    );
+
+    assert.equal(finalized.success, true);
+    if (!finalized.success) {
+        throw new Error('failed to finalize dry-run plan fixture');
+    }
 
     const job = await fixture.jobs.createJob(
-        createJobRequest(planId, dryRun.record.plan.plan_hash),
+        createJobRequest(planId, finalized.record.plan.plan_hash),
         claims(),
     );
 
@@ -305,7 +344,7 @@ async function createPlanAndJob(
 
     return {
         jobId: job.job.job_id,
-        planHash: dryRun.record.plan.plan_hash,
+        planHash: finalized.record.plan.plan_hash,
     };
 }
 

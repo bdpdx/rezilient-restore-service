@@ -520,6 +520,65 @@ test('createJob succeeds when finalized plan exists', async () => {
     assert.equal(result.job.status, 'running');
 });
 
+test('createJob sanitizes caller approval metadata before persisting it', async () => {
+    const stateStore = new InMemoryRestoreJobStateStore();
+    const service = createService({
+        stateStore,
+        finalizedPlanReader: createFinalizedPlanReader({
+            plansById: {
+                'plan-finalized': 'a'.repeat(64),
+            },
+            defaultPlanHash: null,
+        }),
+    });
+    const result = await service.createJob(
+        {
+            ...baseRequest('plan-finalized', 'incident'),
+            approval: {
+                approval_required: true,
+                approval_state: 'approved',
+                approval_policy_id: 'policy-1',
+                approval_requested_at: '2026-02-16T10:00:00.000Z',
+                approval_requested_by: 'requester@example.com',
+                approval_decided_at: '2026-02-16T11:00:00.000Z',
+                approval_decided_by: 'approver@example.com',
+                approval_decision: 'approve',
+                approval_decision_reason: 'approved externally',
+                approval_external_ref: 'ticket-123',
+                approval_snapshot_hash: 'a'.repeat(64),
+                approval_valid_until: '2026-02-17T12:00:00.000Z',
+                approval_revalidated_at: '2026-02-16T11:30:00.000Z',
+                approval_revalidation_result: 'valid',
+                approval_placeholder_mode: 'mvp_not_enforced',
+            },
+        },
+        claims(),
+    );
+
+    assert.equal(result.success, true);
+
+    if (!result.success) {
+        return;
+    }
+
+    assert.deepEqual(result.job.approval, {
+        approval_required: false,
+        approval_state: 'placeholder_not_enforced',
+        approval_decision: 'placeholder',
+        approval_decision_reason:
+            'caller-supplied approval metadata is unverified',
+        approval_revalidation_result: 'not_applicable',
+        approval_placeholder_mode: 'mvp_not_enforced',
+    });
+
+    const state = await stateStore.read();
+
+    assert.deepEqual(
+        state.plans_by_id['plan-finalized']?.approval,
+        result.job.approval,
+    );
+});
+
 test('createJob rejects missing ACP mapping', async () => {
     const service = createService({
         resolver: createResolver(async () => ({
