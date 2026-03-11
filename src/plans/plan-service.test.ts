@@ -225,6 +225,59 @@ function seedScopeMaterializationRecord(input: {
     });
 }
 
+function seedScopeMediaMaterializationRecord(input: {
+    artifactReader: InMemoryRestoreArtifactBodyReader;
+    eventId: string;
+    eventTime: string;
+    indexReader: InMemoryRestoreIndexStateReader;
+    offset: string;
+    partition: number;
+    recordSysId: string;
+    sysModCount: number;
+    sysUpdatedOn: string;
+    table: string;
+}): void {
+    const artifactKey = `rez/restore/event=${input.eventId}.artifact.json`;
+    const manifestKey = `rez/restore/event=${input.eventId}.manifest.json`;
+
+    input.indexReader.upsertIndexedEventCandidate({
+        artifactKey,
+        eventId: input.eventId,
+        eventTime: input.eventTime,
+        instanceId: 'sn-dev-01',
+        manifestKey,
+        offset: input.offset,
+        partition: input.partition,
+        recordSysId: input.recordSysId,
+        source: 'sn://acme-dev.service-now.com',
+        sysModCount: input.sysModCount,
+        sysUpdatedOn: input.sysUpdatedOn,
+        table: input.table,
+        tenantId: 'tenant-acme',
+        topic: 'rez.media',
+    });
+    input.artifactReader.setArtifactBody({
+        artifactKey,
+        body: {
+            __op: 'U',
+            __record_sys_id: input.recordSysId,
+            __table: input.table,
+            __type: 'media.manifest',
+            media: {
+                op: 'upsert',
+                items: [{
+                    media_id: `media-${input.recordSysId}`,
+                    parent_record_sys_id: input.recordSysId,
+                    table: input.table,
+                }],
+            },
+            source: 'sn://acme-dev.service-now.com',
+            tenant_id: 'tenant-acme',
+        },
+        manifestKey,
+    });
+}
+
 type Fixture = {
     service: RestorePlanService;
     indexReader: InMemoryRestoreIndexStateReader;
@@ -513,6 +566,115 @@ describe('RestorePlanService', () => {
                 await fixture.service.getPlan('plan-scope-driven'),
                 null,
             );
+        },
+    );
+
+    test(
+        'createDryRunPlan materializes rows from row-capable PIT candidates '
+        + 'when media artifacts coexist',
+        async () => {
+            const fixture = createScopeDrivenFixture();
+
+            seedScopeMaterializationRecord({
+                artifactReader: fixture.artifactReader,
+                eventId: 'evt-row-capable',
+                eventTime: '2026-02-18T15:21:00.000Z',
+                indexReader: fixture.indexReader,
+                offset: '121',
+                partition: 0,
+                recordSysId: 'rec-01',
+                sysModCount: 3,
+                sysUpdatedOn: '2026-02-18 15:21:00',
+                table: 'x_app.ticket',
+            });
+            seedScopeMediaMaterializationRecord({
+                artifactReader: fixture.artifactReader,
+                eventId: 'evt-media-only',
+                eventTime: '2026-02-18T15:25:00.000Z',
+                indexReader: fixture.indexReader,
+                offset: '122',
+                partition: 0,
+                recordSysId: 'rec-01',
+                sysModCount: 9,
+                sysUpdatedOn: '2026-02-18 15:25:00',
+                table: 'x_app.ticket',
+            });
+
+            const result = await fixture.service.createDryRunPlan(
+                buildScopeDrivenDryRunRequest('plan-scope-mixed-row-media', {
+                    scope: {
+                        mode: 'record',
+                        tables: ['x_app.ticket'],
+                        record_sys_ids: ['rec-01'],
+                    },
+                }),
+                claims(),
+            );
+
+            assert.equal(result.success, true);
+            if (!result.success) {
+                return;
+            }
+
+            assert.equal(result.statusCode, 202);
+            assert.equal(result.reconciliation_state, 'draft');
+            assert.equal(result.record.plan_hash_input.rows.length, 1);
+            assert.equal(
+                result.record.plan_hash_input.rows[0].record_sys_id,
+                'rec-01',
+            );
+            assert.equal(
+                result.record.plan_hash_input.rows[0].metadata.metadata.event_id,
+                'evt-row-capable',
+            );
+            assert.equal(
+                result.target_reconciliation_records[0].source_operation,
+                'U',
+            );
+        },
+    );
+
+    test(
+        'createDryRunPlan keeps missing-row-material failure semantics when '
+        + 'PIT candidates are media-only',
+        async () => {
+            const fixture = createScopeDrivenFixture();
+
+            seedScopeMediaMaterializationRecord({
+                artifactReader: fixture.artifactReader,
+                eventId: 'evt-media-only',
+                eventTime: '2026-02-18T15:27:00.000Z',
+                indexReader: fixture.indexReader,
+                offset: '201',
+                partition: 0,
+                recordSysId: 'rec-01',
+                sysModCount: 10,
+                sysUpdatedOn: '2026-02-18 15:27:00',
+                table: 'x_app.ticket',
+            });
+
+            const result = await fixture.service.createDryRunPlan(
+                buildScopeDrivenDryRunRequest('plan-scope-media-only', {
+                    scope: {
+                        mode: 'record',
+                        tables: ['x_app.ticket'],
+                        record_sys_ids: ['rec-01'],
+                    },
+                }),
+                claims(),
+            );
+
+            assert.equal(result.success, false);
+            if (result.success) {
+                return;
+            }
+
+            assert.equal(result.statusCode, 409);
+            assert.equal(result.error, 'restore_plan_materialization_failed');
+            assert.equal(result.reasonCode, 'blocked_freshness_unknown');
+            assert.equal(result.freshnessUnknownDetail, 'no_indexed_coverage');
+            assert.match(result.message, /missing PIT candidates/i);
+            assert.match(result.message, /row-capable PIT candidates/i);
         },
     );
 

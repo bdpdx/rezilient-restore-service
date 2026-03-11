@@ -2228,6 +2228,149 @@ test(
 );
 
 test(
+    'scope-driven dry-run keeps media candidates while selecting '
+    + 'row-capable PIT winners over newer media artifacts',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const rowArtifactKey =
+            'rez/restore/event=evt-scope-row-capable.artifact.json';
+        const rowManifestKey =
+            'rez/restore/event=evt-scope-row-capable.manifest.json';
+        const mediaArtifactKey =
+            'rez/restore/event=evt-scope-media-only.artifact.json';
+        const mediaManifestKey =
+            'rez/restore/event=evt-scope-media-only.manifest.json';
+        const server = createService(signingKey, {
+            sourceMappingResolver: createResolver(createResolveResult()),
+            indexedEventCandidates: [{
+                artifactKey: rowArtifactKey,
+                eventId: 'evt-scope-row-capable',
+                eventTime: '2026-02-16T11:56:00.000Z',
+                manifestKey: rowManifestKey,
+                offset: '140',
+                partition: 1,
+                recordSysId: 'rec-01',
+                sysModCount: 4,
+                sysUpdatedOn: '2026-02-16 11:56:00',
+                table: 'incident',
+                topic: 'rez.cdc',
+            }, {
+                artifactKey: mediaArtifactKey,
+                eventId: 'evt-scope-media-only',
+                eventTime: '2026-02-16T11:59:00.000Z',
+                manifestKey: mediaManifestKey,
+                offset: '141',
+                partition: 1,
+                recordSysId: 'rec-01',
+                sysModCount: 9,
+                sysUpdatedOn: '2026-02-16 11:59:00',
+                table: 'incident',
+                topic: 'rez.media',
+            }],
+            artifactBodies: [{
+                artifactKey: rowArtifactKey,
+                body: {
+                    __op: 'U',
+                    __schema_version: 3,
+                    __type: 'cdc.write',
+                    row_enc: {
+                        alg: 'AES-256-GCM',
+                        ciphertext: 'cipher-scope-row-capable',
+                    },
+                },
+                manifestKey: rowManifestKey,
+            }, {
+                artifactKey: mediaArtifactKey,
+                body: {
+                    __op: 'U',
+                    __record_sys_id: 'rec-01',
+                    __table: 'incident',
+                    __type: 'media.manifest',
+                    media: {
+                        op: 'upsert',
+                        items: [{
+                            media_id: 'media-rec-01',
+                            parent_record_sys_id: 'rec-01',
+                            table: 'incident',
+                        }],
+                    },
+                    source: 'sn://acme-dev.service-now.com',
+                    tenant_id: 'tenant-acme',
+                },
+                manifestKey: mediaManifestKey,
+            }],
+        });
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+        const mediaCandidate = createMediaCandidate('mixed-scope-01');
+
+        try {
+            const response = await postJson(
+                baseUrl,
+                '/v1/plans/dry-run',
+                token,
+                {
+                    ...createScopeDrivenDryRunPayload(
+                        'plan-scope-http-mixed-row-media',
+                    ),
+                    media_candidates: [mediaCandidate],
+                },
+            );
+
+            assert.equal(response.status, 202);
+            assert.equal(response.body.reconciliation_state, 'draft');
+            const gate = response.body.gate as Record<string, unknown>;
+
+            assert.equal(gate.executability, 'executable');
+            assert.equal(gate.reason_code, 'none');
+
+            const planHashInput = response.body.plan_hash_input as Record<
+                string,
+                unknown
+            >;
+            const rows = planHashInput.rows as Array<Record<string, unknown>>;
+            const firstRow = rows[0];
+            const metadata = firstRow.metadata as Record<string, unknown>;
+            const metadataFields = metadata.metadata as Record<string, unknown>;
+
+            assert.equal(rows.length, 1);
+            assert.equal(firstRow.record_sys_id, 'rec-01');
+            assert.equal(metadataFields.event_id, 'evt-scope-row-capable');
+            assert.equal(metadataFields.topic, 'rez.cdc');
+            assert.equal(metadataFields.sys_mod_count, 4);
+
+            const pitResolutions = response.body.pit_resolutions as Array<
+                Record<string, unknown>
+            >;
+
+            assert.equal(pitResolutions.length, 1);
+            assert.equal(
+                pitResolutions[0].winning_event_id,
+                'evt-scope-row-capable',
+            );
+
+            const targetReconciliationRecords =
+                response.body.target_reconciliation_records as Array<
+                    Record<string, unknown>
+                >;
+
+            assert.equal(targetReconciliationRecords.length, 1);
+            assert.equal(targetReconciliationRecords[0].source_operation, 'U');
+
+            const mediaCandidates = response.body.media_candidates as Array<
+                Record<string, unknown>
+            >;
+
+            assert.equal(mediaCandidates.length, 1);
+            assert.equal(mediaCandidates[0].candidate_id, 'mixed-scope-01');
+            assert.equal(mediaCandidates[0].decision, 'include');
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
+
+test(
     'scope-driven finalize reconciles source insert to update and '
     + 'authoritative action counts',
     async () => {

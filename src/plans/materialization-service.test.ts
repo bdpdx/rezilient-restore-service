@@ -510,6 +510,129 @@ async () => {
     assert.equal(result.rows[0].action, 'update');
 });
 
+test(
+    'materializeRows ignores media-only PIT candidates for row winner selection',
+    async () => {
+        const { reader, service } = buildServiceFixture();
+        const rowOlder = buildCandidate({
+            artifactKey: 'rez/restore/event=evt-row-old.artifact.json',
+            eventId: 'evt-row-old',
+            eventTime: '2026-02-21T10:00:00.000Z',
+            manifestKey: 'rez/restore/event=evt-row-old.manifest.json',
+            sysModCount: 1,
+            sysUpdatedOn: '2026-02-21 10:00:00',
+            topic: 'rez.cdc',
+        });
+        const rowWinner = buildCandidate({
+            artifactKey: 'rez/restore/event=evt-row-win.artifact.json',
+            eventId: 'evt-row-win',
+            eventTime: '2026-02-21T10:01:00.000Z',
+            manifestKey: 'rez/restore/event=evt-row-win.manifest.json',
+            sysModCount: 2,
+            sysUpdatedOn: '2026-02-21 10:01:00',
+            topic: 'rez.cdc',
+        });
+        const mediaOnly = buildCandidate({
+            artifactKey: 'rez/restore/event=evt-media.artifact.json',
+            eventId: 'evt-media',
+            eventTime: '2026-02-21T10:02:00.000Z',
+            manifestKey: 'rez/restore/event=evt-media.manifest.json',
+            sysModCount: 100,
+            sysUpdatedOn: '2026-02-21 10:02:00',
+            topic: 'rez.media',
+        });
+
+        reader.setArtifactBody({
+            artifactKey: rowOlder.artifactKey,
+            body: buildArtifact({
+                row_enc: encryptedPayload('row-older-ciphertext'),
+            }),
+            manifestKey: rowOlder.manifestKey,
+        });
+        reader.setArtifactBody({
+            artifactKey: rowWinner.artifactKey,
+            body: buildArtifact({
+                row_enc: encryptedPayload('row-winner-ciphertext'),
+            }),
+            manifestKey: rowWinner.manifestKey,
+        });
+        reader.setArtifactBody({
+            artifactKey: mediaOnly.artifactKey,
+            body: {
+                __op: 'U',
+                __type: 'media.manifest',
+                media: {
+                    op: 'U',
+                },
+            },
+            manifestKey: mediaOnly.manifestKey,
+        });
+
+        const result = await service.materializeRows({
+            candidates: [
+                rowOlder,
+                mediaOnly,
+                rowWinner,
+            ],
+            instanceId: 'sn-dev-01',
+            scopeRecords: [{
+                recordSysId: 'rec-01',
+                table: 'x_app.ticket',
+            }],
+            source: 'sn://acme-dev.service-now.com',
+            tenantId: 'tenant-acme',
+        });
+
+        assert.equal(result.rows.length, 1);
+        assert.equal(result.pitResolutions.length, 1);
+        assert.equal(result.pitResolutions[0].winning_event_id, 'evt-row-win');
+        assert.equal(
+            result.rows[0].metadata.metadata.event_id,
+            'evt-row-win',
+        );
+    },
+);
+
+test(
+    'materializeRows fails closed when PIT candidates are media-only',
+    async () => {
+        const { reader, service } = buildServiceFixture();
+        const mediaOnly = buildCandidate({
+            artifactKey: 'rez/restore/event=evt-media-only.artifact.json',
+            eventId: 'evt-media-only',
+            manifestKey: 'rez/restore/event=evt-media-only.manifest.json',
+            topic: 'rez.media',
+        });
+
+        reader.setArtifactBody({
+            artifactKey: mediaOnly.artifactKey,
+            body: {
+                __type: 'media.manifest',
+                media: {
+                    op: 'U',
+                },
+            },
+            manifestKey: mediaOnly.manifestKey,
+        });
+
+        await assert.rejects(
+            async () => service.materializeRowsForTargetReconciliationDraft({
+                candidates: [mediaOnly],
+                instanceId: 'sn-dev-01',
+                source: 'sn://acme-dev.service-now.com',
+                tenantId: 'tenant-acme',
+            }),
+            (error: unknown) => {
+                assert.ok(error instanceof RestoreRowMaterializationError);
+                assert.equal(error.code, 'missing_pit_candidates');
+                assert.match(error.message, /row-capable PIT candidates/i);
+
+                return true;
+            },
+        );
+    },
+);
+
 test('materializeRows fails closed when winning artifact body is missing',
 async () => {
     const { service } = buildServiceFixture();

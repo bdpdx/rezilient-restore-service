@@ -306,6 +306,20 @@ function candidateMatchesTuple(
     );
 }
 
+function isRowCapableCandidate(
+    candidate: RestoreIndexIndexedEventLookupCandidate,
+): boolean {
+    const normalizedTopic = readOptionalText(candidate.topic)?.toLowerCase();
+
+    if (!normalizedTopic) {
+        return true;
+    }
+
+    const topicSegments = normalizedTopic.split('.');
+
+    return topicSegments[topicSegments.length - 1] !== 'media';
+}
+
 function resolvePitWinner(
     candidates: RestoreIndexIndexedEventLookupCandidate[],
 ): {
@@ -315,7 +329,7 @@ function resolvePitWinner(
     if (candidates.length === 0) {
         throw new RestoreRowMaterializationError(
             'missing_pit_candidates',
-            'record has no PIT candidates',
+            'record has no row-capable PIT candidates',
         );
     }
 
@@ -499,6 +513,10 @@ function groupByRecord(
         new Map<string, RestoreIndexIndexedEventLookupCandidate[]>();
 
     for (const candidate of candidates) {
+        if (!isRowCapableCandidate(candidate)) {
+            continue;
+        }
+
         const key = buildReferenceKey(candidate.table, candidate.recordSysId);
         const existing = grouped.get(key);
 
@@ -572,7 +590,7 @@ export class RestoreRowMaterializationService {
         if (groupedCandidates.size === 0) {
             throw new RestoreRowMaterializationError(
                 'missing_pit_candidates',
-                'no PIT candidates were provided for materialization',
+                'no row-capable PIT candidates were provided for materialization',
             );
         }
 
@@ -586,7 +604,7 @@ export class RestoreRowMaterializationService {
                 if (!groupedCandidates.has(key)) {
                     throw new RestoreRowMaterializationError(
                         'missing_pit_candidates',
-                        'scope record has no PIT candidates',
+                        'scope record has no row-capable PIT candidates',
                         {
                             recordSysId: scopeRecord.recordSysId,
                             table: scopeRecord.table,
