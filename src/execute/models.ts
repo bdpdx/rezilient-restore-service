@@ -4,6 +4,10 @@ import type {
     RestoreJournalEntry,
     RestorePlanHashRowInput,
 } from '@rezilient/types';
+import {
+    FinalizeTargetReconciliationRecordSchema,
+    type FinalizeTargetReconciliationRecord,
+} from '../plans/models';
 
 const RESTORE_CAPABILITIES = [
     'restore_execute',
@@ -80,6 +84,30 @@ export type RestoreConflictResolution = z.infer<
     typeof RestoreConflictResolutionSchema
 >;
 export type RestorePlanAction = z.infer<typeof RestorePlanActionSchema>;
+
+function requireUniqueTargetRevalidationRecords(
+    records: FinalizeTargetReconciliationRecord[],
+    ctx: z.RefinementCtx,
+): void {
+    const seen = new Set<string>();
+
+    for (const record of records) {
+        const key = `${record.table}|${record.record_sys_id}`;
+
+        if (seen.has(key)) {
+            ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                message:
+                    'revalidated target records must be unique by '
+                    + 'table + record_sys_id',
+                path: ['revalidated_target_records'],
+            });
+            return;
+        }
+
+        seen.add(key);
+    }
+}
 
 export const ExecutionWorkflowModeSchema = z.enum([
     'suppressed_default',
@@ -202,6 +230,9 @@ export const ExecuteRestoreJobRequestSchema = z
         runtime_conflicts: z
             .array(ExecuteRuntimeConflictInputSchema)
             .default([]),
+        revalidated_target_records: z
+            .array(FinalizeTargetReconciliationRecordSchema)
+            .default([]),
         elevated_confirmation: ElevatedConfirmationSchema.optional(),
     })
     .strict()
@@ -229,6 +260,11 @@ export const ExecuteRestoreJobRequestSchema = z
             conflictIds.add(conflict.conflict_id);
             rowIds.add(conflict.row_id);
         }
+
+        requireUniqueTargetRevalidationRecords(
+            request.revalidated_target_records,
+            ctx,
+        );
     });
 
 export type ExecuteRestoreJobRequest = z.infer<
@@ -242,6 +278,9 @@ export const ResumeRestoreJobRequestSchema = z
         runtime_conflicts: z
             .array(ExecuteRuntimeConflictInputSchema)
             .default([]),
+        revalidated_target_records: z
+            .array(FinalizeTargetReconciliationRecordSchema)
+            .default([]),
         expected_plan_checksum: z
             .string()
             .regex(/^[a-f0-9]{64}$/i)
@@ -251,7 +290,13 @@ export const ResumeRestoreJobRequestSchema = z
             .regex(/^[a-f0-9]{64}$/i)
             .optional(),
     })
-    .strict();
+    .strict()
+    .superRefine((request, ctx) => {
+        requireUniqueTargetRevalidationRecords(
+            request.revalidated_target_records,
+            ctx,
+        );
+    });
 
 export type ResumeRestoreJobRequest = z.infer<
     typeof ResumeRestoreJobRequestSchema
@@ -399,6 +444,7 @@ export interface RestoreExecutionRecord {
     workflow_allowlist: string[];
     elevated_confirmation_used: boolean;
     capabilities_used: RestoreCapability[];
+    revalidated_target_records: FinalizeTargetReconciliationRecord[];
     resume_attempt_count: number;
     checkpoint: ExecutionResumeCheckpoint;
     summary: ExecuteSummary;

@@ -6,6 +6,7 @@ import { RestoreEvidenceService } from './evidence/evidence-service';
 import { PostgresRestoreEvidenceStateStore } from './evidence/evidence-state-store';
 import { RestoreExecutionService } from './execute/execute-service';
 import { PostgresRestoreExecutionStateStore } from './execute/execute-state-store';
+import { NoopRestoreTargetWriter } from './execute/models';
 import { RestoreLockManager } from './locks/lock-manager';
 import { PostgresRestoreJobStateStore } from './jobs/job-state-store';
 import { RestoreJobService } from './jobs/job-service';
@@ -136,6 +137,7 @@ async function main(): Promise<void> {
         },
         undefined,
         executeStateStore,
+        new NoopRestoreTargetWriter(),
     );
     const evidence = new RestoreEvidenceService(
         jobs,

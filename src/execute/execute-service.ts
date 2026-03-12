@@ -11,7 +11,10 @@ import type {
 import { AuthTokenClaims } from '../auth/claims';
 import { normalizeIsoWithMillis, RestoreJobRecord } from '../jobs/models';
 import { RestoreJobService } from '../jobs/job-service';
-import { RestoreDryRunPlanRecord } from '../plans/models';
+import {
+    type FinalizeTargetReconciliationRecord,
+    RestoreDryRunPlanRecord,
+} from '../plans/models';
 import { RestorePlanService } from '../plans/plan-service';
 import {
     buildTargetStateLookupKey,
@@ -667,9 +670,15 @@ function summarizeExecution(
 function cloneExecutionRecord(
     record: RestoreExecutionRecord,
 ): RestoreExecutionRecord {
-    return JSON.parse(
+    const cloned = JSON.parse(
         JSON.stringify(record),
     ) as RestoreExecutionRecord;
+
+    if (!Array.isArray(cloned.revalidated_target_records)) {
+        cloned.revalidated_target_records = [];
+    }
+
+    return cloned;
 }
 
 function cloneJournalEntries(
@@ -686,6 +695,14 @@ function cloneMirrorEntries(
     return JSON.parse(
         JSON.stringify(entries),
     ) as RestoreJournalMirrorRecord[];
+}
+
+function cloneTargetRevalidationRecords(
+    records: FinalizeTargetReconciliationRecord[],
+): FinalizeTargetReconciliationRecord[] {
+    return JSON.parse(
+        JSON.stringify(records),
+    ) as FinalizeTargetReconciliationRecord[];
 }
 
 export class RestoreExecutionService {
@@ -830,6 +847,7 @@ export class RestoreExecutionService {
 
         const executeRevalidation = await this.revalidateExecuteTimeTargetStates({
             job,
+            revalidatedTargetRecords: request.revalidated_target_records,
             rows: plan.plan_hash_input.rows,
         });
 
@@ -866,6 +884,9 @@ export class RestoreExecutionService {
                 undefined,
             capabilities_used: normalizeCapabilities(
                 request.operator_capabilities,
+            ),
+            revalidated_target_records: cloneTargetRevalidationRecords(
+                request.revalidated_target_records,
             ),
             resume_attempt_count: 0,
             checkpoint: buildInitialCheckpoint(
@@ -1054,6 +1075,10 @@ export class RestoreExecutionService {
 
         const currentPlanChecksum = computePlanChecksum(plan);
         const currentPreconditionChecksum = computePreconditionChecksum(plan);
+        const revalidatedTargetRecords =
+            request.revalidated_target_records.length > 0
+                ? request.revalidated_target_records
+                : existing.revalidated_target_records || [];
 
         if (currentPlanChecksum !== existing.plan_checksum) {
             return buildFailure(
@@ -1075,6 +1100,7 @@ export class RestoreExecutionService {
 
         const resumeRevalidation = await this.revalidateExecuteTimeTargetStates({
             job,
+            revalidatedTargetRecords,
             rows: plan.plan_hash_input.rows,
         });
 
@@ -1099,10 +1125,15 @@ export class RestoreExecutionService {
             );
         }
 
+        const resumedRecord = cloneExecutionRecord(existing);
+
+        resumedRecord.revalidated_target_records =
+            cloneTargetRevalidationRecords(revalidatedTargetRecords);
+
         return this.processAttempt(
             resume.job,
             plan,
-            existing,
+            resumedRecord,
             toConflictMap(request.runtime_conflicts),
         );
     }
@@ -1182,6 +1213,7 @@ export class RestoreExecutionService {
                 capabilities_used: normalizeCapabilities(
                     job.required_capabilities,
                 ),
+                revalidated_target_records: [],
                 resume_attempt_count: 0,
                 checkpoint: buildInitialCheckpoint(
                     job.job_id,
@@ -1357,6 +1389,8 @@ export class RestoreExecutionService {
 
         const claimRevalidation = await this.revalidateExecuteTimeTargetStates({
             job,
+            revalidatedTargetRecords:
+                record.revalidated_target_records || [],
             rows: selectedPlanRows,
         });
 
@@ -1900,6 +1934,7 @@ export class RestoreExecutionService {
 
     private async revalidateExecuteTimeTargetStates(input: {
         job: RestoreJobRecord;
+        revalidatedTargetRecords?: FinalizeTargetReconciliationRecord[];
         rows: RestorePlanHashRowInput[];
     }): Promise<{
         ok: boolean;
@@ -1942,16 +1977,71 @@ export class RestoreExecutionService {
             });
         }
 
-        let targetStatesByKey: Map<string, RestoreTargetRecordState>;
+        let targetStatesByKey: Map<string, RestoreTargetRecordState> | null =
+            null;
 
-        try {
-            targetStatesByKey = await this.targetStateLookup.lookupTargetState({
-                instance_id: input.job.instance_id,
-                records: Array.from(uniqueRecords.values()),
-                source: input.job.source,
-                tenant_id: input.job.tenant_id,
-            });
-        } catch (error: unknown) {
+        if (
+            Array.isArray(input.revalidatedTargetRecords) &&
+            input.revalidatedTargetRecords.length > 0
+        ) {
+            targetStatesByKey = new Map<string, RestoreTargetRecordState>();
+
+            for (const record of input.revalidatedTargetRecords) {
+                const key = buildTargetStateLookupKey({
+                    record_sys_id: record.record_sys_id,
+                    table: record.table,
+                });
+
+                if (targetStatesByKey.has(key)) {
+                    return {
+                        ok: false,
+                        statusCode: 409,
+                        error: 'target_revalidation_incomplete',
+                        reasonCode: 'failed_internal_error',
+                        message:
+                            'execute-time target revalidation records must '
+                            + 'be unique by table + record_sys_id',
+                    };
+                }
+
+                targetStatesByKey.set(key, record.target_state);
+            }
+
+            for (const key of uniqueRecords.keys()) {
+                if (!targetStatesByKey.has(key)) {
+                    return {
+                        ok: false,
+                        statusCode: 409,
+                        error: 'target_revalidation_incomplete',
+                        reasonCode: 'failed_internal_error',
+                        message:
+                            'execute-time target revalidation records are '
+                            + 'incomplete for the requested plan rows',
+                    };
+                }
+            }
+        } else {
+            try {
+                targetStatesByKey = await this.targetStateLookup.lookupTargetState({
+                    instance_id: input.job.instance_id,
+                    records: Array.from(uniqueRecords.values()),
+                    source: input.job.source,
+                    tenant_id: input.job.tenant_id,
+                });
+            } catch (error: unknown) {
+                return {
+                    ok: false,
+                    statusCode: 503,
+                    error: 'target_revalidation_unavailable',
+                    reasonCode: 'failed_internal_error',
+                    message:
+                        'execute-time target revalidation is unavailable: '
+                        + String((error as Error)?.message || error),
+                };
+            }
+        }
+
+        if (!targetStatesByKey) {
             return {
                 ok: false,
                 statusCode: 503,
@@ -1959,7 +2049,7 @@ export class RestoreExecutionService {
                 reasonCode: 'failed_internal_error',
                 message:
                     'execute-time target revalidation is unavailable: '
-                    + String((error as Error)?.message || error),
+                    + 'target state lookup result is unavailable',
             };
         }
 

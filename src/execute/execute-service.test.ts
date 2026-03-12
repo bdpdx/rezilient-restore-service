@@ -1641,6 +1641,44 @@ test('execute blocks when execute-time target revalidation detects drift', async
     assert.match(result.message, /target revalidation/i);
 });
 
+test(
+    'execute accepts caller-supplied target revalidation records when runtime lookup is unavailable',
+    async () => {
+        const fixture = await buildFixture({
+            rows: [createRow('row-01', 'update')],
+            targetStateLookup: {
+                async lookupTargetState() {
+                    throw new Error('target state lookup runtime support is unavailable');
+                },
+            },
+        });
+        const result = await fixture.execute.executeJob(
+            fixture.jobId,
+            {
+                operator_id: 'operator@example.com',
+                operator_capabilities: ['restore_execute'],
+                revalidated_target_records: [{
+                    table: 'incident',
+                    record_sys_id: 'rec-row-01',
+                    target_state: 'exists',
+                }],
+            },
+            claims(),
+        );
+
+        assert.equal(result.success, true);
+        if (!result.success) {
+            return;
+        }
+
+        assert.deepEqual(result.record.revalidated_target_records, [{
+            table: 'incident',
+            record_sys_id: 'rec-row-01',
+            target_state: 'exists',
+        }]);
+    },
+);
+
 test('rollback journal includes authoritative entries and SN mirror linkage', async () => {
     const fixture = await buildFixture({
         executeConfig: {
@@ -1957,6 +1995,74 @@ test('claim blocks when execute-time target revalidation fails', async () => {
     assert.equal(claim.error, 'target_revalidation_failed');
     assert.equal(claim.reasonCode, 'blocked_reference_conflict');
 });
+
+test(
+    'claim uses persisted target revalidation records when runtime lookup is unavailable',
+    async () => {
+        const stateStore = new InMemoryRestoreExecutionStateStore();
+        const fixture = await buildFixture({
+            executeConfig: {
+                maxChunksPerAttempt: 1,
+            },
+            rows: [
+                createRow('row-01', 'update'),
+                createRow('row-02', 'update'),
+            ],
+            stateStore,
+            targetStateLookup: {
+                async lookupTargetState() {
+                    throw new Error('target state lookup runtime support is unavailable');
+                },
+            },
+        });
+        const first = await fixture.execute.executeJob(
+            fixture.jobId,
+            {
+                operator_id: 'operator@example.com',
+                operator_capabilities: ['restore_execute'],
+                chunk_size: 1,
+                revalidated_target_records: [
+                    {
+                        table: 'incident',
+                        record_sys_id: 'rec-row-01',
+                        target_state: 'exists',
+                    },
+                    {
+                        table: 'incident',
+                        record_sys_id: 'rec-row-02',
+                        target_state: 'exists',
+                    },
+                ],
+            },
+            claims(),
+        );
+
+        assert.equal(first.success, true);
+        if (!first.success) {
+            return;
+        }
+
+        assert.equal(first.record.status, 'paused');
+
+        const claim = await fixture.execute.claimBatch(
+            fixture.jobId,
+            {
+                operator_id: 'sn-worker',
+                max_rows: 1,
+            },
+            claims(),
+        );
+
+        assert.equal(claim.success, true);
+        if (!claim.success) {
+            return;
+        }
+
+        assert.equal(claim.response.accepted, true);
+        assert.equal(claim.response.claimed_rows.length, 1);
+        assert.equal(claim.response.claimed_rows[0]?.row_id, 'row-02');
+    },
+);
 
 test(
     'claim/commit keeps summary totals tied to committed row outcomes',

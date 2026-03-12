@@ -79,6 +79,41 @@ describe('ExecuteRestoreJobRequestSchema', () => {
             );
         assert.equal(result.success, true);
     });
+
+    test('accepts caller-supplied target revalidation records', () => {
+        const result =
+            ExecuteRestoreJobRequestSchema.safeParse({
+                ...buildValidExecRequest(),
+                revalidated_target_records: [{
+                    table: 'incident',
+                    record_sys_id: 'rec-01',
+                    target_state: 'exists',
+                }],
+            });
+
+        assert.equal(result.success, true);
+    });
+
+    test('rejects duplicate caller-supplied target revalidation records', () => {
+        const result =
+            ExecuteRestoreJobRequestSchema.safeParse({
+                ...buildValidExecRequest(),
+                revalidated_target_records: [
+                    {
+                        table: 'incident',
+                        record_sys_id: 'rec-01',
+                        target_state: 'exists',
+                    },
+                    {
+                        table: 'incident',
+                        record_sys_id: 'rec-01',
+                        target_state: 'missing',
+                    },
+                ],
+            });
+
+        assert.equal(result.success, false);
+    });
 });
 
 describe('normalizeCapabilities', () => {
@@ -195,6 +230,21 @@ describe('ResumeRestoreJobRequestSchema', () => {
                 operator_id: 'op-1',
                 operator_capabilities: ['restore_execute'],
             });
+        assert.equal(result.success, true);
+    });
+
+    test('accepts caller-supplied target revalidation records', () => {
+        const result =
+            ResumeRestoreJobRequestSchema.safeParse({
+                operator_id: 'op-1',
+                operator_capabilities: ['restore_execute'],
+                revalidated_target_records: [{
+                    table: 'incident',
+                    record_sys_id: 'rec-01',
+                    target_state: 'exists',
+                }],
+            });
+
         assert.equal(result.success, true);
     });
 
