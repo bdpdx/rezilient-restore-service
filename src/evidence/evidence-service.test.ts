@@ -237,7 +237,9 @@ async function createFixture(options?: {
     const execute = new RestoreExecutionService(
         jobs,
         plans,
-        {},
+        {
+            executionProgressMode: 'legacy_apply',
+        },
         now,
         undefined,
         new NoopRestoreTargetWriter(),

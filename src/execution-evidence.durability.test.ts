@@ -248,6 +248,7 @@ function createFixture(
         plans,
         {
             maxChunksPerAttempt,
+            executionProgressMode: 'legacy_apply',
         },
         now,
         new PostgresRestoreExecutionStateStore('postgres://unused', {
