@@ -1205,6 +1205,10 @@ export class RestoreExecutionService {
         }
 
         const plan = planLookup.plan;
+        const requestedRevalidatedTargetRecords =
+            cloneTargetRevalidationRecords(
+                request.revalidated_target_records || [],
+            );
         let record = await this.getExecutionRecord(jobId);
 
         if (!record) {
@@ -1231,7 +1235,8 @@ export class RestoreExecutionService {
                 capabilities_used: normalizeCapabilities(
                     job.required_capabilities,
                 ),
-                revalidated_target_records: [],
+                revalidated_target_records:
+                    requestedRevalidatedTargetRecords,
                 resume_attempt_count: 0,
                 checkpoint: buildInitialCheckpoint(
                     job.job_id,
@@ -1258,6 +1263,22 @@ export class RestoreExecutionService {
             };
 
             await this.persistExecutionDelta(job.job_id, record, [], []);
+        } else if (
+            (record.revalidated_target_records || []).length === 0 &&
+            requestedRevalidatedTargetRecords.length > 0
+        ) {
+            record.revalidated_target_records =
+                requestedRevalidatedTargetRecords;
+            const rollbackState = await this.loadRollbackJournalState(
+                job.job_id,
+            );
+
+            await this.persistExecutionDelta(
+                job.job_id,
+                record,
+                rollbackState.journalEntries,
+                rollbackState.mirrorEntries,
+            );
         }
 
         const checkpointIntegrity = this.validateCheckpointIntegrity(record);

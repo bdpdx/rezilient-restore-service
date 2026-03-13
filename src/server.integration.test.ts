@@ -3604,6 +3604,82 @@ test(
 );
 
 test(
+    'claim endpoint accepts caller-supplied target revalidation records when runtime support is unavailable and no execution exists',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const server = createService(signingKey, {
+            failClosedRuntimeComposition: true,
+            executeConfig: {
+                maxChunksPerAttempt: 1,
+            },
+        });
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+
+        try {
+            const fixture = await createPlanAndJob(
+                baseUrl,
+                token,
+                'plan-claim-runtime-caller-supplied-target-states',
+                {
+                    requiredCapabilities: ['restore_execute'],
+                },
+            );
+            const claimResponse = await postJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}/execute-batches/claim`,
+                token,
+                {
+                    operator_id: 'sn-worker',
+                    max_rows: 1,
+                    revalidated_target_records: [
+                        {
+                            table: 'incident',
+                            record_sys_id: 'rec-01',
+                            target_state: 'exists',
+                        },
+                        {
+                            table: 'incident',
+                            record_sys_id: 'rec-02',
+                            target_state: 'exists',
+                        },
+                        {
+                            table: 'incident',
+                            record_sys_id: 'rec-03',
+                            target_state: 'exists',
+                        },
+                    ],
+                },
+            );
+
+            assert.equal(claimResponse.status, 200);
+            assert.equal(claimResponse.body.accepted, true);
+            const claimedRows =
+                claimResponse.body.claimed_rows as Array<Record<string, unknown>>;
+            assert.equal(claimedRows.length, 1);
+
+            const executionResponse = await getJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}/execution`,
+                token,
+            );
+
+            assert.equal(executionResponse.status, 200);
+            const executionBody =
+                executionResponse.body.execution as Record<string, unknown>;
+            const revalidatedTargetRecords =
+                executionBody.revalidated_target_records as Array<
+                    Record<string, unknown>
+                >;
+
+            assert.equal(revalidatedTargetRecords.length, 3);
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
+
+test(
     'claim endpoint reuses persisted target revalidation records when runtime support is unavailable',
     async () => {
         const signingKey = 'test-signing-key';

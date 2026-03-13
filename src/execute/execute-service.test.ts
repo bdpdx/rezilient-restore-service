@@ -2003,6 +2003,72 @@ test('claim blocks when execute-time target revalidation fails', async () => {
 });
 
 test(
+    'claim accepts caller-supplied target revalidation records when runtime lookup is unavailable and no execution exists',
+    async () => {
+        const fixture = await buildFixture({
+            executeConfig: {
+                executionProgressMode: 'commit_driven',
+                maxChunksPerAttempt: 1,
+            },
+            rows: [
+                createRow('row-01', 'update'),
+                createRow('row-02', 'update'),
+            ],
+            targetStateLookup: {
+                async lookupTargetState() {
+                    throw new Error('target state lookup runtime support is unavailable');
+                },
+            },
+        });
+        const claim = await fixture.execute.claimBatch(
+            fixture.jobId,
+            {
+                operator_id: 'sn-worker',
+                max_rows: 1,
+                revalidated_target_records: [
+                    {
+                        table: 'incident',
+                        record_sys_id: 'rec-row-01',
+                        target_state: 'exists',
+                    },
+                    {
+                        table: 'incident',
+                        record_sys_id: 'rec-row-02',
+                        target_state: 'exists',
+                    },
+                ],
+            },
+            claims(),
+        );
+
+        assert.equal(claim.success, true);
+        if (!claim.success) {
+            return;
+        }
+
+        assert.equal(claim.statusCode, 200);
+        assert.equal(claim.response.accepted, true);
+        assert.equal(claim.response.claimed_rows.length, 1);
+
+        const execution = await fixture.execute.getExecution(fixture.jobId);
+
+        assert.notEqual(execution, null);
+        assert.deepEqual(execution?.revalidated_target_records, [
+            {
+                table: 'incident',
+                record_sys_id: 'rec-row-01',
+                target_state: 'exists',
+            },
+            {
+                table: 'incident',
+                record_sys_id: 'rec-row-02',
+                target_state: 'exists',
+            },
+        ]);
+    },
+);
+
+test(
     'claim uses persisted target revalidation records when runtime lookup is unavailable',
     async () => {
         const stateStore = new InMemoryRestoreExecutionStateStore();

@@ -306,10 +306,19 @@ export const ExecuteBatchClaimRequestSchema = z
     .object({
         operator_id: z.string().min(1),
         max_rows: z.number().int().positive().max(1000).optional(),
+        revalidated_target_records: z
+            .array(FinalizeTargetReconciliationRecordSchema)
+            .default([]),
     })
-    .strict();
+    .strict()
+    .superRefine((request, ctx) => {
+        requireUniqueTargetRevalidationRecords(
+            request.revalidated_target_records,
+            ctx,
+        );
+    });
 
-export type ExecuteBatchClaimRequest = z.infer<
+export type ExecuteBatchClaimRequest = z.input<
     typeof ExecuteBatchClaimRequestSchema
 >;
 

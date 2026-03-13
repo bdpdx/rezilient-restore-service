@@ -264,9 +264,34 @@ describe('ExecuteBatchClaimRequestSchema', () => {
         const result = ExecuteBatchClaimRequestSchema.safeParse({
             operator_id: 'sn-worker',
             max_rows: 50,
+            revalidated_target_records: [{
+                table: 'incident',
+                record_sys_id: 'rec-01',
+                target_state: 'exists',
+            }],
         });
 
         assert.equal(result.success, true);
+    });
+
+    test('rejects duplicate caller-supplied target revalidation records', () => {
+        const result = ExecuteBatchClaimRequestSchema.safeParse({
+            operator_id: 'sn-worker',
+            revalidated_target_records: [
+                {
+                    table: 'incident',
+                    record_sys_id: 'rec-01',
+                    target_state: 'exists',
+                },
+                {
+                    table: 'incident',
+                    record_sys_id: 'rec-01',
+                    target_state: 'missing',
+                },
+            ],
+        });
+
+        assert.equal(result.success, false);
     });
 
     test('rejects claim request with missing operator_id', () => {
