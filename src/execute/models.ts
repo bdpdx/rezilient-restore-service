@@ -472,6 +472,10 @@ export type ExecuteRestoreJobResult =
     | ExecuteRestoreJobSuccess
     | ExecuteRestoreJobFailure;
 
+export type ExecuteProgressMode =
+    | 'commit_driven'
+    | 'legacy_apply';
+
 export interface ExecuteServiceConfig {
     defaultChunkSize: number;
     maxRows: number;
@@ -481,6 +485,7 @@ export interface ExecuteServiceConfig {
     mediaMaxItems: number;
     mediaMaxBytes: number;
     mediaMaxRetryAttempts: number;
+    executionProgressMode: ExecuteProgressMode;
 }
 
 export interface RestoreTargetWriteRequest {

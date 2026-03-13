@@ -1,4 +1,6 @@
 import { strict as assert } from 'node:assert';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, test } from 'node:test';
 import {
     ExecuteBatchClaimRequestSchema,
@@ -410,5 +412,19 @@ describe('target writer contract', () => {
             reason_code: 'none',
             message: 'noop target writer placeholder',
         });
+    });
+});
+
+describe('product runtime composition', () => {
+    test('bootstrap does not inject the noop target writer override', () => {
+        const indexSource = readFileSync(
+            resolve(__dirname, '../../src/index.ts'),
+            'utf8',
+        );
+
+        assert.equal(
+            indexSource.includes('new NoopRestoreTargetWriter('),
+            false,
+        );
     });
 });

@@ -295,6 +295,7 @@ function createService(
             mediaMaxItems?: number;
             mediaMaxBytes?: number;
             mediaMaxRetryAttempts?: number;
+            executionProgressMode?: 'commit_driven' | 'legacy_apply';
         };
         adminToken?: string;
         bodyMaxBytes?: number;
@@ -498,7 +499,10 @@ function createService(
     const execute = new RestoreExecutionService(
         jobs,
         plans,
-        options?.executeConfig,
+        {
+            executionProgressMode: 'legacy_apply',
+            ...(options?.executeConfig || {}),
+        },
         now,
         options?.stateStores?.execute,
         options?.targetWriter ||
@@ -2092,6 +2096,18 @@ test(
             assert.equal(secondCommitSummary.applied_rows, 1);
             assert.equal(secondCommitSummary.failed_rows, 1);
 
+            const committedCheckpoint = await getJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}/checkpoint`,
+                token,
+            );
+
+            assert.equal(committedCheckpoint.status, 200);
+            const committedCheckpointBody = committedCheckpoint.body
+                .checkpoint as Record<string, unknown>;
+            assert.equal(committedCheckpointBody.next_chunk_index, 1);
+            assert.equal(committedCheckpointBody.next_row_index, 0);
+
             const committedEvidence = await getJson(
                 baseUrl,
                 `/v1/jobs/${encodeURIComponent(fixture.jobId)}/evidence`,
@@ -2119,6 +2135,13 @@ test(
                 committedVerification.signature_verification,
                 'verified',
             );
+            const committedExecutionOutcomes =
+                committedEvidenceRecord.execution_outcomes as Record<
+                    string,
+                    unknown
+                >;
+            assert.equal(committedExecutionOutcomes.rows_applied, 1);
+            assert.equal(committedExecutionOutcomes.rows_failed, 1);
         } finally {
             await closeServer(server);
         }
@@ -3330,6 +3353,7 @@ test(
 test(
     'execute endpoint accepts caller-supplied target revalidation records when runtime support is unavailable',
     async () => {
+        const noopPlaceholderMessage = 'noop target writer placeholder';
         const signingKey = 'test-signing-key';
         const server = createService(signingKey, {
             failClosedRuntimeComposition: true,
@@ -3378,13 +3402,200 @@ test(
                 string,
                 unknown
             >;
+            assert.equal(executeBody.status, 'failed');
             const revalidatedTargetRecords =
                 executeBody.revalidated_target_records as Array<
                     Record<string, unknown>
                 >;
+            const summary = executeBody.summary as Record<string, unknown>;
+            const rowOutcomes = executeBody.row_outcomes as Array<
+                Record<string, unknown>
+            >;
+
             assert.equal(
                 revalidatedTargetRecords.length,
                 3,
+            );
+            assert.equal(summary.applied_rows, 0);
+            assert.equal(
+                Number(summary.failed_rows) >= 1,
+                true,
+            );
+
+            let sawFailClosedApplyMessage = false;
+
+            for (const outcome of rowOutcomes) {
+                if (outcome.action === 'skip') {
+                    continue;
+                }
+
+                assert.equal(outcome.outcome, 'failed');
+                assert.equal(outcome.reason_code, 'failed_internal_error');
+                assert.equal(
+                    outcome.message,
+                    'target apply runtime support is unavailable',
+                );
+                assert.notEqual(
+                    outcome.message,
+                    noopPlaceholderMessage,
+                );
+                sawFailClosedApplyMessage = true;
+            }
+            assert.equal(sawFailClosedApplyMessage, true);
+            assert.equal(
+                JSON.stringify(executeBody).includes(noopPlaceholderMessage),
+                false,
+            );
+        } finally {
+            await closeServer(server);
+        }
+    },
+);
+
+test(
+    'execute endpoint commit-driven mode defers progress until batch commit',
+    async () => {
+        const signingKey = 'test-signing-key';
+        const server = createService(signingKey, {
+            failClosedRuntimeComposition: true,
+            executeConfig: {
+                executionProgressMode: 'commit_driven',
+            },
+        });
+        const baseUrl = await listen(server);
+        const token = createToken(signingKey);
+
+        try {
+            const fixture = await createPlanAndJob(
+                baseUrl,
+                token,
+                'plan-execute-commit-driven-start',
+                {
+                    requiredCapabilities: ['restore_execute'],
+                },
+            );
+            const executeResponse = await postJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}/execution`,
+                token,
+                createExecutePayload({
+                    capabilities: ['restore_execute'],
+                    revalidatedTargetRecords: [
+                        {
+                            table: 'incident',
+                            record_sys_id: 'rec-01',
+                            target_state: 'exists',
+                        },
+                        {
+                            table: 'incident',
+                            record_sys_id: 'rec-02',
+                            target_state: 'exists',
+                        },
+                        {
+                            table: 'incident',
+                            record_sys_id: 'rec-03',
+                            target_state: 'exists',
+                        },
+                    ],
+                }),
+            );
+
+            assert.equal(executeResponse.status, 202);
+            const executeBody = executeResponse.body.execution as Record<
+                string,
+                unknown
+            >;
+            const executeSummary = executeBody.summary as Record<
+                string,
+                unknown
+            >;
+            const checkpoint = executeBody.checkpoint as Record<
+                string,
+                unknown
+            >;
+
+            assert.equal(executeBody.status, 'paused');
+            assert.equal(executeSummary.applied_rows, 0);
+            assert.equal(executeSummary.failed_rows, 0);
+            assert.deepEqual(executeBody.row_outcomes, []);
+            assert.equal(checkpoint.next_chunk_index, 0);
+            assert.equal(checkpoint.next_row_index, 0);
+
+            const claimResponse = await postJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}/execute-batches/claim`,
+                token,
+                {
+                    operator_id: 'sn-worker',
+                    max_rows: 1,
+                },
+            );
+
+            assert.equal(claimResponse.status, 200);
+            assert.equal(claimResponse.body.accepted, true);
+            const claimedRows =
+                claimResponse.body.claimed_rows as Array<Record<string, unknown>>;
+            assert.equal(claimedRows.length, 1);
+
+            const executionBeforeCommit = await getJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}/execution`,
+                token,
+            );
+
+            assert.equal(executionBeforeCommit.status, 200);
+            const beforeCommitBody =
+                executionBeforeCommit.body.execution as Record<string, unknown>;
+            const beforeCommitSummary =
+                beforeCommitBody.summary as Record<string, unknown>;
+
+            assert.equal(beforeCommitSummary.applied_rows, 0);
+            assert.equal(
+                (beforeCommitBody.row_outcomes as Array<unknown>).length,
+                0,
+            );
+
+            const commitResponse = await postJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}/execute-batches/commit`,
+                token,
+                {
+                    claim_id: claimResponse.body.claim_id,
+                    committed_by: 'sn-worker',
+                    row_outcomes: [{
+                        row_id: String(claimedRows[0]?.row_id || ''),
+                        outcome: 'applied',
+                        reason_code: 'none',
+                    }],
+                },
+            );
+
+            assert.equal(commitResponse.status, 200);
+            assert.equal(commitResponse.body.accepted, true);
+            assert.equal(commitResponse.body.execution_status, 'paused');
+            const commitSummary = commitResponse.body.summary as Record<
+                string,
+                unknown
+            >;
+            assert.equal(commitSummary.applied_rows, 1);
+            assert.equal(commitSummary.failed_rows, 0);
+
+            const executionAfterCommit = await getJson(
+                baseUrl,
+                `/v1/jobs/${encodeURIComponent(fixture.jobId)}/execution`,
+                token,
+            );
+
+            assert.equal(executionAfterCommit.status, 200);
+            const afterCommitBody =
+                executionAfterCommit.body.execution as Record<string, unknown>;
+            const afterCommitSummary =
+                afterCommitBody.summary as Record<string, unknown>;
+
+            assert.equal(afterCommitSummary.applied_rows, 1);
+            assert.equal(
+                (afterCommitBody.row_outcomes as Array<unknown>).length,
+                1,
             );
         } finally {
             await closeServer(server);

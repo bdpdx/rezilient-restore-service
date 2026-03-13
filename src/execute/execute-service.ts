@@ -67,6 +67,7 @@ const DEFAULT_EXECUTE_CONFIG: ExecuteServiceConfig = {
     mediaMaxItems: 1000,
     mediaMaxBytes: 100 * 1024 * 1024,
     mediaMaxRetryAttempts: 3,
+    executionProgressMode: 'commit_driven',
 };
 
 function reasonForAbort(
@@ -913,6 +914,15 @@ export class RestoreExecutionService {
             media_outcomes: [],
         };
 
+        if (this.config.executionProgressMode === 'commit_driven') {
+            return this.startCommitDrivenExecution(
+                job,
+                plan,
+                record,
+                chunks,
+            );
+        }
+
         return this.processAttempt(
             job,
             plan,
@@ -1129,6 +1139,14 @@ export class RestoreExecutionService {
 
         resumedRecord.revalidated_target_records =
             cloneTargetRevalidationRecords(revalidatedTargetRecords);
+
+        if (this.config.executionProgressMode === 'commit_driven') {
+            return this.resumeCommitDrivenExecution(
+                resume.job,
+                plan,
+                resumedRecord,
+            );
+        }
 
         return this.processAttempt(
             resume.job,
@@ -2160,6 +2178,136 @@ export class RestoreExecutionService {
                 delete state.sn_mirror_by_job_id[jobId];
             }
         });
+    }
+
+    private async startCommitDrivenExecution(
+        job: RestoreJobRecord,
+        plan: RestoreDryRunPlanRecord,
+        record: RestoreExecutionRecord,
+        chunks: RestorePlanHashRowInput[][],
+    ): Promise<ExecuteRestoreJobResult> {
+        if (chunks.length === 0) {
+            return this.finalizeCommitDrivenExecution(
+                job,
+                plan,
+                record,
+                [],
+                [],
+            );
+        }
+
+        await this.persistExecutionDelta(
+            job.job_id,
+            record,
+            [],
+            [],
+        );
+
+        return {
+            success: true,
+            statusCode: 202,
+            record,
+            promoted_job_ids: [],
+        };
+    }
+
+    private async resumeCommitDrivenExecution(
+        job: RestoreJobRecord,
+        plan: RestoreDryRunPlanRecord,
+        record: RestoreExecutionRecord,
+    ): Promise<ExecuteRestoreJobResult> {
+        const chunks = chunkRows(plan.plan_hash_input.rows, record.chunk_size);
+        const rollbackState = await this.loadRollbackJournalState(job.job_id);
+
+        record.resume_attempt_count += 1;
+        record.status = 'paused';
+        record.reason_code = 'none';
+        record.completed_at = null;
+
+        if (record.checkpoint.next_chunk_index >= chunks.length) {
+            return this.finalizeCommitDrivenExecution(
+                job,
+                plan,
+                record,
+                rollbackState.journalEntries,
+                rollbackState.mirrorEntries,
+            );
+        }
+
+        await this.persistExecutionDelta(
+            job.job_id,
+            record,
+            rollbackState.journalEntries,
+            rollbackState.mirrorEntries,
+        );
+
+        return {
+            success: true,
+            statusCode: 202,
+            record,
+            promoted_job_ids: [],
+        };
+    }
+
+    private async finalizeCommitDrivenExecution(
+        job: RestoreJobRecord,
+        plan: RestoreDryRunPlanRecord,
+        record: RestoreExecutionRecord,
+        journalEntries: RestoreJournalEntry[],
+        mirrorEntries: RestoreJournalMirrorRecord[],
+    ): Promise<ExecuteRestoreJobResult> {
+        if (
+            record.media_outcomes.length === 0 &&
+            plan.media_candidates.length > 0
+        ) {
+            this.processMediaCandidates(plan, record);
+        }
+
+        record.summary = summarizeExecution(
+            plan.plan_hash_input.rows.length,
+            plan.media_candidates.length,
+            record.chunks,
+            record.row_outcomes,
+            record.media_outcomes,
+        );
+
+        const hasFailures = record.summary.failed_rows > 0 ||
+            record.summary.attachments_failed > 0;
+        const terminalStatus = hasFailures ? 'failed' : 'completed';
+        const terminalReason: RestoreReasonCode = hasFailures
+            ? 'failed_internal_error'
+            : 'none';
+        const completion = await this.jobs.completeJob(job.job_id, {
+            status: terminalStatus,
+            reason_code: terminalReason,
+        });
+
+        if (!completion.success) {
+            return buildFailure(
+                500,
+                'job_completion_failed',
+                completion.message,
+                'failed_internal_error',
+            );
+        }
+
+        record.status = terminalStatus;
+        record.reason_code = terminalReason;
+        record.completed_at = normalizeIsoWithMillis(this.now());
+
+        await this.persistExecutionDelta(
+            job.job_id,
+            record,
+            journalEntries,
+            mirrorEntries,
+        );
+
+        return {
+            success: true,
+            statusCode: 200,
+            record,
+            promoted_job_ids: completion.promoted_job_ids,
+        };
     }
 
     private async processAttempt(

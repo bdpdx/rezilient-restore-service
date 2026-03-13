@@ -482,6 +482,7 @@ async function buildFixture(options?: {
         mediaMaxItems?: number;
         mediaMaxBytes?: number;
         mediaMaxRetryAttempts?: number;
+        executionProgressMode?: 'commit_driven' | 'legacy_apply';
     };
     rows?: ReturnType<typeof createRow>[];
     mediaCandidates?: Record<string, unknown>[];
@@ -540,7 +541,10 @@ async function buildFixture(options?: {
     const execute = new RestoreExecutionService(
         jobs,
         plans,
-        options?.executeConfig,
+        {
+            executionProgressMode: 'legacy_apply',
+            ...(options?.executeConfig || {}),
+        },
         now,
         options?.stateStore,
         options?.targetWriter || new NoopRestoreTargetWriter(),
@@ -664,7 +668,9 @@ async function buildScopeDrivenFixture(): Promise<{
     const execute = new RestoreExecutionService(
         jobs,
         plans,
-        undefined,
+        {
+            executionProgressMode: 'legacy_apply',
+        },
         now,
         undefined,
         targetWriter,
@@ -2002,6 +2008,7 @@ test(
         const stateStore = new InMemoryRestoreExecutionStateStore();
         const fixture = await buildFixture({
             executeConfig: {
+                executionProgressMode: 'commit_driven',
                 maxChunksPerAttempt: 1,
             },
             rows: [
@@ -2060,7 +2067,276 @@ test(
 
         assert.equal(claim.response.accepted, true);
         assert.equal(claim.response.claimed_rows.length, 1);
-        assert.equal(claim.response.claimed_rows[0]?.row_id, 'row-02');
+        assert.equal(claim.response.claimed_rows[0]?.row_id, 'row-01');
+    },
+);
+
+test(
+    'commit-driven execute start persists initialized state without row outcomes',
+    async () => {
+        const fixture = await buildFixture({
+            executeConfig: {
+                executionProgressMode: 'commit_driven',
+            },
+            rows: [
+                createRow('row-01', 'update'),
+                createRow('row-02', 'update'),
+            ],
+        });
+        const started = await fixture.execute.executeJob(
+            fixture.jobId,
+            {
+                operator_id: 'operator@example.com',
+                operator_capabilities: ['restore_execute'],
+            },
+            claims(),
+        );
+
+        assert.equal(started.success, true);
+        if (!started.success) {
+            return;
+        }
+
+        assert.equal(started.statusCode, 202);
+        assert.equal(started.record.status, 'paused');
+        assert.equal(started.record.summary.applied_rows, 0);
+        assert.equal(started.record.summary.failed_rows, 0);
+        assert.equal(started.record.row_outcomes.length, 0);
+        assert.equal(started.record.checkpoint.next_chunk_index, 0);
+        assert.equal(started.record.checkpoint.next_row_index, 0);
+
+        const persisted = await fixture.execute.getExecution(
+            fixture.jobId,
+        );
+        const rollback = await fixture.execute.getRollbackJournal(
+            fixture.jobId,
+        );
+
+        assert.ok(persisted);
+        assert.equal(persisted?.summary.applied_rows, 0);
+        assert.equal(persisted?.summary.failed_rows, 0);
+        assert.equal(persisted?.row_outcomes.length, 0);
+        assert.equal(rollback, null);
+    },
+);
+
+test(
+    'commit-driven claim/commit applied path updates summary and rollback journal',
+    async () => {
+        const fixture = await buildFixture({
+            executeConfig: {
+                executionProgressMode: 'commit_driven',
+            },
+            rows: [createRow('row-01', 'update')],
+        });
+        const started = await fixture.execute.executeJob(
+            fixture.jobId,
+            {
+                operator_id: 'operator@example.com',
+                operator_capabilities: ['restore_execute'],
+            },
+            claims(),
+        );
+
+        assert.equal(started.success, true);
+        if (!started.success) {
+            return;
+        }
+
+        const claim = await fixture.execute.claimBatch(
+            fixture.jobId,
+            {
+                operator_id: 'sn-worker',
+                max_rows: 1,
+            },
+            claims(),
+        );
+
+        assert.equal(claim.success, true);
+        if (!claim.success) {
+            return;
+        }
+
+        const commit = await fixture.execute.commitBatch(
+            fixture.jobId,
+            {
+                claim_id: String(claim.response.claim_id || ''),
+                committed_by: 'sn-worker',
+                row_outcomes: [{
+                    row_id: 'row-01',
+                    outcome: 'applied',
+                    reason_code: 'none',
+                }],
+            },
+            claims(),
+        );
+
+        assert.equal(commit.success, true);
+        if (!commit.success) {
+            return;
+        }
+
+        assert.equal(commit.response.execution_status, 'completed');
+        assert.equal(commit.response.summary?.applied_rows, 1);
+        assert.equal(commit.response.summary?.failed_rows, 0);
+
+        const rollback = await fixture.execute.getRollbackJournal(
+            fixture.jobId,
+        );
+
+        assert.equal(rollback?.journal_entries.length, 1);
+        assert.equal(rollback?.sn_mirror_entries.length, 1);
+    },
+);
+
+test(
+    'commit-driven claim/commit failed path keeps summary truthful and skips rollback journal writes',
+    async () => {
+        const fixture = await buildFixture({
+            executeConfig: {
+                executionProgressMode: 'commit_driven',
+            },
+            rows: [createRow('row-01', 'update')],
+        });
+        const started = await fixture.execute.executeJob(
+            fixture.jobId,
+            {
+                operator_id: 'operator@example.com',
+                operator_capabilities: ['restore_execute'],
+            },
+            claims(),
+        );
+
+        assert.equal(started.success, true);
+        if (!started.success) {
+            return;
+        }
+
+        const claim = await fixture.execute.claimBatch(
+            fixture.jobId,
+            {
+                operator_id: 'sn-worker',
+                max_rows: 1,
+            },
+            claims(),
+        );
+
+        assert.equal(claim.success, true);
+        if (!claim.success) {
+            return;
+        }
+
+        const commit = await fixture.execute.commitBatch(
+            fixture.jobId,
+            {
+                claim_id: String(claim.response.claim_id || ''),
+                committed_by: 'sn-worker',
+                row_outcomes: [{
+                    row_id: 'row-01',
+                    outcome: 'failed',
+                    reason_code: 'failed_internal_error',
+                    message: 'target apply failed',
+                }],
+            },
+            claims(),
+        );
+
+        assert.equal(commit.success, true);
+        if (!commit.success) {
+            return;
+        }
+
+        assert.equal(commit.response.execution_status, 'failed');
+        assert.equal(commit.response.summary?.applied_rows, 0);
+        assert.equal(commit.response.summary?.failed_rows, 1);
+
+        const rollback = await fixture.execute.getRollbackJournal(
+            fixture.jobId,
+        );
+
+        assert.equal(rollback, null);
+    },
+);
+
+test(
+    'commit-driven claim/commit partial-failure path preserves mixed outcomes',
+    async () => {
+        const fixture = await buildFixture({
+            executeConfig: {
+                executionProgressMode: 'commit_driven',
+            },
+            rows: [
+                createRow('row-01', 'update'),
+                createRow('row-02', 'update'),
+            ],
+        });
+        const started = await fixture.execute.executeJob(
+            fixture.jobId,
+            {
+                operator_id: 'operator@example.com',
+                operator_capabilities: ['restore_execute'],
+            },
+            claims(),
+        );
+
+        assert.equal(started.success, true);
+        if (!started.success) {
+            return;
+        }
+
+        const claim = await fixture.execute.claimBatch(
+            fixture.jobId,
+            {
+                operator_id: 'sn-worker',
+                max_rows: 2,
+            },
+            claims(),
+        );
+
+        assert.equal(claim.success, true);
+        if (!claim.success) {
+            return;
+        }
+
+        const commit = await fixture.execute.commitBatch(
+            fixture.jobId,
+            {
+                claim_id: String(claim.response.claim_id || ''),
+                committed_by: 'sn-worker',
+                row_outcomes: [{
+                    row_id: 'row-01',
+                    outcome: 'applied',
+                    reason_code: 'none',
+                }, {
+                    row_id: 'row-02',
+                    outcome: 'failed',
+                    reason_code: 'failed_permission_conflict',
+                    message: 'target rejected write',
+                }],
+            },
+            claims(),
+        );
+
+        assert.equal(commit.success, true);
+        if (!commit.success) {
+            return;
+        }
+
+        assert.equal(commit.response.execution_status, 'failed');
+        assert.equal(commit.response.summary?.applied_rows, 1);
+        assert.equal(commit.response.summary?.failed_rows, 1);
+
+        const execution = await fixture.execute.getExecution(
+            fixture.jobId,
+        );
+        const rollback = await fixture.execute.getRollbackJournal(
+            fixture.jobId,
+        );
+
+        assert.ok(execution);
+        assert.equal(execution?.row_outcomes.length, 2);
+        assert.equal(rollback?.journal_entries.length, 1);
+        assert.equal(rollback?.sn_mirror_entries.length, 1);
     },
 );
 
